@@ -17,6 +17,11 @@ set(TEST_SOURCES
     test_sleep_wakeup.c
 )
 
+# UI Simulator test (separate from unit tests — runs full UI workflow)
+set(SIM_SOURCES
+    simulator/test_ui_simulator.c
+)
+
 foreach(TEST_SRC ${TEST_SOURCES})
     get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
     add_executable(${TEST_NAME} ${TEST_SRC})
@@ -26,9 +31,17 @@ foreach(TEST_SRC ${TEST_SOURCES})
     )
 endforeach()
 
-# Custom target to run all tests
+# Build simulator test
+add_executable(test_ui_simulator ${SIM_SOURCES})
+target_include_directories(test_ui_simulator PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/mocks
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/simulator
+)
+
+# Custom target to run unit tests only
 add_custom_target(run_tests
-    COMMAND ${CMAKE_COMMAND} -E echo "===== Running All P4MSLO Tests ====="
+    COMMAND ${CMAKE_COMMAND} -E echo "===== Running All P4MSLO Unit Tests ====="
     DEPENDS ${TEST_NAMES}
 )
 
@@ -40,3 +53,23 @@ foreach(TEST_SRC ${TEST_SOURCES})
         COMMENT "Running ${TEST_NAME}..."
     )
 endforeach()
+
+# Custom target to run UI simulator (generates screenshots)
+add_custom_target(run_simulator
+    COMMAND ${CMAKE_COMMAND} -E echo "===== Running UI Simulator ====="
+    COMMAND $<TARGET_FILE:test_ui_simulator>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    DEPENDS test_ui_simulator
+    COMMENT "Running UI simulator with screenshot capture..."
+)
+
+# Run ALL tests (unit + simulator)
+add_custom_target(run_all_tests
+    COMMAND ${CMAKE_COMMAND} -E echo "===== Running All Tests (Unit + Simulator) ====="
+    DEPENDS run_tests
+)
+add_custom_command(TARGET run_all_tests POST_BUILD
+    COMMAND $<TARGET_FILE:test_ui_simulator>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    COMMENT "Running UI simulator tests..."
+)

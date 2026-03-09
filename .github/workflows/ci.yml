@@ -25,7 +25,7 @@ jobs:
           cmake .. -DCMAKE_BUILD_TYPE=Debug
           make -j$(nproc)
 
-      - name: Run tests
+      - name: Run unit tests
         run: |
           cd test/build
           TOTAL=0 PASS=0 FAIL=0
@@ -38,6 +38,14 @@ jobs:
           echo ""
           echo "$TOTAL Tests $FAIL Failures 0 Ignored"
           [ $FAIL -eq 0 ] && echo "OK" || { echo "FAILED"; exit 1; }
+
+      - name: Upload simulator screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-simulator-screenshots
+          path: test/build/screenshots/
+          if-no-files-found: ignore
 
   docker-test:
     name: Docker Test Image

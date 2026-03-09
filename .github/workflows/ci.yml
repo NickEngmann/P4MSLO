@@ -1,0 +1,79 @@
+name: P4MSLO CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  host-tests:
+    name: Host-Based Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ cmake make
+
+      - name: Build tests
+        run: |
+          cd test
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug
+          make -j$(nproc)
+
+      - name: Run tests
+        run: |
+          cd test/build
+          TOTAL=0 PASS=0 FAIL=0
+          for t in test_*; do
+            [ -x "$t" ] || continue
+            TOTAL=$((TOTAL+1))
+            echo "--- Running $t ---"
+            if ./"$t"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+          done
+          echo ""
+          echo "$TOTAL Tests $FAIL Failures 0 Ignored"
+          [ $FAIL -eq 0 ] && echo "OK" || { echo "FAILED"; exit 1; }
+
+  docker-test:
+    name: Docker Test Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test image
+        run: docker build -f Dockerfile.test -t p4mslo-test .
+
+      - name: Run tests in container
+        run: docker run --rm p4mslo-test
+
+  idf-build:
+    name: ESP-IDF Build (ESP32-P4)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build factory demo
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          cd factory_demo
+          idf.py set-target esp32p4
+          idf.py build 2>&1 | tail -30
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-esp32p4
+          path: |
+            factory_demo/build/factory_demo.bin
+            factory_demo/build/factory_demo.elf
+            factory_demo/build/bootloader/bootloader.bin
+            factory_demo/build/partition_table/partition-table.bin
+          if-no-files-found: warn

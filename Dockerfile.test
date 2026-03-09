@@ -1,0 +1,35 @@
+# P4MSLO Lightweight Test Image
+# Host-based tests only — no ESP-IDF, fast build (~30s)
+#
+# Build: docker build -f Dockerfile.test -t p4mslo-test .
+# Run:   docker run --rm p4mslo-test
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ cmake make ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY test/ /workspace/test/
+
+RUN cd /workspace/test && \
+    mkdir -p build && cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Debug && \
+    make -j$(nproc)
+
+# Run tests and report results
+CMD ["bash", "-c", "\
+    cd /workspace/test/build && \
+    TOTAL=0 PASS=0 FAIL=0; \
+    for t in test_*; do \
+        [ -x \"$t\" ] || continue; \
+        TOTAL=$((TOTAL+1)); \
+        if ./\"$t\"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi; \
+    done; \
+    echo ''; \
+    echo \"$TOTAL Tests $FAIL Failures 0 Ignored\"; \
+    [ $FAIL -eq 0 ] && echo OK || { echo FAILED; exit 1; }; \
+"]

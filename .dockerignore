@@ -1,0 +1,6 @@
+.git
+test/build
+factory_demo/build
+factory_demo/managed_components
+*.espdl
+*.onnx

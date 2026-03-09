@@ -1,0 +1,4 @@
+test/build/
+test/simulator/build/
+test/simulator/lvgl/
+test/simulator/lv_drivers/

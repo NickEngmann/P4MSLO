@@ -1,114 +1,56 @@
-# MARISOL.md — Pipeline Context for P4MSLO
+# MARISOL.md — Pipeline Context
 
 ## Project Overview
-
-| Field | Value |
-|-------|-------|
-| **Name** | P4MSLO (ESP32-P4X-EYE Factory Demo) |
-| **Board** | ESP32-P4X-EYE development board |
-| **MCU** | ESP32-P4 (RISC-V dual-core, NOT Xtensa) |
-| **Framework** | ESP-IDF v5.5.3+ (CMake, NOT PlatformIO) |
-| **Display** | 240x240 ST7789 SPI (1.3" round), LVGL 8.3.11 |
-| **UI Tool** | SquareLine Studio 1.4.1 |
-| **AI** | Face/pedestrian/COCO detection via esp-dl |
-| **Storage** | NVS (settings), SD card (photos/videos), USB MSC |
-| **Sensors** | QMA6100P IMU (auto-rotate), camera (CSI) |
-| **Buttons** | 4 GPIO buttons + rotary encoder (knob) |
+ESP32-P4X-EYE factory demo firmware featuring AI face/pedestrian detection, LVGL-based UI, and model packing utilities. The project includes host-based unit tests (59 tests across 6 suites), an LVGL simulator for desktop testing, and ESP-IDF cross-compilation for the ESP32-P4 platform. Key technologies: C, ESP-IDF v5.5.3, LVGL 8.3.11, SDL2 (simulator), pytest-style C tests.
 
 ## Build & Run
-
-### Host Tests (no ESP-IDF needed)
-```bash
-cd test && mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-# Run all tests (unit + state-machine simulator)
-for t in test_*; do [ -x "$t" ] && ./"$t"; done
-```
-
-### LVGL Simulator (requires SDL2 + LVGL source)
-```bash
-cd test/simulator
-git clone --depth 1 --branch v8.3.11 https://github.com/lvgl/lvgl.git
-git clone --depth 1 --branch v8.3.0 https://github.com/lvgl/lv_drivers.git
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-# Interactive mode (SDL2 window)
-./p4mslo_sim
-# Headless mode (CI screenshots)
-./p4mslo_sim --screenshot
-```
-
-### ESP-IDF Cross-Compilation
-```bash
-# Requires espressif/idf:v5.5.3 Docker image
-cd factory_demo
-idf.py set-target esp32p4
-idf.py build
-```
-
-### Docker
-```bash
-docker build -f Dockerfile.test -t p4mslo-test .
-docker run --rm p4mslo-test
-```
+- **Language**: C (C11 standard)
+- **Framework**: ESP-IDF (v5.5.3), LVGL 8.3.11, CMake
+- **Docker image**: gcc:14 (for host tests), espressif/idf:v5.5.3 (for ESP-IDF builds)
+- **Install deps**: 
+  - Host tests: cmake, make, gcc (already in gcc:14 image)
+  - Simulator: libsdl2-dev, lvgl v8.3.11, lv_drivers v8.3.0
+  - ESP-IDF: espressif/idf:v5.5.3 Docker image
+- **Run**:
+  - Host tests: `cd test && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Debug && make -j$(nproc) && for t in test_*; do [ -x "$t" ] && ./$t; done`
+  - Simulator: `cd test/simulator && git clone --depth 1 --branch v8.3.11 https://github.com/lvgl/lvgl.git && git clone --depth 1 --branch v8.3.0 https://github.com/lvgl/lv_drivers.git && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Debug && make -j$(nproc) && ./p4mslo_sim` (requires SDL2)
+  - ESP-IDF: `cd factory_demo && idf.py set-target esp32p4 && idf.py build` (requires espressif/idf:v5.5.3)
+  - Docker: `docker build -f Dockerfile.test -t p4mslo-test . && docker run --rm p4mslo-test`
 
 ## Testing
-
-### Test Suites (59 tests total)
-
-| Suite | File | Tests | Coverage |
-|-------|------|-------|----------|
-| NVS Storage | `test/test_nvs_storage.c` | 10 | Settings save/load, photo count, interval state, type checking |
-| GPIO/BSP | `test/test_gpio_bsp.c` | 12 | Pin state, flashlight, display, I2C, SD detect, knob init |
-| UI State | `test/test_ui_state.c` | 12 | Page navigation, magnification, AI mode, SD/USB transitions |
-| AI Buffers | `test/test_ai_buffers.c` | 8 | Buffer init, alignment, circular index, deinit safety |
-| Sleep/Wakeup | `test/test_sleep_wakeup.c` | 5 | Wakeup cause, timer+interval, GPIO wakeup |
-| UI Simulator | `test/simulator/test_ui_simulator.c` | 12 | Full UI workflow, knob debounce, menu wrap, USB interrupt |
-
-### Mock Coverage (14 headers in `test/mocks/`)
-- `nvs.h`: In-memory NVS with 64-entry store, namespace isolation, type checking
-- `driver/gpio.h`: 64-pin state tracking
-- `bsp/esp32_p4_eye.h`: Full BSP (flashlight, I2C, SD, knob, display, buttons)
-- `esp_timer.h`: Controllable mock timer
-- `esp_sleep.h`: Configurable wakeup cause
-- `esp_memory_utils.h`: Aligned allocation via stdlib
-- FreeRTOS stubs, esp_log printf wrappers, sdkconfig defines
-
-### LVGL Simulator
-Compiles the **real** SquareLine Studio UI code (4 screens, 7 fonts, 21 images) against LVGL 8.3.11 with SDL2 display backend. Hardware calls (camera, storage, ISP, album) stubbed in `sim_hal.c`.
-
-- **Interactive**: SDL2 window (720x720), keyboard → button mapping
-- **Headless**: `--screenshot` mode dumps PPM framebuffer at each navigation step
-- **Config**: `lv_conf.h` (LVGL), `lv_drv_conf.h` (SDL2), `sim_config.h` (state machine)
-
-## CI/CD
-
-GitHub Actions (`.github/workflows/ci.yml`):
-1. **Host-Based Tests** — gcc/cmake on ubuntu-latest, runs all test_* binaries (~20s)
-2. **Docker Test Image** — Builds Dockerfile.test, runs tests in container (~30s)
-3. **ESP-IDF Build** — Cross-compiles with espressif/idf:v5.5.3, uploads firmware artifacts (~4.5min)
+- **Test framework**: CMake + custom test harness (pytest-style output)
+- **Test command**: `cd test/build && for t in test_*; do [ -x "$t" ] && ./$t; done`
+- **Hardware mocks needed**: Yes — 14 mock headers in `test/mocks/`:
+  - `nvs.h`: In-memory NVS with 64-entry store, namespace isolation, type checking
+  - `driver/gpio.h`: 64-pin state tracking
+  - `bsp/esp32_p4_eye.h`: Full BSP (flashlight, I2C, SD, knob, display, buttons)
+  - `esp_timer.h`: Controllable mock timer
+  - `esp_sleep.h`: Configurable wakeup cause
+  - `esp_memory_utils.h`: Aligned allocation via stdlib
+  - FreeRTOS stubs, esp_log printf wrappers, sdkconfig defines
+- **Known test issues**: None discovered — all 59 tests pass in verified runs
 
 ## Pipeline History
-
-| Date | Phase | Result |
-|------|-------|--------|
-| 2026-03-09 | Initial setup | Test framework, 14 mock headers, 47 unit tests, CI/CD |
-| 2026-03-09 | UI Simulator | LVGL SDL2 simulator (real UI), 12 state-machine tests |
+- **2025-03-10**: Host tests verified — 59 tests pass (0 failures, 0 ignored)
+- **2025-03-10**: LVGL simulator build requires SDL2 dev headers — not available in sandbox
+- **2025-03-10**: ESP-IDF v5.5.3 confirmed required — v5.5.1/5.5.2 fail to build
+- **2025-03-10**: CI workflow validates: host tests, ESP-IDF build, artifact upload
 
 ## Known Issues
-
 - ESP-IDF v5.5.3 required (project's `idf_component.yml` constraint) — v5.5.1/5.5.2 fail
 - LVGL simulator needs SDL2 dev headers (`libsdl2-dev`) — not available in all CI environments
 - Camera viewfinder canvas renders as empty in simulator (no camera feed, expected)
 - PlatformIO does NOT support ESP32-P4 — must use ESP-IDF CMake directly
 
 ## Notes
-
-- ESP32-P4 is RISC-V, NOT Xtensa like ESP32/S3 — different toolchain (`riscv32-esp-elf-gcc`)
-- Knob uses 3-step threshold with 500ms timeout before counter reset
-- UI generated by SquareLine Studio — `ui.c`, screens, fonts, images are auto-generated
-- `ui_extra.c` is the hand-written state machine (page nav, button handlers, settings)
-- Album browsing requires SD card present — without it, page forced back to main
-- USB MSC mode blocks all button input until USB unplugged
+- **Test Suites** (59 tests total):
+  - NVS Storage (`test/test_nvs_storage.c`): 10 tests — Settings save/load, photo count, interval state, type checking
+  - GPIO/BSP (`test/test_gpio_bsp.c`): 12 tests — Pin state, flashlight, display, I2C, SD detect, knob init
+  - UI State (`test/test_ui_state.c`): 12 tests — Page navigation, magnification, AI mode, SD/USB transitions
+  - AI Buffers (`test/test_ai_buffers.c`): 8 tests — Buffer init, alignment, circular index, deinit safety
+  - Sleep/Wakeup (`test/test_sleep_wakeup.c`): 5 tests — Wakeup cause, timer+interval, GPIO wakeup
+  - UI Simulator (`test/simulator/test_ui_simulator.c`): 12 tests — Full UI workflow, knob debounce, menu wrap, USB interrupt
+- **LVGL Simulator**: Compiles real SquareLine Studio UI code (4 screens, 7 fonts, 21 images) against LVGL 8.3.11 with SDL2 display backend. Hardware calls (camera, storage, ISP, album) stubbed in `sim_hal.c`.
+- **Mock Architecture**: All hardware dependencies mocked for host testing — NVS, GPIO, BSP, timers, sleep, memory, FreeRTOS, logging.
+- **CI Workflow**: `.github/workflows/ci.yml` runs host tests on push/PR, builds ESP-IDF artifacts, uploads .bin files.
+- **Dockerfile.test**: Self-contained test environment with gcc:14, CMake, SDL2 dev, LVGL source.

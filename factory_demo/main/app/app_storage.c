@@ -22,6 +22,14 @@
 #include "app_video_stream.h"
 #include "app_storage.h"
 
+/* Forward declarations for NVS helper functions */
+static esp_err_t nvs_set_u32(nvs_handle_t handle, const char *key, uint32_t value);
+static esp_err_t nvs_get_u32(nvs_handle_t handle, const char *key, uint32_t *value);
+static esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value);
+static esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *value);
+static esp_err_t nvs_set_u16(nvs_handle_t handle, const char *key, uint16_t value);
+static esp_err_t nvs_get_u16(nvs_handle_t handle, const char *key, uint16_t *value);
+
 /* Constants and definitions */
 #define PIC_FOLDER_NAME "esp32_p4_pic_save"
 #define NVS_NAMESPACE "p4_eye_cfg"

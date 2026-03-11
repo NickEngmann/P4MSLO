@@ -15,6 +15,7 @@ set(TEST_SOURCES
     test_ui_state.c
     test_ai_buffers.c
     test_sleep_wakeup.c
+    test_photo_quality.c
 )
 
 # UI Simulator test (separate from unit tests — runs full UI workflow)

@@ -112,6 +112,23 @@ static const char *unity_current_test_name = NULL;
     } \
 } while(0)
 
+#define TEST_ASSERT_EQUAL_FLOAT(expected, actual) do { \
+    float _e = (float)(expected); \
+    float _a = (float)(actual); \
+    if (fabsf(_e - _a) > 0.0001f) { \
+        printf("  " UNITY_RED "FAIL" UNITY_RESET " %s:%d: Expected %.6f, got %.6f\n", \
+            __FILE__, __LINE__, _e, _a); \
+        unity_current_test_failed = 1; \
+        return; \
+    } \
+} while(0)
+
+#define TEST_FAIL() do { \
+    printf("  " UNITY_RED "FAIL" UNITY_RESET " %s:%d: Test explicitly failed\n", __FILE__, __LINE__); \
+    unity_current_test_failed = 1; \
+    return; \
+} while(0)
+
 #define TEST_FAIL_MESSAGE(msg) do { \
     printf("  " UNITY_RED "FAIL" UNITY_RESET " %s:%d: %s\n", __FILE__, __LINE__, msg); \
     unity_current_test_failed = 1; \

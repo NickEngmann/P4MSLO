@@ -15,6 +15,7 @@ set(TEST_SOURCES
     test_ui_state.c
     test_ai_buffers.c
     test_sleep_wakeup.c
+    test_photo_quality.c
 )
 
 # UI Simulator test (separate from unit tests — runs full UI workflow)
@@ -29,6 +30,7 @@ foreach(TEST_SRC ${TEST_SOURCES})
         ${CMAKE_CURRENT_SOURCE_DIR}/mocks
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
+    target_link_libraries(${TEST_NAME} m)
 endforeach()
 
 # Build simulator test

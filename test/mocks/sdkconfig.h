@@ -1,36 +1,38 @@
-/**
- * @brief Mock sdkconfig for host-based testing
- * Simulates ESP32-P4 configuration defaults
- */
-#pragma once
+#ifndef SDKCONFIG_H
+#define SDKCONFIG_H
 
-#define CONFIG_IDF_TARGET_ESP32P4       1
-#define CONFIG_IDF_TARGET               "esp32p4"
+// ESP32-P4 specific configuration defines
+#define CONFIG_ESP32P4
+#define CONFIG_IDF_TARGET_ESP32P4
 
-/* BSP Configuration */
-#define CONFIG_BSP_I2C_NUM              0
-#define CONFIG_BSP_SPIFFS_MOUNT_POINT   "/spiffs"
-#define CONFIG_BSP_SPIFFS_PARTITION_LABEL "storage"
-#define CONFIG_BSP_SPIFFS_MAX_FILES     5
-#define CONFIG_BSP_SD_MOUNT_POINT       "/sdcard"
-#define CONFIG_BSP_DISPLAY_BRIGHTNESS_LEDC_CH 0
-#define CONFIG_BSP_DISPLAY_LVGL_TICK    5
-#define CONFIG_BSP_DISPLAY_LVGL_MAX_SLEEP 500
-#define CONFIG_BSP_DISPLAY_LVGL_TASK_PRIORITY 2
+// Display configuration
+#define CONFIG_LCD_WIDTH 720
+#define CONFIG_LCD_HEIGHT 720
+#define CONFIG_LCD_BITS_PER_PIXEL 16
 
-/* Display */
-#define BSP_LCD_H_RES   240
-#define BSP_LCD_V_RES   240
-#define BSP_LCD_BITS_PER_PIXEL 16
-#define BSP_LCD_COLOR_SPACE 0
+// Camera configuration
+#define CONFIG_CAMERA_WIDTH 640
+#define CONFIG_CAMERA_HEIGHT 480
+#define CONFIG_CAMERA_PIXEL_FORMAT JPEG
 
-/* Memory */
-#define CONFIG_SPIRAM    1
+// Storage configuration
+#define CONFIG_STORAGE_TYPE NVS
+#define CONFIG_STORAGE_PARTITION_SIZE 1048576
 
-/* ESP painter */
-#define CONFIG_ESP_PAINTER_BASIC_FONT_20  1
+// GPIO configuration
+#define CONFIG_BUTTON_POWER_PIN 0
+#define CONFIG_BUTTON_OK_PIN 1
+#define CONFIG_BUTTON_BACK_PIN 2
+#define CONFIG_KNOB_PIN 3
 
-/* AI detect */
-#define AI_DETECT_FACE       0
-#define AI_DETECT_PEDESTRIAN 1
-#define AI_DETECT_COCO       2
+// I2C configuration
+#define CONFIG_I2C_SDA_PIN 4
+#define CONFIG_I2C_SCL_PIN 5
+
+// SD card configuration
+#define CONFIG_SD_CARD_DETECT_PIN 6
+
+// Flashlight configuration
+#define CONFIG_FLASHLIGHT_PIN 7
+
+#endif /* SDKCONFIG_H */

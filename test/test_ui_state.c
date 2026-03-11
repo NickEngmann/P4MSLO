@@ -14,11 +14,14 @@
 
 /* ---- Page Navigation ---- */
 void test_default_page_is_main(void) {
-    mock_current_page = UI_PAGE_MAIN;
+    mock_ui_context.current_page = UI_PAGE_MAIN;
+    ui_extra_init();
     TEST_ASSERT_EQUAL(UI_PAGE_MAIN, ui_extra_get_current_page());
 }
 
 void test_goto_camera_page(void) {
+    mock_ui_context.current_page = UI_PAGE_MAIN;  // Reset before test
+    ui_extra_init();
     ui_extra_goto_page(UI_PAGE_CAMERA);
     TEST_ASSERT_EQUAL(UI_PAGE_CAMERA, ui_extra_get_current_page());
 }

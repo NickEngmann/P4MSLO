@@ -20,6 +20,14 @@
 #define AI_BUFFER_COUNT  5
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
+/* Mock BSP display resolutions for testing */
+#ifndef BSP_LCD_H_RES
+#define BSP_LCD_H_RES 720
+#endif
+#ifndef BSP_LCD_V_RES
+#define BSP_LCD_V_RES 720
+#endif
+
 typedef struct {
     void *ai_buffers[AI_BUFFER_COUNT];
     size_t ai_buffer_size;

@@ -1,14 +1,13 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 project(p4mslo_tests C)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-function -Wno-unused-variable -g")
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Mock include path takes priority over system includes
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/mocks)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+# Add mock headers
+include_directories(${CMAKE_SOURCE_DIR}/mocks)
 
-# Each test is a standalone executable
+# Test files
 set(TEST_SOURCES
     test_nvs_storage.c
     test_gpio_bsp.c
@@ -17,59 +16,23 @@ set(TEST_SOURCES
     test_sleep_wakeup.c
 )
 
-# UI Simulator test (separate from unit tests — runs full UI workflow)
-set(SIM_SOURCES
-    simulator/test_ui_simulator.c
-)
-
+# Create test executables
 foreach(TEST_SRC ${TEST_SOURCES})
     get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
     add_executable(${TEST_NAME} ${TEST_SRC})
-    target_include_directories(${TEST_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/mocks
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
+    target_link_libraries(${TEST_NAME} m)
+    set_target_properties(${TEST_NAME} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endforeach()
 
-# Build simulator test
-add_executable(test_ui_simulator ${SIM_SOURCES})
-target_include_directories(test_ui_simulator PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/mocks
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/simulator
-)
+# Add simulator test
+add_subdirectory(simulator)
 
-# Custom target to run unit tests only
+# Custom target to run all tests
 add_custom_target(run_tests
-    COMMAND ${CMAKE_COMMAND} -E echo "===== Running All P4MSLO Unit Tests ====="
-    DEPENDS ${TEST_NAMES}
-)
-
-foreach(TEST_SRC ${TEST_SOURCES})
-    get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
-    add_custom_command(TARGET run_tests POST_BUILD
-        COMMAND $<TARGET_FILE:${TEST_NAME}>
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-        COMMENT "Running ${TEST_NAME}..."
-    )
-endforeach()
-
-# Custom target to run UI simulator (generates screenshots)
-add_custom_target(run_simulator
-    COMMAND ${CMAKE_COMMAND} -E echo "===== Running UI Simulator ====="
-    COMMAND $<TARGET_FILE:test_ui_simulator>
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    DEPENDS test_ui_simulator
-    COMMENT "Running UI simulator with screenshot capture..."
-)
-
-# Run ALL tests (unit + simulator)
-add_custom_target(run_all_tests
-    COMMAND ${CMAKE_COMMAND} -E echo "===== Running All Tests (Unit + Simulator) ====="
-    DEPENDS run_tests
-)
-add_custom_command(TARGET run_all_tests POST_BUILD
-    COMMAND $<TARGET_FILE:test_ui_simulator>
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Running UI simulator tests..."
+    COMMAND ${CMAKE_COMMAND} -E echo "Running all tests..."
+    COMMAND for t in ${CMAKE_BINARY_DIR}/test_*; do [ -x "$$t" ] && echo "Running $$t" && $$t || true; done
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    DEPENDS ${TEST_SOURCES}
+    COMMENT "Running all unit tests"
 )

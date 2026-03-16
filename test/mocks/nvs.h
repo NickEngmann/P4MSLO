@@ -45,6 +45,10 @@ typedef struct {
         int8_t   i8;
         int16_t  i16;
         int32_t  i32;
+        struct {
+            void *data;
+            size_t size;
+        } blob;
     } value;
     bool in_use;
 } mock_nvs_entry_t;
@@ -57,6 +61,13 @@ static nvs_open_mode_t mock_nvs_current_mode = NVS_READONLY;
 static uint32_t mock_nvs_handle_counter = 1;
 
 static inline void mock_nvs_reset(void) {
+    /* Free blob allocations */
+    for (int i = 0; i < MOCK_NVS_MAX_ENTRIES; i++) {
+        if (mock_nvs_store[i].in_use && mock_nvs_store[i].type == NVS_TYPE_BLOB) {
+            free(mock_nvs_store[i].value.blob.data);
+            mock_nvs_store[i].value.blob.data = NULL;
+        }
+    }
     memset(mock_nvs_store, 0, sizeof(mock_nvs_store));
     mock_nvs_initialized = 0;
     mock_nvs_handle_counter = 1;
@@ -168,5 +179,41 @@ static inline esp_err_t nvs_get_u32(nvs_handle_t handle, const char *key, uint32
     if (!e) return ESP_ERR_NVS_NOT_FOUND;
     if (e->type != NVS_TYPE_U32) return ESP_ERR_NVS_TYPE_MISMATCH;
     *out_value = e->value.u32;
+    return ESP_OK;
+}
+
+/* Blob operations */
+static inline esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, size_t length) {
+    (void)handle;
+    mock_nvs_entry_t *e = mock_nvs_alloc(mock_nvs_current_ns, key);
+    if (!e) return ESP_ERR_NO_MEM;
+    
+    e->type = NVS_TYPE_BLOB;
+    e->value.blob.size = length;
+    e->value.blob.data = malloc(length);
+    if (!e->value.blob.data) {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(e->value.blob.data, value, length);
+    return ESP_OK;
+}
+
+static inline esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *value, size_t *length) {
+    (void)handle;
+    mock_nvs_entry_t *e = mock_nvs_find(mock_nvs_current_ns, key);
+    if (!e) {
+        *length = 0;
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (e->type != NVS_TYPE_BLOB) {
+        *length = 0;
+        return ESP_ERR_NVS_TYPE_MISMATCH;
+    }
+    if (*length < e->value.blob.size) {
+        *length = e->value.blob.size;
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(value, e->value.blob.data, e->value.blob.size);
+    *length = e->value.blob.size;
     return ESP_OK;
 }

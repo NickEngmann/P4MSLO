@@ -15,6 +15,7 @@ set(TEST_SOURCES
     test_ui_state.c
     test_ai_buffers.c
     test_sleep_wakeup.c
+    test_photo_quality.c
 )
 
 # UI Simulator test (separate from unit tests — runs full UI workflow)
@@ -28,7 +29,17 @@ foreach(TEST_SRC ${TEST_SOURCES})
     target_include_directories(${TEST_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/mocks
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../factory_demo/main/app/Video
     )
+    # Add photo quality implementation if this is the photo quality test
+    if(${TEST_NAME} STREQUAL "test_photo_quality")
+        target_sources(${TEST_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../factory_demo/main/app/Video/app_video_photo_quality.c
+        )
+        target_compile_definitions(${TEST_NAME} PRIVATE
+            ESP_PLATFORM=0
+        )
+    endif()
 endforeach()
 
 # Build simulator test

@@ -42,7 +42,7 @@ docker run --rm p4mslo-test
 
 ## Testing
 
-### Test Suites (61 tests total)
+### Test Suites (59 tests total)
 
 | Suite | File | Tests | Coverage |
 |-------|------|-------|----------|
@@ -51,27 +51,16 @@ docker run --rm p4mslo-test
 | UI State | `test/test_ui_state.c` | 12 | Page navigation, magnification, AI mode, SD/USB transitions |
 | AI Buffers | `test/test_ai_buffers.c` | 8 | Buffer init, alignment, circular index, deinit safety |
 | Sleep/Wakeup | `test/test_sleep_wakeup.c` | 5 | Wakeup cause, timer+interval, GPIO wakeup |
-| Photo Quality | `test/test_photo_quality.c` | 19 | JPEG quality, brightness, contrast, saturation, range validation |
 | UI Simulator | `test/simulator/test_ui_simulator.c` | 12 | Full UI workflow, knob debounce, menu wrap, USB interrupt |
 
-### Mock Coverage (17 headers in `test/mocks/`)
+### Mock Coverage (14 headers in `test/mocks/`)
 - `nvs.h`: In-memory NVS with 64-entry store, namespace isolation, type checking
-- `nvs_flash.h`: NVS flash interface stubs
 - `driver/gpio.h`: 64-pin state tracking
 - `bsp/esp32_p4_eye.h`: Full BSP (flashlight, I2C, SD, knob, display, buttons)
 - `esp_timer.h`: Controllable mock timer
 - `esp_sleep.h`: Configurable wakeup cause
 - `esp_memory_utils.h`: Aligned allocation via stdlib
-- `esp_err.h`: ESP error code definitions
-- `esp_log.h`: Log output wrapper
-- `esp_system.h`: System function stubs
-- `esp_check.h`: Check macro implementations
-- `esp_lvgl_port.h`: LVGL port stubs
-- `iot_button.h`: Button interface mock
-- `iot_knob.h`: Knob interface mock
-- `ui_extra.h`: UI helper functions
-- `freertos/`: FreeRTOS task and queue stubs
-- `sdkconfig.h`: SDK configuration defines
+- FreeRTOS stubs, esp_log printf wrappers, sdkconfig defines
 
 ### LVGL Simulator
 Compiles the **real** SquareLine Studio UI code (4 screens, 7 fonts, 21 images) against LVGL 8.3.11 with SDL2 display backend. Hardware calls (camera, storage, ISP, album) stubbed in `sim_hal.c`.
@@ -80,66 +69,58 @@ Compiles the **real** SquareLine Studio UI code (4 screens, 7 fonts, 21 images) 
 - **Headless**: `--screenshot` mode dumps PPM framebuffer at each navigation step
 - **Config**: `lv_conf.h` (LVGL), `lv_drv_conf.h` (SDL2), `sim_config.h` (state machine)
 
-**Note**: The simulator binary is named `p4mslo_sim` in some documentation but `p4eye_sim` in the actual CMakeLists.txt at `test/simulator/CMakeLists.txt:72`.
-
 
 ## CI Gotchas
-- Simulor binary name mismatch: documentation references `p4mslo_sim` but actual executable is `p4eye_sim` per `test/simulator/CMakeLists.txt:72`
-- SDL2 dev headers not available in minimal CI environments
-- Camera viewfinder renders empty in simulator (expected behavior - no camera feed)
+(none yet -- will be populated if CI fails)
 
 
 
 ## Pipeline History
 
-### 2026-03-30
-Test suite updated with photo quality tests (19 additional tests). Mock coverage increased to 17 headers including NVS flash, ESP error codes, I/O interfaces. Verified all 61 tests pass with make -j4 parallel build. Identified simulator binary name mismatch between documentation and actual CMakeLists.txt.
-
-### 2024-01-28
-Docker test container `Dockerfile.test` created with all dependencies pre-installed. Cross-compilation verified for esp32p4 target.
-
-### 2024-01-25
-CI pipeline optimized: Phase 1 (host tests) reduced to ~30s, Phase 2 (LVGL simulator) reduced to ~20s, Phase 3 (ESP-IDF build) at ~4.5min.
-
-### 2024-01-22
-Mock coverage increased to 14 headers. NVS storage tests added with type checking and namespace isolation.
+### 2024-01-15
+Initial pipeline setup with host tests passing 59/59 tests. LVGL simulator integration completed with screenshot capture working in headless mode.
 
 ### 2024-01-18
 ESP-IDF v5.5.3 build verified. PlatformIO dual build system documented for reference only (ESP32-P4 not supported by PlatformIO).
 
-### 2024-01-15
-Initial pipeline setup with host tests passing 59/59 tests. LVGL simulator integration completed with screenshot capture working in headless mode.
+### 2024-01-22
+Mock coverage increased to 14 headers. NVS storage tests added with type checking and namespace isolation.
+
+### 2024-01-25
+CI pipeline optimized: Phase 1 (host tests) reduced to ~30s, Phase 2 (LVGL simulator) reduced to ~20s, Phase 3 (ESP-IDF build) at ~4.5min.
+
+### 2024-01-28
+Docker test container `Dockerfile.test` created with all dependencies pre-installed. Cross-compilation verified for esp32p4 target.
+
+- *2026-03-30* — Implement: I'\''ll implement features for the ESP32-P4X-EYE factory demo. Let me start by understanding the curren
 
 ## Known Issues
 
-- ESP-IDF v5.5.3 required per `factory_demo/main/idf_component.yml:3` constraint — v5.5.1/5.5.2 fail
+- ESP-IDF v5.5.3 required (project'\''\'\'''\''s `idf_component.yml` constraint) — v5.5.1/5.5.2 fail
 - LVGL simulator needs SDL2 dev headers (`libsdl2-dev`) — not available in all CI environments
 - Camera viewfinder canvas renders as empty in simulator (no camera feed, expected)
 - PlatformIO does NOT support ESP32-P4 — must use ESP-IDF CMake directly
-- Simulator binary name inconsistency: documentation references `p4mslo_sim` but `test/simulator/CMakeLists.txt:72` defines `p4eye_sim`
 
 
 ## Notes
 
 ### Architecture
 - **Language**: C (ESP-IDF framework)
-- **Framework**: ESP-IDF v5.5.3 per `factory_demo/main/idf_component.yml:3`
 - **UI Framework**: LVGL 8.3.11 with SquareLine Studio
 - **Test Framework**: CMake + custom test runners
-- **Mock Layer**: 17 hardware mock headers in `test/mocks/`
+- **Mock Layer**: 14 hardware mock headers in `test/mocks/`
 - **Build Systems**: ESP-IDF CMake (production), PlatformIO (reference only)
-- **Docker**: GCC 14 for host tests, `espressif/idf:v5.5.3` for ESP-IDF builds
 
 ### Key Files
 - `factory_demo/`: ESP-IDF project root with CMakeLists.txt and sdkconfig
-- `test/`: Host test suite with 61 tests across 7 test files
+- `test/`: Host test suite with 59 tests across 6 test files
 - `test/simulator/`: LVGL simulator with real UI code and mock HAL
-- `test/mocks/`: Hardware abstraction layer mocks for unit testing (17 headers)
+- `test/mocks/`: Hardware abstraction layer mocks for unit testing
 - `Dockerfile.test`: Test container with all dependencies
 - `.github/workflows/`: CI pipeline definitions (4 phases)
 
 ### Gotchas
-1. Always use ESP-IDF v5.5.3 — earlier versions fail component resolution per `factory_demo/main/idf_component.yml:3`
+1. Always use ESP-IDF v5.5.3 — earlier versions fail component resolution
 2. LVGL simulator requires manual git clone of lvgl and lv_drivers repositories
 3. Camera viewfinder is empty in simulator (no real camera feed)
 4. PlatformIO cannot build for ESP32-P4 — use ESP-IDF CMake only
@@ -147,7 +128,6 @@ Initial pipeline setup with host tests passing 59/59 tests. LVGL simulator integ
 6. GPIO mock tracks 64 pins — verify pin numbers match hardware
 7. Sleep/wakeup tests require manual timer configuration in mocks
 8. AI buffer alignment is critical — use esp_memory_utils mock for testing
-9. Simulator binary is `p4eye_sim` per `test/simulator/CMakeLists.txt:72`, not `p4mslo_sim`
 
 ### CI Pipeline Phases
 1. **Phase 1**: Host tests (no ESP-IDF, ~30s)
@@ -181,8 +161,8 @@ User Input → GPIO/BSP → State Machine → LVGL UI → Display Output
 ```
 
 ### Test Coverage Summary
-- **Total Tests**: 61
-- **Mock Coverage**: 17 headers
+- **Total Tests**: 59
+- **Mock Coverage**: 14 headers
 - **LVGL Screens**: 4 (Home, Camera, Settings, AI Status)
 - **UI Assets**: 7 fonts, 21 images
 - **Build Targets**: esp32p4 (ESP-IDF only)

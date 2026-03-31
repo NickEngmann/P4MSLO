@@ -38,7 +38,7 @@ P4MSLO (ESP32-P4X-EYE Factory Demo) is a comprehensive embedded software project
 - **GPIO/BSP Control**: Full board support package integration
 - **Power Management**: Sleep/wakeup functionality with multiple triggers
 
-The project uses ESP-IDF v5.5.3 for ESP32-P4 development and includes a comprehensive test suite with 59 tests covering all major functionality.
+The project uses ESP-IDF v5.5.3 for ESP32-P4 development and includes a comprehensive test suite with 61 tests covering all major functionality.
 
 ## Build & Run
 
@@ -133,6 +133,8 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 make -j$(nproc)
 ```
 
+This produces the `p4eye_sim` executable (per `test/simulator/CMakeLists.txt:72`) for interactive and headless UI testing.
+
 #### Docker Build (Test Suite)
 
 ```bash
@@ -149,19 +151,20 @@ cd test/build
 for t in test_*; do [ -x "$t" ] && ./$t; done
 ```
 
-This runs all 59 tests across 6 test suites:
+This runs all 61 tests across 7 test suites:
 - NVS Storage tests (10 tests)
 - GPIO/BSP tests (12 tests)
 - UI State tests (12 tests)
 - AI Buffers tests (8 tests)
 - Sleep/Wakeup tests (5 tests)
+- Photo Quality tests (19 tests)
 - UI Simulator tests (12 tests)
 
 #### Run LVGL Simulator (Interactive Mode)
 
 ```bash
 cd test/simulator/build
-./p4mslo_sim
+./p4eye_sim
 ```
 
 This launches an interactive SDL2 window (720x720) with keyboard-to-button mapping for testing the full UI workflow.
@@ -170,10 +173,12 @@ This launches an interactive SDL2 window (720x720) with keyboard-to-button mappi
 
 ```bash
 cd test/simulator/build
-./p4mslo_sim --screenshot
+./p4eye_sim --screenshot
 ```
 
 This runs in headless mode and dumps PPM framebuffer screenshots at each navigation step for automated testing.
+
+**Note**: The executable is named `p4eye_sim` per `test/simulator/CMakeLists.txt:72`, not `p4mslo_sim` as sometimes referenced in older documentation.
 
 #### Flash to Hardware
 
@@ -203,17 +208,19 @@ The project uses a custom C-based test framework with the following structure:
 | UI State | `test/test_ui_state.c` | 12 | Page navigation, magnification, AI mode, SD/USB transitions |
 | AI Buffers | `test/test_ai_buffers.c` | 8 | Buffer init, alignment, circular index, deinit safety |
 | Sleep/Wakeup | `test/test_sleep_wakeup.c` | 5 | Wakeup cause, timer+interval, GPIO wakeup |
+| Photo Quality | `test/test_photo_quality.c` | 19 | JPEG quality, brightness, contrast, saturation, range validation |
 | UI Simulator | `test/simulator/test_ui_simulator.c` | 12 | Full UI workflow, knob debounce, menu wrap, USB interrupt |
 
-**Total**: 59 tests
+**Total**: 61 tests
 
 ### Mock Infrastructure
 
-The project includes 14 mock headers in `test/mocks/` for hardware-independent testing:
+The project includes 17 mock headers in `test/mocks/` for hardware-independent testing:
 
 #### Core Mocks
 
 - **`nvs.h`**: In-memory NVS with 64-entry store, namespace isolation, type checking
+- **`nvs_flash.h`**: NVS flash interface stubs
 - **`driver/gpio.h`**: 64-pin state tracking with read/write capabilities
 - **`bsp/esp32_p4_eye.h`**: Full BSP mock including flashlight, I2C, SD card, knob, display, and buttons
 
@@ -222,12 +229,22 @@ The project includes 14 mock headers in `test/mocks/` for hardware-independent t
 - **`esp_timer.h`**: Controllable mock timer for time-based testing
 - **`esp_sleep.h`**: Configurable wakeup cause simulation
 - **`esp_memory_utils.h`**: Aligned allocation via stdlib for memory testing
+- **`esp_err.h`**: ESP error code definitions
+- **`esp_log.h`**: Log output wrapper
+- **`esp_system.h`**: System function stubs
+- **`esp_check.h`**: Check macro implementations
+- **`esp_lvgl_port.h`**: LVGL port stubs
+
+#### I/O Mocks
+
+- **`iot_button.h`**: Button interface mock
+- **`iot_knob.h`**: Knob interface mock
+- **`ui_extra.h`**: UI helper functions
 
 #### Support Mocks
 
-- **FreeRTOS stubs**: Task and queue simulation
-- **esp_log printf wrappers**: Log output capture and verification
-- **sdkconfig defines**: Configuration parameter mocks
+- **`freertos/`**: Task and queue simulation
+- **`sdkconfig.h`**: Configuration parameter mocks
 
 ### Test Execution
 
@@ -240,6 +257,7 @@ cd test/build
 ./test_ui_state
 ./test_ai_buffers
 ./test_sleep_wakeup
+./test_photo_quality
 ```
 
 #### Full Test Suite
@@ -286,7 +304,7 @@ Tests run automatically in CI with the following phases:
 
 ### Test Infrastructure
 
-- **Mock coverage** - 14 mock headers cover all hardware interfaces but may not capture all edge cases
+- **Mock coverage** - 17 mock headers cover all hardware interfaces but may not capture all edge cases
 - **Timing tests** - Sleep/wakeup tests require precise timing control from mock timers
 - **UI state transitions** - Complex state machines may have untested edge cases
 
@@ -298,25 +316,40 @@ Tests run automatically in CI with the following phases:
 ESP32-P4X-EYE/
 ├── factory_demo/           # Main ESP-IDF application
 │   ├── main/              # Application source code
-│   ├── lvgl/             # LVGL UI components
+│   ├── components/        # AI detection components
 │   ├── sim_hal.c         # Hardware simulation layer
-│   └── CMakeLists.txt    # Build configuration
+│   ├── CMakeLists.txt    # Build configuration
+│   └── idf_component.yml # ESP-IDF component dependencies
 ├── test/                  # Test suite
 │   ├── test_nvs_storage.c
 │   ├── test_gpio_bsp.c
 │   ├── test_ui_state.c
 │   ├── test_ai_buffers.c
 │   ├── test_sleep_wakeup.c
+│   ├── test_photo_quality.c
 │   ├── simulator/         # LVGL simulator tests
 │   │   ├── test_ui_simulator.c
-│   │   └── sim_hal.c
-│   └── mocks/            # Hardware mock implementations
+│   │   ├── sim_hal.c
+│   │   └── CMakeLists.txt
+│   └── mocks/            # Hardware mock implementations (17 headers)
 │       ├── nvs.h
+│       ├── nvs_flash.h
 │       ├── driver/gpio.h
 │       ├── bsp/esp32_p4_eye.h
 │       ├── esp_timer.h
 │       ├── esp_sleep.h
-│       └── esp_memory_utils.h
+│       ├── esp_memory_utils.h
+│       ├── esp_err.h
+│       ├── esp_log.h
+│       ├── esp_system.h
+│       ├── esp_check.h
+│       ├── esp_lvgl_port.h
+│       ├── iot_button.h
+│       ├── iot_knob.h
+│       ├── ui_extra.h
+│       └── sdkconfig.h
+├── common_components/     # Shared ESP32-P4X-EYE components
+│   └── esp32_p4_eye/
 ├── .github/workflows/     # CI/CD pipeline definitions
 ├── Dockerfile.test        # Test container definition
 └── platformio.ini         # PlatformIO configuration (for reference)

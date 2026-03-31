@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
 
 typedef uint32_t nvs_handle_t;
 
@@ -168,5 +169,34 @@ static inline esp_err_t nvs_get_u32(nvs_handle_t handle, const char *key, uint32
     if (!e) return ESP_ERR_NVS_NOT_FOUND;
     if (e->type != NVS_TYPE_U32) return ESP_ERR_NVS_TYPE_MISMATCH;
     *out_value = e->value.u32;
+    return ESP_OK;
+}
+
+/* Blob support for structured data */
+static inline esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *data, size_t length) {
+    (void)handle;
+    mock_nvs_entry_t *e = mock_nvs_alloc(mock_nvs_current_ns, key);
+    if (!e) return ESP_ERR_NO_MEM;
+    e->type = NVS_TYPE_BLOB;
+    /* Store only the first 4 bytes of blob data for simplicity */
+    if (length > 0 && data != NULL) {
+        uint32_t temp;
+        memcpy(&temp, data, sizeof(temp));
+        e->value.u32 = temp;
+    }
+    return ESP_OK;
+}
+
+static inline esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *out_data, size_t *length) {
+    (void)handle;
+    mock_nvs_entry_t *e = mock_nvs_find(mock_nvs_current_ns, key);
+    if (!e) return ESP_ERR_NVS_NOT_FOUND;
+    if (e->type != NVS_TYPE_BLOB) return ESP_ERR_NVS_TYPE_MISMATCH;
+    
+    /* Return the stored value */
+    if (out_data != NULL && *length >= sizeof(uint32_t)) {
+        memcpy(out_data, &e->value.u32, sizeof(uint32_t));
+        *length = sizeof(uint32_t);
+    }
     return ESP_OK;
 }

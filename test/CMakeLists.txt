@@ -15,6 +15,7 @@ set(TEST_SOURCES
     test_ui_state.c
     test_ai_buffers.c
     test_sleep_wakeup.c
+    test_photo_quality.c
 )
 
 # UI Simulator test (separate from unit tests — runs full UI workflow)
@@ -24,10 +25,21 @@ set(SIM_SOURCES
 
 foreach(TEST_SRC ${TEST_SOURCES})
     get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
-    add_executable(${TEST_NAME} ${TEST_SRC})
+    # Set source files for each test
+    set(TEST_ALL_SOURCES ${TEST_SRC})
+    
+    # Add app_video_photo_quality.c for photo_quality test
+    if(TEST_NAME STREQUAL "test_photo_quality")
+        list(APPEND TEST_ALL_SOURCES 
+            ${CMAKE_CURRENT_SOURCE_DIR}/../factory_demo/main/app/Video/app_video_photo_quality.c
+        )
+    endif()
+    
+    add_executable(${TEST_NAME} ${TEST_ALL_SOURCES})
     target_include_directories(${TEST_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/mocks
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../factory_demo/main/app/Video
     )
 endforeach()
 

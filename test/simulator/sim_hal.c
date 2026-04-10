@@ -9,6 +9,8 @@
 #include "sim_hal.h"
 #include "esp_err.h"
 #include "ui_extra.h"
+#include "ui.h"
+#include "lvgl.h"
 
 #include <string.h>
 
@@ -121,11 +123,67 @@ esp_err_t app_storage_load_gyroscope_setting(bool *enabled) {
 }
 
 /*-------------------------------------------------*/
-/* app_album.h stubs                                */
+/* app_album.h stubs — fake photo rendering         */
 /*-------------------------------------------------*/
 
+#define ALBUM_W 240
+#define ALBUM_H 240
+
+/* Canvas buffer for fake album images */
+static lv_color_t s_album_buf[ALBUM_W * ALBUM_H];
+static lv_obj_t  *s_album_canvas = NULL;
+
+/* Palette for fake photos — distinct colours per index */
+static const uint32_t s_photo_colors[] = {
+    0x3498DB, /* Blue      */
+    0x2ECC71, /* Green     */
+    0xE74C3C, /* Red       */
+    0xF39C12, /* Orange    */
+    0x9B59B6, /* Purple    */
+};
+
+static void sim_album_draw_placeholder(void)
+{
+    if (!s_album_canvas) return;
+    int idx = s_hw.album_current_index;
+    uint32_t bg = s_photo_colors[idx % (sizeof(s_photo_colors)/sizeof(s_photo_colors[0]))];
+
+    lv_canvas_set_buffer(s_album_canvas, s_album_buf, ALBUM_W, ALBUM_H, LV_IMG_CF_TRUE_COLOR);
+
+    /* Fill background with the photo colour */
+    lv_draw_rect_dsc_t rect_dsc;
+    lv_draw_rect_dsc_init(&rect_dsc);
+    rect_dsc.bg_color = lv_color_hex(bg);
+    rect_dsc.bg_opa   = LV_OPA_COVER;
+    rect_dsc.radius   = 0;
+    rect_dsc.border_width = 0;
+    lv_canvas_draw_rect(s_album_canvas, 0, 0, ALBUM_W, ALBUM_H, &rect_dsc);
+
+    /* Draw "Photo N/M" label */
+    lv_draw_label_dsc_t label_dsc;
+    lv_draw_label_dsc_init(&label_dsc);
+    label_dsc.color = lv_color_white();
+    label_dsc.font  = &lv_font_montserrat_20;
+    label_dsc.align = LV_TEXT_ALIGN_CENTER;
+
+    char text[32];
+    snprintf(text, sizeof(text), "Photo %d / %d", idx + 1, s_hw.album_image_count);
+    lv_canvas_draw_text(s_album_canvas, 20, ALBUM_H / 2 - 15, ALBUM_W - 40, &label_dsc, text);
+
+    /* Draw a decorative border */
+    rect_dsc.bg_opa = LV_OPA_TRANSP;
+    rect_dsc.border_color = lv_color_white();
+    rect_dsc.border_width = 3;
+    rect_dsc.border_opa   = LV_OPA_60;
+    rect_dsc.radius = 8;
+    lv_canvas_draw_rect(s_album_canvas, 10, 10, ALBUM_W - 20, ALBUM_H - 20, &rect_dsc);
+
+    lv_obj_invalidate(s_album_canvas);
+}
+
 esp_err_t app_album_init(void *parent) {
-    (void)parent;
+    s_album_canvas = (lv_obj_t *)parent;
+    printf("[SIM] app_album_init(parent=%p)\n", parent);
     return ESP_OK;
 }
 
@@ -134,6 +192,7 @@ esp_err_t app_album_next_image(void) {
         s_hw.album_current_index = (s_hw.album_current_index + 1) % s_hw.album_image_count;
     }
     printf("[SIM] album_next -> index=%d\n", s_hw.album_current_index);
+    sim_album_draw_placeholder();
     return ESP_OK;
 }
 
@@ -142,11 +201,13 @@ esp_err_t app_album_prev_image(void) {
         s_hw.album_current_index = (s_hw.album_current_index - 1 + s_hw.album_image_count) % s_hw.album_image_count;
     }
     printf("[SIM] album_prev -> index=%d\n", s_hw.album_current_index);
+    sim_album_draw_placeholder();
     return ESP_OK;
 }
 
 esp_err_t app_album_refresh(void) {
     printf("[SIM] album_refresh (count=%d)\n", s_hw.album_image_count);
+    sim_album_draw_placeholder();
     return ESP_OK;
 }
 

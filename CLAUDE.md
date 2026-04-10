@@ -72,11 +72,12 @@ docker run --rm p4mslo-ci
 
 ### LVGL Simulator
 
-Compiles real SquareLine Studio UI code against LVGL 8.3.11 with SDL2 display backend. Hardware calls stubbed in `sim_hal.c`. Generates 11 navigation screenshots in `test/simulator/screenshots/`.
+Compiles real SquareLine Studio UI code against LVGL 8.3.11 with SDL2 display backend. Hardware calls stubbed in `sim_hal.c` (includes fake colored album photos). Generates 44 PNG screenshots covering all pages in `test/simulator/screenshots/`.
 
-- **Interactive**: SDL2 window (720x720), keyboard-to-button mapping
-- **Headless**: `--screenshot` dumps PPM framebuffer at each navigation step
+- **Interactive**: SDL2 window (240x240), keyboard-to-button mapping
+- **Headless**: `--screenshot` generates PNG screenshots via libpng, navigates all pages using `ui_extra_goto_page()`
 - **Config**: `lv_conf.h`, `lv_drv_conf.h`, `sim_config.h`
+- **Screenshot map**: See `docs/simulator-screenshots.md`
 
 ## CI Pipeline (GitHub Actions)
 
@@ -105,13 +106,16 @@ P4MSLO/
 │   └── esp32_p4_eye/          # Board support package
 ├── test/
 │   ├── test_*.c               # 5 unit test files (47 tests)
-│   ├── simulator/             # LVGL simulator (12 tests)
-│   │   ├── sim_main.c         # SDL2 main loop
-│   │   ├── sim_hal.c          # Hardware stub layer
+│   ├── simulator/             # LVGL simulator (13 tests)
+│   │   ├── sim_main.c         # SDL2 main loop + headless PNG screenshot engine
+│   │   ├── sim_hal.c          # Hardware stub layer (includes fake album photos)
 │   │   ├── test_ui_simulator.c
-│   │   └── screenshots/       # 11 captured UI screenshots
+│   │   └── screenshots/       # 44 PNG screenshots covering all pages
 │   ├── mocks/                 # 17 ESP-IDF mock headers
 │   └── CMakeLists.txt
+├── docs/                      # Documentation
+│   ├── device-info.md         # ESP32-P4X-EYE hardware details, flash commands
+│   └── simulator-screenshots.md # Screenshot map (44 screenshots)
 ├── .github/workflows/ci.yml   # CI pipeline
 ├── Dockerfile                 # Full CI image (tests + ESP-IDF)
 └── Dockerfile.test            # Lightweight test-only image
@@ -122,8 +126,17 @@ P4MSLO/
 - **ESP-IDF v5.5.3 required** — v5.5.1/5.5.2 fail component resolution
 - **PlatformIO unsupported** — ESP32-P4 requires native ESP-IDF CMake
 - **Simulator camera** — Viewfinder renders empty (no camera feed, expected)
-- **SDL2 dependency** — LVGL simulator needs `libsdl2-dev`, not in all CI envs
+- **SDL2 + libpng dependencies** — LVGL simulator needs `libsdl2-dev` and `libpng-dev`
 - **LVGL/lv_drivers** — Must be manually cloned into `test/simulator/` (gitignored)
+- **Chip revision** — ESP32-P4X-EYE dev boards are rev v1.3; ESP-IDF v5.5.3 defaults to rev v3.01+ minimum
+
+## Flash via Docker
+
+```bash
+docker run --rm -v $(pwd):/workspace -w /workspace/factory_demo \
+  --device=/dev/ttyACM0 espressif/idf:v5.5.3 \
+  bash -c ". \$IDF_PATH/export.sh && idf.py -p /dev/ttyACM0 flash"
+```
 
 ## Gotchas
 
@@ -133,3 +146,6 @@ P4MSLO/
 4. GPIO mock tracks 64 pins — verify pin numbers match hardware
 5. Sleep/wakeup tests need manual timer setup in mocks
 6. AI buffer alignment is critical — use `esp_memory_utils` mock
+7. Chip rev v1.3 needs `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` and `CONFIG_ESP32P4_REV_MIN_100=y` in sdkconfig.defaults
+8. `ui_extra_clear_page()` must hide `ui_PanelCameraSettings` — otherwise ISP sliders bleed into other pages
+9. The popup timer (`lv_popup_timer`) is shared across pages — call `ui_extra_cancel_popup_timer()` when programmatically switching pages

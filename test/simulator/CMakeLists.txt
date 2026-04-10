@@ -18,6 +18,7 @@ set(DRV_DIR    ${SIM_DIR}/lv_drivers)
 # -----------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
+pkg_check_modules(PNG REQUIRED libpng)
 
 # -----------------------------------------------------------------
 # LVGL core sources (all .c under lvgl/src/)
@@ -93,6 +94,9 @@ target_include_directories(p4eye_sim PRIVATE
 
     # SDL2
     ${SDL2_INCLUDE_DIRS}
+
+    # libpng
+    ${PNG_INCLUDE_DIRS}
 )
 
 # -----------------------------------------------------------------
@@ -134,6 +138,7 @@ target_compile_options(p4eye_sim PRIVATE
 # -----------------------------------------------------------------
 target_link_libraries(p4eye_sim PRIVATE
     ${SDL2_LIBRARIES}
+    ${PNG_LIBRARIES}
     m
     pthread
 )

@@ -153,6 +153,11 @@ uint16_t app_extra_get_interval_time(void);
 void ui_extra_set_sd_card_mounted(bool mounted);
 
 /**
+ * @brief Cancel popup timer to prevent stale UI elements from appearing
+ */
+void ui_extra_cancel_popup_timer(void);
+
+/**
  * @brief Get SD card mount status
  * @return Whether SD card is mounted
  */

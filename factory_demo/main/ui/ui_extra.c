@@ -848,6 +848,7 @@ void ui_extra_clear_page(void)
     lv_obj_add_flag(ui_LabelRedDotTime, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_PanelSettings, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_PanelSettingsMenu, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_PanelCameraSettings, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_PanelCanvasPopupAICamera, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(scroll_cont, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(info_label, LV_OBJ_FLAG_HIDDEN);
@@ -1317,6 +1318,20 @@ void ui_extra_set_sd_card_mounted(bool mounted)
 bool ui_extra_get_sd_card_mounted(void)
 {
     return is_sd_card_mounted;
+}
+
+/**
+ * @brief Cancel and delete the popup timer
+ *
+ * Useful when programmatically switching pages to prevent a popup timer
+ * from a previous page firing and revealing stale UI elements.
+ */
+void ui_extra_cancel_popup_timer(void)
+{
+    if (lv_popup_timer) {
+        lv_timer_del(lv_popup_timer);
+        lv_popup_timer = NULL;
+    }
 }
 
 /**

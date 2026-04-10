@@ -30,6 +30,15 @@
 #include "ui_extra.h"
 #include "sim_hal.h"
 
+/* Album functions — declared in app_album.h, implemented in sim_hal.c */
+#include "esp_err.h"
+esp_err_t app_album_init(void *parent);
+esp_err_t app_album_next_image(void);
+esp_err_t app_album_prev_image(void);
+
+/* PNG output */
+#include <png.h>
+
 /* SDL2 — included for both interactive and headless (tick source) */
 #include <SDL2/SDL.h>
 
@@ -48,7 +57,7 @@
 static void setup_display(void);
 static void run_interactive(void);
 static void run_screenshot_mode(void);
-static void save_framebuffer_ppm(const char *filename);
+static void save_framebuffer_png(const char *filename);
 
 /* Framebuffer for headless screenshot capture */
 static lv_color_t s_fb[DISP_HOR_RES * DISP_VER_RES];
@@ -97,23 +106,26 @@ int main(int argc, char **argv)
         /* Headless mode: SDL needed for tick only, no window */
         SDL_Init(SDL_INIT_TIMER);
 
-        /* Setup display with headless flush */
+        /* Setup display with headless flush — direct mode renders into s_fb */
         static lv_disp_draw_buf_t draw_buf;
-        static lv_color_t buf1[DISP_HOR_RES * 10];
-        lv_disp_draw_buf_init(&draw_buf, buf1, NULL, DISP_HOR_RES * 10);
+        lv_disp_draw_buf_init(&draw_buf, s_fb, NULL, DISP_HOR_RES * DISP_VER_RES);
 
         static lv_disp_drv_t disp_drv;
         lv_disp_drv_init(&disp_drv);
-        disp_drv.draw_buf  = &draw_buf;
-        disp_drv.flush_cb  = headless_flush_cb;
-        disp_drv.hor_res   = DISP_HOR_RES;
-        disp_drv.ver_res   = DISP_VER_RES;
+        disp_drv.draw_buf    = &draw_buf;
+        disp_drv.flush_cb    = headless_flush_cb;
+        disp_drv.hor_res     = DISP_HOR_RES;
+        disp_drv.ver_res     = DISP_VER_RES;
+        disp_drv.direct_mode = 1;  /* Render directly into s_fb */
         lv_disp_drv_register(&disp_drv);
     }
 
     /* Initialize the REAL UI */
     ui_init();
     ui_extra_init();
+
+    /* Initialize album canvas with the real UI object (mirrors app_storage.c) */
+    app_album_init(ui_ImageScreenAlbum);
 
     printf("[SIM] UI initialized. Page=%d\n", ui_extra_get_current_page());
 
@@ -206,6 +218,11 @@ static void run_interactive(void)
 }
 
 /*-------------------------------------------------*/
+/* Screenshot output directory (relative to build/) */
+/*-------------------------------------------------*/
+#define SCREENSHOT_DIR "../screenshots"
+
+/*-------------------------------------------------*/
 /* Screenshot mode: comprehensive page capture      */
 /*-------------------------------------------------*/
 static void run_screenshot_mode(void)
@@ -214,7 +231,7 @@ static void run_screenshot_mode(void)
     char filename[256];
 
     /* Create screenshots directory */
-    (void)system("mkdir -p screenshots");
+    (void)system("mkdir -p " SCREENSHOT_DIR);
 
     /* Helper: pump LVGL for N milliseconds to let rendering settle */
     #define PUMP_MS(ms) do { \
@@ -226,176 +243,158 @@ static void run_screenshot_mode(void)
     } while(0)
 
     #define SCREENSHOT(label) do { \
-        PUMP_MS(300); \
-        snprintf(filename, sizeof(filename), "screenshots/%02d_%s.ppm", screenshot_num++, (label)); \
-        save_framebuffer_ppm(filename); \
+        PUMP_MS(500); \
+        snprintf(filename, sizeof(filename), SCREENSHOT_DIR "/%02d_%s.png", screenshot_num++, (label)); \
+        save_framebuffer_png(filename); \
         printf("[SCREENSHOT] %s\n", filename); \
     } while(0)
 
-    /* ===== 1. MAIN MENU — all button icons visible ===== */
+    /* Helper: navigate to a page cleanly (cancel stale timers, go via main) */
+    #define GOTO_PAGE(page) do { \
+        ui_extra_cancel_popup_timer(); \
+        ui_extra_goto_page(UI_PAGE_MAIN); \
+        PUMP_MS(300); \
+        ui_extra_cancel_popup_timer(); \
+        ui_extra_goto_page(page); \
+        PUMP_MS(500); \
+    } while(0)
+
+    /* Simulate SD card inserted so pages don't block on SD warnings */
+    ui_extra_set_sd_card_mounted(true);
+    PUMP_MS(200);
+
+    /* ===== 1. MAIN MENU — scroll through all items ===== */
     printf("\n[SIM] === Main Menu Screenshots ===\n");
-    SCREENSHOT("main_menu_camera_selected");
-
-    /* Scroll through each main menu item */
-    ui_extra_btn_down();
-    SCREENSHOT("main_menu_item2");
+    /* Menu order: Camera(0), Interval Cam(1), Video Mode(2),
+       AI Detect(3), Album(4), USB Disk(5), Settings(6) */
+    SCREENSHOT("main_menu_camera");
 
     ui_extra_btn_down();
-    SCREENSHOT("main_menu_item3");
+    SCREENSHOT("main_menu_interval_cam");
 
     ui_extra_btn_down();
-    SCREENSHOT("main_menu_item4");
+    SCREENSHOT("main_menu_video_mode");
 
     ui_extra_btn_down();
-    SCREENSHOT("main_menu_item5");
+    SCREENSHOT("main_menu_ai_detect");
 
     ui_extra_btn_down();
-    SCREENSHOT("main_menu_item6");
+    SCREENSHOT("main_menu_album");
 
-    /* Wrap back to top */
     ui_extra_btn_down();
-    SCREENSHOT("main_menu_wrap_to_top");
+    SCREENSHOT("main_menu_usb_disk");
+
+    ui_extra_btn_down();
+    SCREENSHOT("main_menu_settings");
 
     /* ===== 2. CAMERA PAGE ===== */
     printf("\n[SIM] === Camera Page Screenshots ===\n");
-    ui_extra_btn_encoder();
+    GOTO_PAGE(UI_PAGE_CAMERA);
     SCREENSHOT("camera_main");
 
-    /* Camera with popup (down button shows camera popup) */
+    /* Down button interaction */
     ui_extra_btn_down();
-    PUMP_MS(200);
-    SCREENSHOT("camera_popup_down");
+    PUMP_MS(300);
+    SCREENSHOT("camera_btn_down");
 
-    /* Camera with up button popup */
+    /* Up button interaction */
     ui_extra_btn_up();
-    PUMP_MS(200);
-    SCREENSHOT("camera_popup_up");
+    PUMP_MS(300);
+    SCREENSHOT("camera_btn_up");
 
-    /* Camera encoder press (take photo / select) */
+    /* Encoder press (take photo) */
     ui_extra_btn_encoder();
-    PUMP_MS(200);
-    SCREENSHOT("camera_encoder_press");
+    PUMP_MS(300);
+    SCREENSHOT("camera_take_photo");
 
-    /* Back to main */
-    ui_extra_btn_menu();
-    PUMP_MS(200);
+    /* Zoom via knob */
+    ui_extra_btn_right();
+    PUMP_MS(300);
+    SCREENSHOT("camera_zoom_in");
+
+    ui_extra_btn_left();
+    PUMP_MS(300);
+    SCREENSHOT("camera_zoom_out");
 
     /* ===== 3. ALBUM PAGE ===== */
     printf("\n[SIM] === Album Page Screenshots ===\n");
-    /* Navigate to album (item 2 from top — depends on menu order) */
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_encoder();
-    SCREENSHOT("album_page_main");
+    GOTO_PAGE(UI_PAGE_ALBUM);
+    SCREENSHOT("album_photo1");
 
-    /* Browse album images */
-    ui_extra_btn_down();
-    PUMP_MS(200);
-    SCREENSHOT("album_next_image");
+    /* Browse through fake photos via direct album API */
+    app_album_next_image();
+    SCREENSHOT("album_photo2");
 
-    ui_extra_btn_down();
-    PUMP_MS(200);
-    SCREENSHOT("album_next_image2");
+    app_album_next_image();
+    SCREENSHOT("album_photo3");
 
-    ui_extra_btn_up();
-    PUMP_MS(200);
-    SCREENSHOT("album_prev_image");
+    app_album_next_image();
+    SCREENSHOT("album_photo4");
 
-    /* Back to main */
-    ui_extra_btn_menu();
-    PUMP_MS(200);
+    app_album_prev_image();
+    SCREENSHOT("album_photo3_back");
 
     /* ===== 4. SETTINGS PAGE ===== */
     printf("\n[SIM] === Settings Page Screenshots ===\n");
-    /* Navigate to settings */
-    for (int i = 0; i < 6; i++) {
-        ui_extra_btn_down();
-        PUMP_MS(100);
-    }
-    ui_extra_btn_encoder();
+    GOTO_PAGE(UI_PAGE_SETTINGS);
     SCREENSHOT("settings_main");
 
-    /* Scroll through all settings items */
+    /* Scroll through settings items */
     ui_extra_btn_down();
+    PUMP_MS(300);
     SCREENSHOT("settings_item2");
 
     ui_extra_btn_down();
+    PUMP_MS(300);
     SCREENSHOT("settings_item3");
 
     ui_extra_btn_down();
+    PUMP_MS(300);
     SCREENSHOT("settings_item4");
 
-    /* Toggle a setting (right button) */
-    ui_extra_btn_right();
-    PUMP_MS(200);
-    SCREENSHOT("settings_toggle_right");
-
-    /* Toggle back (left button) */
-    ui_extra_btn_left();
-    PUMP_MS(200);
-    SCREENSHOT("settings_toggle_left");
-
-    /* Continue scrolling settings */
     ui_extra_btn_down();
+    PUMP_MS(300);
     SCREENSHOT("settings_item5");
 
     ui_extra_btn_down();
+    PUMP_MS(300);
     SCREENSHOT("settings_item6");
 
-    /* Encoder press on a settings item */
-    ui_extra_btn_encoder();
-    PUMP_MS(200);
-    SCREENSHOT("settings_encoder_press");
+    /* Toggle a setting */
+    ui_extra_btn_right();
+    PUMP_MS(300);
+    SCREENSHOT("settings_toggle_right");
 
-    /* Back to main */
-    ui_extra_btn_menu();
-    PUMP_MS(200);
+    ui_extra_btn_left();
+    PUMP_MS(300);
+    SCREENSHOT("settings_toggle_left");
+
+    /* Encoder press on setting */
+    ui_extra_btn_encoder();
+    PUMP_MS(300);
+    SCREENSHOT("settings_encoder_press");
 
     /* ===== 5. VIDEO MODE PAGE ===== */
     printf("\n[SIM] === Video Mode Screenshots ===\n");
-    /* Navigate to video mode (scroll to correct menu item) */
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_encoder();
-    PUMP_MS(300);
+    GOTO_PAGE(UI_PAGE_VIDEO_MODE);
     SCREENSHOT("video_mode_main");
 
-    /* Video mode interactions */
+    /* Start/stop recording */
     ui_extra_btn_encoder();
-    PUMP_MS(200);
-    SCREENSHOT("video_mode_encoder");
+    PUMP_MS(300);
+    SCREENSHOT("video_mode_record");
 
     ui_extra_btn_down();
-    PUMP_MS(200);
-    SCREENSHOT("video_mode_down");
+    PUMP_MS(300);
+    SCREENSHOT("video_mode_btn_down");
 
     ui_extra_btn_up();
-    PUMP_MS(200);
-    SCREENSHOT("video_mode_up");
-
-    /* Back to main */
-    ui_extra_btn_menu();
-    PUMP_MS(200);
+    PUMP_MS(300);
+    SCREENSHOT("video_mode_btn_up");
 
     /* ===== 6. AI DETECT PAGE ===== */
     printf("\n[SIM] === AI Detection Screenshots ===\n");
-    /* Navigate to AI detect */
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_encoder();
-    PUMP_MS(300);
+    GOTO_PAGE(UI_PAGE_AI_DETECT);
     SCREENSHOT("ai_detect_main");
 
     /* Cycle through AI modes */
@@ -407,75 +406,65 @@ static void run_screenshot_mode(void)
     PUMP_MS(300);
     SCREENSHOT("ai_detect_mode3");
 
-    /* AI detect with knob (zoom) */
+    /* Zoom via knob */
     ui_extra_btn_right();
-    PUMP_MS(200);
-    SCREENSHOT("ai_detect_knob_right");
+    PUMP_MS(300);
+    SCREENSHOT("ai_detect_zoom_in");
 
     ui_extra_btn_left();
-    PUMP_MS(200);
-    SCREENSHOT("ai_detect_knob_left");
-
-    /* Back to main */
-    ui_extra_btn_menu();
-    PUMP_MS(200);
+    PUMP_MS(300);
+    SCREENSHOT("ai_detect_zoom_out");
 
     /* ===== 7. INTERVAL CAMERA PAGE ===== */
     printf("\n[SIM] === Interval Camera Screenshots ===\n");
-    /* Navigate to interval camera */
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_down();
-    PUMP_MS(100);
-    ui_extra_btn_encoder();
-    PUMP_MS(300);
+    GOTO_PAGE(UI_PAGE_INTERVAL_CAM);
     SCREENSHOT("interval_cam_main");
 
-    /* Interval interactions */
+    /* Start interval */
     ui_extra_btn_encoder();
     PUMP_MS(300);
-    SCREENSHOT("interval_cam_encoder");
+    SCREENSHOT("interval_cam_start");
 
     ui_extra_btn_up();
-    PUMP_MS(200);
-    SCREENSHOT("interval_cam_up");
+    PUMP_MS(300);
+    SCREENSHOT("interval_cam_btn_up");
 
     ui_extra_btn_down();
-    PUMP_MS(200);
-    SCREENSHOT("interval_cam_down");
+    PUMP_MS(300);
+    SCREENSHOT("interval_cam_btn_down");
 
     ui_extra_btn_right();
-    PUMP_MS(200);
+    PUMP_MS(300);
     SCREENSHOT("interval_cam_time_plus");
 
     ui_extra_btn_left();
-    PUMP_MS(200);
+    PUMP_MS(300);
     SCREENSHOT("interval_cam_time_minus");
 
-    /* Back to main */
-    ui_extra_btn_menu();
-    PUMP_MS(200);
+    /* ===== 8. USB DISK PAGE ===== */
+    printf("\n[SIM] === USB Disk Screenshots ===\n");
+    GOTO_PAGE(UI_PAGE_USB_DISK);
+    SCREENSHOT("usb_disk_main");
 
-    /* ===== 8. FINAL STATE — return to main ===== */
+    /* ===== 9. FINAL — return to main ===== */
     printf("\n[SIM] === Final State ===\n");
+    GOTO_PAGE(UI_PAGE_MAIN);
     SCREENSHOT("final_main_menu");
 
-    printf("\n[SIM] Screenshot sequence complete: %d screenshots saved to screenshots/\n", screenshot_num);
+    printf("\n[SIM] Screenshot sequence complete: %d screenshots saved to " SCREENSHOT_DIR "/\n", screenshot_num);
 
     #undef PUMP_MS
     #undef SCREENSHOT
+    #undef GOTO_PAGE
 }
 
 /*-------------------------------------------------*/
-/* PPM framebuffer dump                             */
+/* PNG framebuffer dump via libpng                  */
 /*-------------------------------------------------*/
-static void save_framebuffer_ppm(const char *filename)
+static void save_framebuffer_png(const char *filename)
 {
     /* Force a full render cycle */
+    lv_obj_invalidate(lv_scr_act());
     lv_refr_now(NULL);
 
     FILE *f = fopen(filename, "wb");
@@ -484,21 +473,39 @@ static void save_framebuffer_ppm(const char *filename)
         return;
     }
 
-    fprintf(f, "P6\n%d %d\n255\n", DISP_HOR_RES, DISP_VER_RES);
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) { fclose(f); return; }
 
-    for (int i = 0; i < DISP_HOR_RES * DISP_VER_RES; i++) {
-        lv_color_t c = s_fb[i];
-        /* LVGL RGB565 with LV_COLOR_16_SWAP=1: green split across bytes */
-        uint8_t r5 = c.ch.red;
-        uint8_t g6 = LV_COLOR_GET_G(c);
-        uint8_t b5 = c.ch.blue;
-        uint8_t r = (r5 << 3) | (r5 >> 2);
-        uint8_t g = (g6 << 2) | (g6 >> 4);
-        uint8_t b = (b5 << 3) | (b5 >> 2);
-        fputc(r, f);
-        fputc(g, f);
-        fputc(b, f);
+    png_infop info = png_create_info_struct(png);
+    if (!info) { png_destroy_write_struct(&png, NULL); fclose(f); return; }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(f);
+        return;
     }
 
+    png_init_io(png, f);
+    png_set_IHDR(png, info, DISP_HOR_RES, DISP_VER_RES, 8,
+                 PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    uint8_t row[DISP_HOR_RES * 3];
+    for (int y = 0; y < DISP_VER_RES; y++) {
+        for (int x = 0; x < DISP_HOR_RES; x++) {
+            lv_color_t c = s_fb[y * DISP_HOR_RES + x];
+            uint8_t r5 = c.ch.red;
+            uint8_t g6 = LV_COLOR_GET_G(c);
+            uint8_t b5 = c.ch.blue;
+            row[x * 3 + 0] = (r5 << 3) | (r5 >> 2);
+            row[x * 3 + 1] = (g6 << 2) | (g6 >> 4);
+            row[x * 3 + 2] = (b5 << 3) | (b5 >> 2);
+        }
+        png_write_row(png, row);
+    }
+
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
     fclose(f);
 }

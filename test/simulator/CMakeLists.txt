@@ -91,6 +91,7 @@ target_include_directories(p4eye_sim PRIVATE
     # App headers — the real ones from factory_demo
     ${REPO_ROOT}/factory_demo/main/app
     ${REPO_ROOT}/factory_demo/main/app/Video
+    ${REPO_ROOT}/factory_demo/main/app/Gif
 
     # SDL2
     ${SDL2_INCLUDE_DIRS}

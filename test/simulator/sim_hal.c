@@ -376,3 +376,35 @@ esp_err_t app_isp_set_hue(uint32_t percent) {
     s_hw.hue = percent;
     return ESP_OK;
 }
+
+/*-------------------------------------------------*/
+/* app_gifs.h stubs                                 */
+/*-------------------------------------------------*/
+
+esp_err_t app_gifs_init(void *canvas) {
+    (void)canvas;
+    printf("[SIM] app_gifs_init\n");
+    return ESP_OK;
+}
+
+void app_gifs_deinit(void) {}
+
+esp_err_t app_gifs_scan(void) {
+    printf("[SIM] app_gifs_scan\n");
+    return ESP_OK;
+}
+
+int app_gifs_get_count(void) { return 0; }
+int app_gifs_get_current_index(void) { return 0; }
+
+esp_err_t app_gifs_next(void) { return ESP_OK; }
+esp_err_t app_gifs_prev(void) { return ESP_OK; }
+esp_err_t app_gifs_play_current(void) { return ESP_OK; }
+void app_gifs_stop(void) {}
+bool app_gifs_is_playing(void) { return false; }
+esp_err_t app_gifs_create_from_album(int delay_ms) {
+    (void)delay_ms;
+    printf("[SIM] app_gifs_create_from_album(%d)\n", delay_ms);
+    return ESP_OK;
+}
+bool app_gifs_is_encoding(void) { return false; }

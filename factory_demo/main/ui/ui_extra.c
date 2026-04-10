@@ -25,6 +25,7 @@
 #include "app_album.h"
 #include "app_video_stream.h"
 #include "app_isp.h"
+#include "app_gifs.h"
 
 /* Constants */
 #define IMG_BASE_ZOOM       60
@@ -119,6 +120,7 @@ static const PageMapping page_map[] = {
     {"INTERVAL CAM", UI_PAGE_INTERVAL_CAM},
     {"VIDEO MODE", UI_PAGE_VIDEO_MODE},
     {"AI DETECT", UI_PAGE_AI_DETECT},
+    {"GIFS", UI_PAGE_GIFS},
     {"ALBUM", UI_PAGE_ALBUM},
     {"USB DISK", UI_PAGE_USB_DISK},
     {"SETTINGS", UI_PAGE_SETTINGS},
@@ -133,6 +135,7 @@ static void ui_extra_redirect_to_video_mode_page(void);
 static void ui_extra_redirect_to_album_page(void);
 static void ui_extra_redirect_to_usb_disk_page(void);
 static void ui_extra_redirect_to_settings_page(void);
+static void ui_extra_redirect_to_gifs_page(void);
 static void ui_extra_clear_popup_window(void);
 static void ui_extra_focus_on_picture_delete(void);
 static void ui_extra_update_ai_detect_mode_label(void);
@@ -550,6 +553,8 @@ static void scroll_end_event_cb(lv_event_t * e)
                     lv_obj_align(info_label, LV_ALIGN_CENTER, -12, 45);
                 } else if(strcmp(btn_text, "VIDEO MODE") == 0) {
                     lv_obj_align(info_label, LV_ALIGN_CENTER, -9, 45);
+                } else if(strcmp(btn_text, "GIFS") == 0) {
+                    lv_obj_align(info_label, LV_ALIGN_CENTER, -9, 55);
                 } else if(strcmp(btn_text, "ALBUM") == 0) {
                     lv_obj_align(info_label, LV_ALIGN_CENTER, -9, 55);
                 } else if(strcmp(btn_text, "USB DISK") == 0) {
@@ -773,8 +778,8 @@ static void lv_scroll_create(void)
     lv_label_set_text(info_label, "");  
 
     const char* btn_texts[] = {
-        "CAMERA", "INTERVAL CAM", "VIDEO MODE", "AI DETECT","ALBUM", 
-        "USB DISK", "SETTINGS"
+        "CAMERA", "INTERVAL CAM", "VIDEO MODE", "AI DETECT", "GIFS",
+        "ALBUM", "USB DISK", "SETTINGS"
     };
 
     // Define the image source for each button
@@ -783,6 +788,7 @@ static void lv_scroll_create(void)
         &ui_img_interval_big_png,
         &ui_img_video_big_png,
         &ui_img_ai_detect_png,
+        &ui_img_gifs_big_png,
         &ui_img_album_big_png,
         &ui_img_usb_big_png,
         &ui_img_settings_big_png,
@@ -978,6 +984,30 @@ static void ui_extra_redirect_to_album_page(void)
 }
 
 /**
+ * @brief Redirect to GIFs page
+ */
+static bool gifs_initialized = false;
+
+static void ui_extra_redirect_to_gifs_page(void)
+{
+    current_page = UI_PAGE_GIFS;
+
+    ui_extra_clear_page();
+
+    _ui_screen_change(&ui_ScreenGifs, LV_SCR_LOAD_ANIM_NONE, 0, 0, ui_ScreenGifs_screen_init);
+
+    if(is_sd_card_mounted) {
+        lv_obj_add_flag(ui_PanelGifsPopupSDWarning, LV_OBJ_FLAG_HIDDEN);
+        if (!gifs_initialized) {
+            app_gifs_init(ui_ImageScreenGifs);
+            gifs_initialized = true;
+        }
+    } else {
+        lv_obj_clear_flag(ui_PanelGifsPopupSDWarning, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/**
  * @brief Redirect to USB disk page
  */
 static void ui_extra_redirect_to_usb_disk_page(void)
@@ -1166,6 +1196,10 @@ void ui_extra_goto_page(ui_page_t page)
             break;
         case UI_PAGE_AI_DETECT:
             ui_extra_redirect_to_ai_detect_page();
+            break;
+        case UI_PAGE_GIFS:
+            app_gifs_scan();
+            ui_extra_redirect_to_gifs_page();
             break;
         default:
             ui_extra_redirect_to_main_page();
@@ -1575,7 +1609,11 @@ void ui_extra_btn_up(void)
                 ui_extra_change_ai_detect_mode(AI_DETECT_PEDESTRIAN);
             }
             break;
-            
+
+        case UI_PAGE_GIFS:
+            app_gifs_prev();
+            break;
+
         default:
             break;
     }
@@ -1656,7 +1694,11 @@ void ui_extra_btn_down(void)
                 ui_extra_change_ai_detect_mode(AI_DETECT_FACE);
             }
             break;
-            
+
+        case UI_PAGE_GIFS:
+            app_gifs_next();
+            break;
+
         default:
             break;
     }
@@ -1875,6 +1917,11 @@ void ui_extra_btn_menu(void)
             }
             break;    
         
+        case UI_PAGE_GIFS:
+            app_gifs_stop();
+            ui_extra_goto_page(UI_PAGE_MAIN);
+            break;
+
         default:
             // For other pages, return to main page
             ui_extra_goto_page(UI_PAGE_MAIN);
@@ -1882,7 +1929,7 @@ void ui_extra_btn_menu(void)
             if(lv_interval_timer) {
                 lv_timer_ready(lv_interval_timer);
             }
-            
+
             // Hide AI mode label when leaving AI detect page
             if (current_page == UI_PAGE_AI_DETECT && ai_mode_label != NULL) {
                 lv_obj_add_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
@@ -2037,6 +2084,17 @@ void ui_extra_btn_encoder(void)
                 if (lv_video_timer) {
                     lv_timer_pause(lv_video_timer);
                 }
+            }
+            break;
+
+        case UI_PAGE_GIFS:
+            if (app_gifs_is_playing()) {
+                app_gifs_stop();
+            } else if (app_gifs_get_count() > 0) {
+                app_gifs_play_current();
+            } else if (!app_gifs_is_encoding()) {
+                /* No GIFs exist — create one from album photos */
+                app_gifs_create_from_album(500);
             }
             break;
 

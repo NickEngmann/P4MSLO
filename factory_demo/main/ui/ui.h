@@ -133,6 +133,14 @@ extern lv_obj_t * ui_ImageScreenUSB;
 extern lv_obj_t * ui_ImageScreenUSBSuccess;
 extern lv_obj_t * ui_ImageScreenUSBWarning;
 extern lv_obj_t * ui_ImageUSBNOSDcard;
+// SCREEN: ui_ScreenGifs
+void ui_ScreenGifs_screen_init(void);
+extern lv_obj_t * ui_ScreenGifs;
+extern lv_obj_t * ui_ImageScreenGifs;
+extern lv_obj_t * ui_ImageGifsMenu;
+extern lv_obj_t * ui_ImageGifsUp;
+extern lv_obj_t * ui_ImageGifsDown;
+extern lv_obj_t * ui_PanelGifsPopupSDWarning;
 // SCREEN: ui_ScreenPicSave
 void ui_ScreenPicSave_screen_init(void);
 extern lv_obj_t * ui_ScreenPicSave;
@@ -165,6 +173,7 @@ LV_IMG_DECLARE(ui_img_usb_big_png);    // assets/usb_big.png
 LV_IMG_DECLARE(ui_img_settings_big_png);    // assets/settings_big.png
 LV_IMG_DECLARE(ui_img_ai_detect_png); // assets/ai_detect.png
 LV_IMG_DECLARE(ui_img_ai_detect_small_png); // assets/ai_detect_small.png
+LV_IMG_DECLARE(ui_img_gifs_big_png); // assets/gifs_big.png
 
 
 LV_FONT_DECLARE(ui_font_FontKoHoBold14);

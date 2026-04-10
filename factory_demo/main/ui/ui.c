@@ -104,6 +104,15 @@ lv_obj_t * ui_PanelCanvasPopupCameraSDSpaceWarning;
 lv_obj_t * ui_LabelPanelCanvasPopupCameraSDSpaceWarning;
 
 
+// SCREEN: ui_ScreenGifs
+void ui_ScreenGifs_screen_init(void);
+lv_obj_t * ui_ScreenGifs;
+lv_obj_t * ui_ImageScreenGifs;
+lv_obj_t * ui_ImageGifsMenu;
+lv_obj_t * ui_ImageGifsUp;
+lv_obj_t * ui_ImageGifsDown;
+lv_obj_t * ui_PanelGifsPopupSDWarning;
+
 // SCREEN: ui_ScreenAlbum
 void ui_ScreenAlbum_screen_init(void);
 lv_obj_t * ui_ScreenAlbum;

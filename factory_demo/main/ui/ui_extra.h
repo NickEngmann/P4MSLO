@@ -34,6 +34,7 @@ typedef enum {
     UI_PAGE_USB_DISK,       // USB disk page
     UI_PAGE_SETTINGS,       // Settings page
     UI_PAGE_AI_DETECT,      // AI detect page
+    UI_PAGE_GIFS,           // GIFs page
     UI_PAGE_MAX             // Page count
 } ui_page_t;
 

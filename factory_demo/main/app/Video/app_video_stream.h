@@ -64,6 +64,20 @@ esp_err_t app_video_stream_init(i2c_master_bus_handle_t i2c_handle);
  */
 esp_err_t app_video_stream_deinit(void);
 
+/**
+ * @brief Free large camera buffers to make PSRAM available for other tasks
+ *
+ * Frees scaled_camera_buf, shared_photo_buf, AI buffers, and JPEG buffer.
+ * The camera stream task continues but frame processing is skipped.
+ * Call app_video_stream_resume_buffers() to reallocate.
+ */
+void app_video_stream_free_buffers(void);
+
+/**
+ * @brief Reallocate camera buffers after they were freed
+ */
+esp_err_t app_video_stream_realloc_buffers(void);
+
 /* Photo and video control */
 /**
  * @brief Take a photo with the current settings

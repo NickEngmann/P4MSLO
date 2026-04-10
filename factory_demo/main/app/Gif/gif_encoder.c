@@ -118,8 +118,11 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
         ESP_LOGI(TAG, "GIF dimensions: %dx%d", enc->width, enc->height);
     }
 
-    /* Allocate decode buffer sized for this specific image (RGB565 output) */
-    size_t needed = (size_t)info.width * info.height * 2;
+    /* Allocate decode buffer sized for this specific image (RGB565 output).
+     * The hardware JPEG decoder aligns width and height to 16 bytes. */
+    uint32_t aligned_w = (info.width + 15) & ~15;
+    uint32_t aligned_h = (info.height + 15) & ~15;
+    size_t needed = (size_t)aligned_w * aligned_h * 2;
     if (!enc->decode_buf || enc->decode_buf_size < needed) {
         if (enc->decode_buf) {
             heap_caps_free(enc->decode_buf);
@@ -159,6 +162,18 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
     /* Free raw JPEG data early */
     free(enc->jpeg_buf);
     enc->jpeg_buf = NULL;
+
+    /* Allocate scaled output buffer if needed */
+    if (!enc->scaled_buf) {
+        enc->scaled_buf_size = ALIGN_UP(enc->width * enc->height * 2, enc->cache_line_size);
+        enc->scaled_buf = heap_caps_aligned_calloc(enc->cache_line_size, 1,
+                                                    enc->scaled_buf_size, MALLOC_CAP_SPIRAM);
+        if (!enc->scaled_buf) {
+            ESP_LOGE(TAG, "Failed to allocate %zu byte scaled buffer", enc->scaled_buf_size);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "Allocated scaled buffer: %zu bytes", enc->scaled_buf_size);
+    }
 
     /* Scale to target resolution using PPA */
     /* Compute square crop from center */
@@ -339,23 +354,8 @@ void gif_encoder_set_progress_cb(gif_encoder_t *enc, gif_encoder_progress_cb_t c
 
 esp_err_t gif_encoder_pass1_add_frame(gif_encoder_t *enc, const char *jpeg_path)
 {
-    esp_err_t ret;
-
-    /* Allocate scaled buffer if not done yet (we need to decode one frame first to know dimensions) */
-    ret = load_and_decode_jpeg(enc, jpeg_path);
+    esp_err_t ret = load_and_decode_jpeg(enc, jpeg_path);
     if (ret != ESP_OK) return ret;
-
-    /* Ensure scaled buffer exists */
-    if (!enc->scaled_buf) {
-        enc->scaled_buf_size = ALIGN_UP(enc->width * enc->height * 2, enc->cache_line_size);
-        enc->scaled_buf = heap_caps_aligned_calloc(enc->cache_line_size, 1,
-                                                    enc->scaled_buf_size, MALLOC_CAP_SPIRAM);
-        if (!enc->scaled_buf) return ESP_ERR_NO_MEM;
-
-        /* Re-decode since we just allocated the output buffer */
-        ret = load_and_decode_jpeg(enc, jpeg_path);
-        if (ret != ESP_OK) return ret;
-    }
 
     /* Subsample pixels into quantizer (every 4th pixel to save time) */
     ret = gif_quantize_accumulate_rgb565(enc->quantizer, enc->scaled_buf,

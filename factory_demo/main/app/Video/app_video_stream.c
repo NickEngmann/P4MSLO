@@ -83,6 +83,7 @@ static camera_buffer_t camera_buffer = {
 };
 
 static size_t data_cache_line_size = 0;
+static bool buffers_freed = false;
 
 // Current PPA rotation angle synchronized with display rotation
 static ppa_srm_rotation_angle_t current_ppa_rotation = PPA_SRM_ROTATION_ANGLE_0;
@@ -557,6 +558,81 @@ esp_err_t app_video_stream_deinit(void)
     return ESP_OK;
 }
 
+void app_video_stream_free_buffers(void)
+{
+    if (buffers_freed) return;
+
+    ESP_LOGI(TAG, "Freeing camera buffers (PSRAM free: %zu)", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    /* Free the large buffers */
+    if (camera_buffer.scaled_camera_buf) {
+        heap_caps_free(camera_buffer.scaled_camera_buf);
+        camera_buffer.scaled_camera_buf = NULL;
+    }
+    if (camera_buffer.shared_photo_buf) {
+        heap_caps_free(camera_buffer.shared_photo_buf);
+        camera_buffer.shared_photo_buf = NULL;
+    }
+    if (camera_buffer.jpg_buf) {
+        free(camera_buffer.jpg_buf);
+        camera_buffer.jpg_buf = NULL;
+    }
+
+    /* Free AI detection buffers */
+    app_ai_detection_deinit();
+
+    buffers_freed = true;
+    ESP_LOGI(TAG, "Camera buffers freed (PSRAM free: %zu)", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+esp_err_t app_video_stream_realloc_buffers(void)
+{
+    if (!buffers_freed) return ESP_OK;
+
+    ESP_LOGI(TAG, "Reallocating camera buffers...");
+
+    /* Reallocate scaled camera buffer */
+    camera_buffer.scaled_camera_buf = heap_caps_aligned_calloc(
+        data_cache_line_size, 1,
+        PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1080P * 2,
+        MALLOC_CAP_SPIRAM);
+    if (!camera_buffer.scaled_camera_buf) {
+        ESP_LOGE(TAG, "Failed to reallocate scaled camera buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Reallocate shared photo buffer */
+    uint32_t shared_size = SHARED_PHOTO_BUF_WIDTH * SHARED_PHOTO_BUF_HEIGHT * 2;
+    camera_buffer.shared_photo_buf = heap_caps_aligned_calloc(
+        data_cache_line_size, 1, shared_size, MALLOC_CAP_SPIRAM);
+    if (!camera_buffer.shared_photo_buf) {
+        ESP_LOGE(TAG, "Failed to reallocate shared photo buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Reallocate JPEG encode buffer */
+    jpeg_encode_memory_alloc_cfg_t rx_mem_cfg = {
+        .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
+    };
+    camera_buffer.jpg_buf = (uint8_t*)jpeg_alloc_encoder_mem(
+        PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1088P * 2 / JPEG_COMPRESSION_RATIO,
+        &rx_mem_cfg, &camera_buffer.rx_buffer_size);
+    if (!camera_buffer.jpg_buf) {
+        ESP_LOGE(TAG, "Failed to reallocate JPEG buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Reallocate AI detection buffers */
+    esp_err_t ret = app_ai_detection_init_buffers(data_cache_line_size);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to reallocate AI buffers (non-fatal): 0x%x", ret);
+    }
+
+    buffers_freed = false;
+    ESP_LOGI(TAG, "Camera buffers reallocated (PSRAM free: %zu)", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return ESP_OK;
+}
+
 /* Private function implementations */
 
 /**
@@ -568,10 +644,13 @@ esp_err_t app_video_stream_deinit(void)
  * @param camera_buf_ves Vertical resolution
  * @param camera_buf_len Buffer length
  */
-static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index, 
-                                        uint32_t camera_buf_hes, uint32_t camera_buf_ves, 
+static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
+                                        uint32_t camera_buf_hes, uint32_t camera_buf_ves,
                                         size_t camera_buf_len)
 {
+    /* Skip frame processing when buffers are freed (e.g., during GIF encoding) */
+    if (buffers_freed) return;
+
     int scale_level = app_extra_get_magnification_factor();
 
     // Camera initialization check

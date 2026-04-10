@@ -44,9 +44,9 @@ void app_main(void)
     ESP_ERROR_CHECK(bsp_i2c_init());
     bsp_get_i2c_bus_handle(&i2c_handle);
 
-    // Initialize the AI detect
-    ESP_LOGI(TAG, "Initialize the AI detect");
-    ESP_ERROR_CHECK(app_ai_detect_init());
+    // AI detection models disabled at boot to save ~10MB PSRAM.
+    // Can be initialized on-demand via app_ai_detect_init() when needed.
+    // ESP_ERROR_CHECK(app_ai_detect_init());
 
     // Initialize the display
     ESP_LOGI(TAG, "Initialize the display");

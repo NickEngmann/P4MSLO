@@ -22,6 +22,7 @@
 #include "bsp/esp-bsp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "app_video_stream.h"
 
 static const char *TAG = "app_gifs";
 
@@ -188,6 +189,11 @@ static void encode_task(void *param)
 
     ESP_LOGI(TAG, "Creating GIF from %d JPEGs", jpeg_count);
 
+    /* Free camera buffers to make PSRAM available for JPEG decoding */
+    app_video_stream_free_buffers();
+    ESP_LOGI(TAG, "Free PSRAM after releasing camera buffers: %zu",
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     /* Create encoder */
     gif_encoder_config_t cfg = {
         .frame_delay_cs = p->frame_delay_ms / 10,
@@ -240,6 +246,12 @@ cleanup:
     }
     heap_caps_free(jpeg_files);
     free(p);
+
+    /* Restore camera buffers */
+    esp_err_t realloc_ret = app_video_stream_realloc_buffers();
+    if (realloc_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to restore camera buffers: 0x%x", realloc_ret);
+    }
 
     s_ctx.is_encoding = false;
 

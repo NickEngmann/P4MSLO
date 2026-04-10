@@ -57,8 +57,9 @@ bool app_gifs_is_playing(void);
  * to the LVGL status label via lv_async_call.
  *
  * @param frame_delay_ms  Frame delay in milliseconds (e.g. 500)
+ * @param max_frames      Maximum number of frames (0 = all photos)
  */
-esp_err_t app_gifs_create_from_album(int frame_delay_ms);
+esp_err_t app_gifs_create_from_album(int frame_delay_ms, int max_frames);
 
 /** @brief Check if GIF creation is in progress */
 bool app_gifs_is_encoding(void);

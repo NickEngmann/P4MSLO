@@ -2094,7 +2094,7 @@ void ui_extra_btn_encoder(void)
                 app_gifs_play_current();
             } else if (!app_gifs_is_encoding()) {
                 /* No GIFs exist — create one from album photos */
-                app_gifs_create_from_album(500);
+                app_gifs_create_from_album(500, 4);
             }
             break;
 

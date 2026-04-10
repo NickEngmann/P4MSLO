@@ -165,6 +165,7 @@ static void display_gif_info(void)
 
 typedef struct {
     int frame_delay_ms;
+    int max_frames;
 } encode_task_params_t;
 
 static void encode_progress_cb(int current, int total, int pass, void *user)
@@ -216,7 +217,22 @@ static void encode_task(void *param)
         return;
     }
 
-    ESP_LOGI(TAG, "Creating GIF from %d JPEGs", jpeg_count);
+    /* Randomly select max_frames images (Fisher-Yates shuffle) */
+    int use_count = jpeg_count;
+    if (p->max_frames > 0 && p->max_frames < jpeg_count) {
+        /* Shuffle and take first max_frames */
+        uint32_t seed = (uint32_t)esp_log_timestamp();
+        for (int i = jpeg_count - 1; i > 0; i--) {
+            seed = seed * 1103515245 + 12345;
+            int j = (seed >> 16) % (i + 1);
+            char *tmp = jpeg_files[i];
+            jpeg_files[i] = jpeg_files[j];
+            jpeg_files[j] = tmp;
+        }
+        use_count = p->max_frames;
+    }
+
+    ESP_LOGI(TAG, "Creating GIF from %d JPEGs (of %d available)", use_count, jpeg_count);
 
     /* Free camera buffers to make PSRAM available for JPEG decoding */
     app_video_stream_free_buffers();
@@ -238,7 +254,7 @@ static void encode_task(void *param)
     gif_encoder_set_progress_cb(enc, encode_progress_cb, NULL);
 
     /* Pass 1: build palette */
-    for (int i = 0; i < jpeg_count; i++) {
+    for (int i = 0; i < use_count; i++) {
         ret = gif_encoder_pass1_add_frame(enc, jpeg_files[i]);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Pass 1 failed for %s, skipping", jpeg_files[i]);
@@ -256,7 +272,7 @@ static void encode_task(void *param)
     ret = gif_encoder_pass2_begin(enc, output_path);
     if (ret != ESP_OK) goto cleanup;
 
-    for (int i = 0; i < jpeg_count; i++) {
+    for (int i = 0; i < use_count; i++) {
         ret = gif_encoder_pass2_add_frame(enc, jpeg_files[i]);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Pass 2 failed for %s, skipping", jpeg_files[i]);
@@ -479,7 +495,7 @@ void app_gifs_stop(void)
 
 bool app_gifs_is_playing(void) { return s_ctx.is_playing; }
 
-esp_err_t app_gifs_create_from_album(int frame_delay_ms)
+esp_err_t app_gifs_create_from_album(int frame_delay_ms, int max_frames)
 {
     if (s_ctx.is_encoding) {
         ESP_LOGW(TAG, "Encoding already in progress");
@@ -489,6 +505,7 @@ esp_err_t app_gifs_create_from_album(int frame_delay_ms)
     encode_task_params_t *params = malloc(sizeof(encode_task_params_t));
     if (!params) return ESP_ERR_NO_MEM;
     params->frame_delay_ms = (frame_delay_ms > 0) ? frame_delay_ms : 500;
+    params->max_frames = (max_frames > 0) ? max_frames : 0;
 
     s_ctx.is_encoding = true;
 

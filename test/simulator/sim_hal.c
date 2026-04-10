@@ -402,9 +402,9 @@ esp_err_t app_gifs_prev(void) { return ESP_OK; }
 esp_err_t app_gifs_play_current(void) { return ESP_OK; }
 void app_gifs_stop(void) {}
 bool app_gifs_is_playing(void) { return false; }
-esp_err_t app_gifs_create_from_album(int delay_ms) {
-    (void)delay_ms;
-    printf("[SIM] app_gifs_create_from_album(%d)\n", delay_ms);
+esp_err_t app_gifs_create_from_album(int delay_ms, int max_frames) {
+    (void)delay_ms; (void)max_frames;
+    printf("[SIM] app_gifs_create_from_album(%d, %d)\n", delay_ms, max_frames);
     return ESP_OK;
 }
 bool app_gifs_is_encoding(void) { return false; }

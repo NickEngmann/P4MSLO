@@ -117,11 +117,18 @@ static void cmd_btn(const char *which)
 static void cmd_gifs_create(const char *arg)
 {
     int delay = 500;
-    if (arg && *arg) delay = atoi(arg);
+    int frames = 4;
+    if (arg && *arg) {
+        /* Parse: "delay [frames]" */
+        char *space = strchr(arg, ' ');
+        delay = atoi(arg);
+        if (space) frames = atoi(space + 1);
+    }
     if (delay <= 0) delay = 500;
+    if (frames <= 0) frames = 4;
 
-    esp_err_t ret = app_gifs_create_from_album(delay);
-    cmd_respond("%s gifs_create delay=%d", ret == ESP_OK ? "ok" : "error", delay);
+    esp_err_t ret = app_gifs_create_from_album(delay, frames);
+    cmd_respond("%s gifs_create delay=%d frames=%d", ret == ESP_OK ? "ok" : "error", delay, frames);
 }
 
 static void cmd_gifs_list(void)

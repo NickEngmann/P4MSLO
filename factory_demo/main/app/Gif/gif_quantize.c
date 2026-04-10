@@ -64,13 +64,14 @@ esp_err_t gif_quantize_accumulate_rgb565(gif_quantize_ctx_t *ctx,
     if (!ctx || !rgb565) return ESP_ERR_INVALID_ARG;
     if (subsample < 1) subsample = 1;
 
-    /* PPA outputs standard RGB565 (R in high bits, B in low bits) after rgb_swap */
+    /* JPEG decoder outputs BGR565: bits [15:11]=B, [10:5]=G, [4:0]=R.
+     * PPA preserves this order. Extract correctly. */
     int total = width * height;
     for (int i = 0; i < total; i += subsample) {
         uint16_t px = rgb565[i];
-        uint8_t r5 = (px >> 11) & 0x1F;
+        uint8_t b5 = (px >> 11) & 0x1F;
         uint8_t g5 = ((px >> 5) & 0x3F) >> 1;  /* 6-bit green → 5-bit */
-        uint8_t b5 =  px & 0x1F;
+        uint8_t r5 =  px & 0x1F;
         ctx->histogram[CUBE_IDX(r5, g5, b5)]++;
     }
     return ESP_OK;

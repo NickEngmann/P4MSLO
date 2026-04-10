@@ -34,8 +34,11 @@ static const char *TAG = "app_gifs";
 
 typedef struct {
     lv_obj_t *canvas;
-    uint16_t *canvas_buffer;
+    uint16_t *canvas_buffer;       /* 240x240 for display */
     int canvas_width, canvas_height;
+
+    uint16_t *decode_buffer;       /* GIF native resolution for decoder output */
+    int decode_width, decode_height;
 
     char **filenames;
     int count;
@@ -67,19 +70,41 @@ static void ensure_gif_dir(void)
     mkdir(path, 0755);
 }
 
+/* Scale a GIF frame from native resolution to 240x240 display using nearest-neighbor */
+static void scale_to_display(const uint16_t *src, int src_w, int src_h,
+                             uint16_t *dst, int dst_w, int dst_h)
+{
+    for (int y = 0; y < dst_h; y++) {
+        int sy = y * src_h / dst_h;
+        if (sy >= src_h) sy = src_h - 1;
+        for (int x = 0; x < dst_w; x++) {
+            int sx = x * src_w / dst_w;
+            if (sx >= src_w) sx = src_w - 1;
+            dst[y * dst_w + x] = src[sy * src_w + sx];
+        }
+    }
+}
+
+/* Convert RGB888 palette color to RGB565 with byte swap for LVGL */
+static inline uint16_t rgb888_to_rgb565_swapped(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint16_t px = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    return (px >> 8) | (px << 8);  /* Byte swap for LV_COLOR_16_SWAP */
+}
+
 static void playback_timer_cb(lv_timer_t *timer)
 {
-    if (!s_ctx.is_playing || !s_ctx.decoder || !s_ctx.canvas_buffer) {
+    if (!s_ctx.is_playing || !s_ctx.decoder || !s_ctx.decode_buffer) {
         return;
     }
 
     int delay_cs = 10;
-    esp_err_t ret = gif_decoder_next_frame(s_ctx.decoder, s_ctx.canvas_buffer, &delay_cs);
+    esp_err_t ret = gif_decoder_next_frame(s_ctx.decoder, s_ctx.decode_buffer, &delay_cs);
 
     if (ret == ESP_ERR_NOT_FOUND) {
         /* Loop: reset to first frame */
         gif_decoder_reset(s_ctx.decoder);
-        ret = gif_decoder_next_frame(s_ctx.decoder, s_ctx.canvas_buffer, &delay_cs);
+        ret = gif_decoder_next_frame(s_ctx.decoder, s_ctx.decode_buffer, &delay_cs);
         if (ret != ESP_OK) {
             app_gifs_stop();
             return;
@@ -88,6 +113,10 @@ static void playback_timer_cb(lv_timer_t *timer)
         app_gifs_stop();
         return;
     }
+
+    /* Scale GIF frame to display size */
+    scale_to_display(s_ctx.decode_buffer, s_ctx.decode_width, s_ctx.decode_height,
+                     s_ctx.canvas_buffer, s_ctx.canvas_width, s_ctx.canvas_height);
 
     /* Update canvas */
     bsp_display_lock(0);
@@ -99,7 +128,7 @@ static void playback_timer_cb(lv_timer_t *timer)
 
     /* Adjust timer period for next frame */
     if (delay_cs > 0) {
-        lv_timer_set_period(timer, delay_cs * 10);  /* centiseconds → milliseconds */
+        lv_timer_set_period(timer, delay_cs * 10);
     }
 }
 
@@ -194,12 +223,12 @@ static void encode_task(void *param)
     ESP_LOGI(TAG, "Free PSRAM after releasing camera buffers: %zu",
              heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    /* Create encoder */
+    /* Create encoder — use 480xAuto (proportional) by default */
     gif_encoder_config_t cfg = {
         .frame_delay_cs = p->frame_delay_ms / 10,
         .loop_count = 0,
-        .target_width = BSP_LCD_H_RES,
-        .target_height = BSP_LCD_V_RES,
+        .target_width = 0,   /* Auto-detect from first frame */
+        .target_height = 0,
     };
 
     gif_encoder_t *enc = NULL;
@@ -301,6 +330,11 @@ void app_gifs_deinit(void)
         s_ctx.canvas_buffer = NULL;
     }
 
+    if (s_ctx.decode_buffer) {
+        heap_caps_free(s_ctx.decode_buffer);
+        s_ctx.decode_buffer = NULL;
+    }
+
     s_ctx.count = 0;
 }
 
@@ -324,7 +358,7 @@ esp_err_t app_gifs_scan(void)
     DIR *dir = opendir(gif_dir);
     if (!dir) {
         ESP_LOGW(TAG, "Cannot open %s", gif_dir);
-        return ESP_OK;  /* Not an error, just no GIFs */
+        return ESP_OK;
     }
 
     s_ctx.filenames = heap_caps_calloc(MAX_GIF_FILES, sizeof(char *), MALLOC_CAP_SPIRAM);
@@ -372,12 +406,41 @@ esp_err_t app_gifs_prev(void)
 
 esp_err_t app_gifs_play_current(void)
 {
-    if (s_ctx.count == 0 || !s_ctx.canvas_buffer) return ESP_FAIL;
+    if (s_ctx.count == 0 || !s_ctx.canvas_buffer) {
+        ESP_LOGE(TAG, "Cannot play: count=%d canvas=%p", s_ctx.count, s_ctx.canvas_buffer);
+        return ESP_FAIL;
+    }
 
     app_gifs_stop();
 
+    ESP_LOGI(TAG, "Playing: %s", s_ctx.filenames[s_ctx.current_index]);
+
     esp_err_t ret = gif_decoder_open(s_ctx.filenames[s_ctx.current_index], &s_ctx.decoder);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open GIF: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Allocate decode buffer matching GIF dimensions */
+    s_ctx.decode_width = gif_decoder_get_width(s_ctx.decoder);
+    s_ctx.decode_height = gif_decoder_get_height(s_ctx.decoder);
+
+    if (s_ctx.decode_buffer) {
+        heap_caps_free(s_ctx.decode_buffer);
+        s_ctx.decode_buffer = NULL;
+    }
+
+    size_t decode_buf_size = s_ctx.decode_width * s_ctx.decode_height * 2;
+    s_ctx.decode_buffer = heap_caps_malloc(decode_buf_size, MALLOC_CAP_SPIRAM);
+    if (!s_ctx.decode_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate %zu byte decode buffer", decode_buf_size);
+        gif_decoder_close(s_ctx.decoder);
+        s_ctx.decoder = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "GIF: %dx%d, decode buffer: %zu bytes",
+             s_ctx.decode_width, s_ctx.decode_height, decode_buf_size);
 
     s_ctx.is_playing = true;
 
@@ -406,6 +469,11 @@ void app_gifs_stop(void)
     if (s_ctx.decoder) {
         gif_decoder_close(s_ctx.decoder);
         s_ctx.decoder = NULL;
+    }
+
+    if (s_ctx.decode_buffer) {
+        heap_caps_free(s_ctx.decode_buffer);
+        s_ctx.decode_buffer = NULL;
     }
 }
 

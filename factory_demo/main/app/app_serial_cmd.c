@@ -237,6 +237,71 @@ static void cmd_sd_hexdump(const char *args)
     }
 }
 
+static void cmd_sd_rm(const char *path)
+{
+    if (!path || !*path) {
+        cmd_respond("error: no path");
+        return;
+    }
+    if (unlink(path) == 0) {
+        cmd_respond("ok deleted %s", path);
+    } else {
+        cmd_respond("error: cannot delete '%s'", path);
+    }
+}
+
+static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void cmd_sd_base64(const char *args)
+{
+    char path[256] = {0};
+    long offset = 0, len = 512;
+
+    if (sscanf(args, "%255s %ld %ld", path, &offset, &len) < 1) {
+        cmd_respond("error: usage: sd_base64 <path> [offset] [len]");
+        return;
+    }
+    if (len > 4096) len = 4096;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        cmd_respond("error: cannot open '%s'", path);
+        return;
+    }
+
+    fseek(f, offset, SEEK_SET);
+    uint8_t buf[4096];
+    int n = fread(buf, 1, len, f);
+    fclose(f);
+
+    /* Base64 encode and output */
+    cmd_respond("base64 %s offset=%ld len=%d", path, offset, n);
+
+    char out[80];
+    int opos = 0;
+    for (int i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)buf[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)buf[i + 1] << 8;
+        if (i + 2 < n) v |= buf[i + 2];
+
+        out[opos++] = b64_table[(v >> 18) & 0x3F];
+        out[opos++] = b64_table[(v >> 12) & 0x3F];
+        out[opos++] = (i + 1 < n) ? b64_table[(v >> 6) & 0x3F] : '=';
+        out[opos++] = (i + 2 < n) ? b64_table[v & 0x3F] : '=';
+
+        if (opos >= 76) {
+            out[opos] = '\0';
+            cmd_respond("%s", out);
+            opos = 0;
+        }
+    }
+    if (opos > 0) {
+        out[opos] = '\0';
+        cmd_respond("%s", out);
+    }
+    cmd_respond("end_base64");
+}
+
 /* ---- Command dispatcher ---- */
 
 static void dispatch_command(char *line)
@@ -294,6 +359,10 @@ static void dispatch_command(char *line)
         cmd_sd_stat(arg);
     } else if (strcmp(line, "sd_hexdump") == 0) {
         cmd_sd_hexdump(arg ? arg : "");
+    } else if (strcmp(line, "sd_rm") == 0) {
+        cmd_sd_rm(arg);
+    } else if (strcmp(line, "sd_base64") == 0) {
+        cmd_sd_base64(arg ? arg : "");
     } else {
         cmd_respond("error: unknown command '%s'", line);
     }

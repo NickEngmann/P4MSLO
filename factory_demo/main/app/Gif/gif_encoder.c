@@ -56,13 +56,13 @@ struct gif_encoder {
 
 /* ---- Helpers ---- */
 
-/* The JPEG decoder outputs BGR565 (JPEG_DEC_RGB_ELEMENT_ORDER_BGR).
- * In BGR565: bits [15:11]=B, [10:5]=G, [4:0]=R */
-static inline void bgr565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
+/* PPA outputs standard RGB565 (with rgb_swap=1 converting BGR→RGB).
+ * RGB565: bits [15:11]=R, [10:5]=G, [4:0]=B */
+static inline void rgb565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    uint8_t b5 = (px >> 11) & 0x1F;
+    uint8_t r5 = (px >> 11) & 0x1F;
     uint8_t g6 = (px >> 5) & 0x3F;
-    uint8_t r5 = px & 0x1F;
+    uint8_t b5 = px & 0x1F;
     *r = (r5 << 3) | (r5 >> 2);
     *g = (g6 << 2) | (g6 >> 4);
     *b = (b5 << 3) | (b5 >> 2);
@@ -104,11 +104,22 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
 
     ESP_LOGI(TAG, "JPEG: %ux%u (%zu bytes)", info.width, info.height, file_size);
 
-    /* Set target dimensions from first frame if not specified */
+    /* Set target dimensions from first frame if not specified.
+     * Default to 480x270 (16:9) for a decent-quality GIF. */
     if (enc->width == 0 || enc->height == 0) {
-        enc->width = enc->config.target_width > 0 ? enc->config.target_width : BSP_LCD_H_RES;
-        enc->height = enc->config.target_height > 0 ? enc->config.target_height : BSP_LCD_V_RES;
-        ESP_LOGI(TAG, "GIF dimensions: %dx%d", enc->width, enc->height);
+        if (enc->config.target_width > 0 && enc->config.target_height > 0) {
+            enc->width = enc->config.target_width;
+            enc->height = enc->config.target_height;
+        } else {
+            /* Scale down proportionally from source */
+            int target_w = 480;
+            enc->width = target_w;
+            enc->height = (int)((float)info.height / info.width * target_w);
+            /* Ensure even dimensions */
+            enc->height &= ~1;
+        }
+        ESP_LOGI(TAG, "GIF dimensions: %dx%d (from %ux%u source)",
+                 enc->width, enc->height, info.width, info.height);
     }
 
     /* Allocate decode buffer sized for this specific image (RGB565 output).
@@ -165,21 +176,21 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
             ESP_LOGE(TAG, "Failed to allocate %zu byte scaled buffer", enc->scaled_buf_size);
             return ESP_ERR_NO_MEM;
         }
-        ESP_LOGI(TAG, "Allocated scaled buffer: %zu bytes", enc->scaled_buf_size);
+        ESP_LOGI(TAG, "Allocated scaled buffer: %zu bytes (%dx%d)",
+                 enc->scaled_buf_size, enc->width, enc->height);
     }
 
-    /* Scale to target resolution using PPA */
-    /* Compute square crop from center */
-    int crop_size = (info.width < info.height) ? info.width : info.height;
-
+    /* Scale full image to target resolution using PPA.
+     * Use the full image (no crop) to preserve aspect ratio.
+     * The JPEG decoder uses BGR element order, so use rgb_swap to get proper RGB565. */
     ppa_srm_oper_config_t srm = {
         .in.buffer = enc->decode_buf,
         .in.pic_w = info.width,
         .in.pic_h = info.height,
-        .in.block_w = crop_size,
-        .in.block_h = crop_size,
-        .in.block_offset_x = (info.width - crop_size) / 2,
-        .in.block_offset_y = (info.height - crop_size) / 2,
+        .in.block_w = info.width,
+        .in.block_h = info.height,
+        .in.block_offset_x = 0,
+        .in.block_offset_y = 0,
         .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
 
         .out.buffer = enc->scaled_buf,
@@ -191,14 +202,17 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
         .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
 
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = (float)enc->width / crop_size,
-        .scale_y = (float)enc->height / crop_size,
+        .scale_x = (float)enc->width / info.width,
+        .scale_y = (float)enc->height / info.height,
+        .rgb_swap = 1,   /* Swap R and B channels: BGR565 → RGB565 */
+        .byte_swap = 0,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 
     ret = ppa_do_scale_rotate_mirror(enc->ppa_handle, &srm);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "PPA scale failed");
+        ESP_LOGE(TAG, "PPA scale failed (in: %ux%u → out: %dx%d)",
+                 info.width, info.height, enc->width, enc->height);
         return ret;
     }
 
@@ -393,7 +407,7 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     int total = enc->width * enc->height;
     for (int i = 0; i < total; i++) {
         uint8_t r, g, b;
-        bgr565_to_rgb888(enc->scaled_buf[i], &r, &g, &b);
+        rgb565_to_rgb888(enc->scaled_buf[i], &r, &g, &b);
         uint8_t idx = gif_quantize_map_pixel(&enc->palette, r, g, b);
         gif_lzw_enc_pixel(lzw, idx);
     }

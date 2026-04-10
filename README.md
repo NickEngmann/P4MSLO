@@ -1,447 +1,154 @@
-# ESP32-P4X-EYE Development Board
+# P4MSLO — ESP32-P4X-EYE Factory Demo
 
-## User Guide
+Factory firmware for the [ESP32-P4X-EYE](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32p4/esp32-p4x-eye/user_guide.html) development board featuring real-time AI object detection, a full LVGL graphical interface, and a comprehensive hardware-independent test suite.
 
-*Note: This section contains detailed usage instructions for the ESP32-P4X-EYE development board.*
+| | |
+|---|---|
+| **Board** | ESP32-P4X-EYE ([User Guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32p4/esp32-p4x-eye/user_guide.html)) |
+| **Framework** | ESP-IDF v5.5.3 (C) |
+| **UI** | LVGL 8.3.11 / SquareLine Studio — 4 screens, 7 fonts, 21 images |
+| **AI** | COCO object, human face, and pedestrian detection via esp-dl |
+| **Tests** | 60 tests across 6 suites, 17 mock headers, LVGL simulator with screenshots |
+| **CI** | GitHub Actions — host tests, Docker tests, ESP-IDF cross-compilation |
 
-* ESP32-P4X-EYE - [English](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32p4/esp32-p4x-eye/user_guide.html) / [中文](https://docs.espressif.com/projects/esp-dev-kits/zh_CN/latest/esp32p4/esp32-p4x-eye/user_guide.html)
+## Quick Start
 
-## Examples
-
-The examples are developed under the ESP-IDF **release/v5.5** branch. The [Factory Demo](./examples/factory_demo/) is the factory firmware of the development board.
-
-## Factory Bin
-
-* [Factory Bin](https://dl.espressif.com/AE/esp-dev-kits/p4x_eye_factory_demo_110.bin) for ESP32-P4X-EYE, programmed with the [Factory Demo](./examples/factory_demo/) example.
-
-<a href="https://espressif.github.io/esp-launchpad/?flashConfigURL=https://espressif2022.github.io/ESP32-P4-Function-EV-Board/launchpad.toml">
-    <img alt="Try it with ESP Launchpad" src="https://dl.espressif.com/AE/esp-dev-kits/new_launchpad.png" width="316" height="100">
-</a>
-
-Experience more examples instantly with the [ESP-LaunchPad](https://espressif.github.io/esp-launchpad/?flashConfigURL=https://espressif2022.github.io/ESP32-P4-Function-EV-Board/launchpad.toml).
-
-**Note**:
-* Firmware files with the `p4x_` prefix are for ESP32-P4X boards. Firmware files with the `p4_` prefix are for the original ESP32-P4 boards.
-
----
-
-# P4MSLO - ESP32-P4X-EYE Factory Demo with AI Detection
-
-## Project Overview
-
-P4MSLO (ESP32-P4X-EYE Factory Demo) is a comprehensive embedded software project for the ESP32-P4X-EYE development board. It features:
-
-- **AI Detection**: Real-time object detection using ESP32-P4's AI capabilities
-- **LVGL UI**: Full graphical interface with 4 screens, 7 fonts, and 21 images
-- **Hardware Simulation**: Complete mock infrastructure for testing without physical hardware
-- **NVS Storage**: Non-volatile storage for settings persistence
-- **GPIO/BSP Control**: Full board support package integration
-- **Power Management**: Sleep/wakeup functionality with multiple triggers
-
-The project uses ESP-IDF v5.5.3 for ESP32-P4 development and includes a comprehensive test suite with 59 tests covering all major functionality.
-
-## Build & Run
-
-### Language & Framework
-
-- **Language**: C (ESP-IDF framework)
-- **Framework**: ESP-IDF v5.5.3 (required - v5.5.1/5.5.2 fail)
-- **Docker image**: `gcc:14` for host tests, `espressif/idf:v5.5.3` for ESP-IDF builds
-- **Build System**: CMake (ESP-IDF native)
-
-### Prerequisites
-
-#### For ESP-IDF Builds
-
-1. **ESP-IDF v5.5.3** - Install from [Espressif official documentation](https://docs.espressif.com/projects/esp-idf/en/latest/esp32p4/get-started/index.html)
-2. **ESP32-P4 target** - Set target with `idf.py set-target esp32p4`
-3. **Docker** - For CI builds using `espressif/idf:v5.5.3`
-
-#### For Host Tests (No ESP-IDF Required)
-
-1. **CMake** - For building test suite
-2. **GCC** - For compiling C code
-3. **Make** - For building tests
-4. **nproc** - For parallel compilation
-
-#### For LVGL Simulator
-
-1. **SDL2 development headers** - `libsdl2-dev` on Ubuntu/Debian
-2. **LVGL v8.3.11** - Clone from [LVGL GitHub](https://github.com/lvgl/lvgl)
-3. **LVGL drivers v8.3.0** - Clone from [lv_drivers GitHub](https://github.com/lvgl/lv_drivers)
-
-### Installation
-
-#### Clone Repository
+### Build the Factory Demo (ESP-IDF)
 
 ```bash
-git clone https://github.com/espressif/ESP32-P4X-EYE.git
-cd ESP32-P4X-EYE
-```
-
-#### Install Dependencies (Host Tests)
-
-```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y cmake build-essential libsdl2-dev
-
-# For ESP-IDF builds
-# Follow ESP-IDF installation guide at:
-# https://docs.espressif.com/projects/esp-idf/en/latest/esp32p4/get-started/index.html
-```
-
-#### Install Dependencies (LVGL Simulator)
-
-```bash
-cd test/simulator
-git clone --depth 1 --branch v8.3.11 https://github.com/lvgl/lvgl.git
-git clone --depth 1 --branch v8.3.0 https://github.com/lvgl/lv_drivers.git
-cd ..
-cd ..
-```
-
-### Build Commands
-
-#### ESP-IDF Build (Factory Demo)
-
-```bash
+# Requires ESP-IDF v5.5.3 — install from https://docs.espressif.com/projects/esp-idf/en/latest/esp32p4/get-started/
 cd factory_demo
 idf.py set-target esp32p4
 idf.py build
+idf.py -p /dev/ttyUSB0 flash monitor   # flash + serial monitor
 ```
 
-This produces firmware binaries for flashing to the ESP32-P4X-EYE board.
-
-#### Host Tests Build
+### Run Host Tests (no hardware needed)
 
 ```bash
-cd test
-mkdir -p build
-cd build
+sudo apt-get install -y cmake build-essential   # Ubuntu/Debian
+cd test && mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Debug
 make -j$(nproc)
+for t in test_*; do [ -x "$t" ] && ./"$t"; done
 ```
 
-#### LVGL Simulator Build
-
-```bash
-cd test/simulator
-mkdir -p build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-```
-
-#### Docker Build (Test Suite)
+### Run Tests in Docker
 
 ```bash
 docker build -f Dockerfile.test -t p4mslo-test .
 docker run --rm p4mslo-test
 ```
 
-### Run Commands
-
-#### Run All Host Tests
+### Run the LVGL Simulator
 
 ```bash
-cd test/build
-for t in test_*; do [ -x "$t" ] && ./$t; done
+sudo apt-get install -y libsdl2-dev
+cd test/simulator
+git clone --depth 1 --branch v8.3.11 https://github.com/lvgl/lvgl.git
+git clone --depth 1 --branch v8.3.0 https://github.com/lvgl/lv_drivers.git
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Debug && make -j$(nproc)
+./p4eye_sim              # interactive SDL2 window (720x720)
+./p4eye_sim --screenshot # headless — captures PPM screenshots at each step
 ```
 
-This runs all 59 tests across 6 test suites:
-- NVS Storage tests (10 tests)
-- GPIO/BSP tests (12 tests)
-- UI State tests (12 tests)
-- AI Buffers tests (8 tests)
-- Sleep/Wakeup tests (5 tests)
-- UI Simulator tests (12 tests)
+## Project Structure
 
-#### Run LVGL Simulator (Interactive Mode)
-
-```bash
-cd test/simulator/build
-./p4mslo_sim
 ```
-
-This launches an interactive SDL2 window (720x720) with keyboard-to-button mapping for testing the full UI workflow.
-
-#### Run LVGL Simulator (Headless Mode)
-
-```bash
-cd test/simulator/build
-./p4mslo_sim --screenshot
+P4MSLO/
+├── factory_demo/              # ESP-IDF application
+│   ├── main/
+│   │   ├── app/              # Camera, storage, ISP, video logic
+│   │   ├── ui/               # SquareLine Studio UI (screens/, fonts/, images/)
+│   │   └── main.c
+│   ├── components/            # AI models (coco_detect, human_face, pedestrian)
+│   ├── sdkconfig.defaults
+│   └── CMakeLists.txt
+├── common_components/
+│   └── esp32_p4_eye/          # Board support package
+├── test/
+│   ├── test_nvs_storage.c     # 10 tests — NVS save/load, type checking
+│   ├── test_gpio_bsp.c        # 12 tests — GPIO, flashlight, I2C, knob
+│   ├── test_ui_state.c        # 12 tests — page nav, magnification, AI mode
+│   ├── test_ai_buffers.c      #  8 tests — buffer init, alignment, circular index
+│   ├── test_sleep_wakeup.c    #  5 tests — wakeup cause, timer, GPIO wakeup
+│   ├── simulator/
+│   │   ├── test_ui_simulator.c # 12 tests — full UI workflow, knob, USB interrupt
+│   │   ├── sim_main.c         # SDL2 main loop
+│   │   ├── sim_hal.c          # Hardware stub layer
+│   │   └── screenshots/       # 11 captured UI navigation screenshots
+│   ├── mocks/                 # 17 ESP-IDF mock headers
+│   ├── unity/                 # Unity test framework header
+│   └── CMakeLists.txt
+├── .github/workflows/ci.yml
+├── Dockerfile                 # Full CI image (tests + ESP-IDF cross-compile)
+├── Dockerfile.test            # Lightweight test-only image
+└── .dockerignore
 ```
-
-This runs in headless mode and dumps PPM framebuffer screenshots at each navigation step for automated testing.
-
-#### Flash to Hardware
-
-```bash
-cd factory_demo
-idf.py -p /dev/ttyUSB0 flash monitor
-```
-
-Replace `/dev/ttyUSB0` with your actual serial port.
 
 ## Testing
 
-### Test Framework
+### Test Suites (59 total)
 
-The project uses a custom C-based test framework with the following structure:
-
-- **Unit Tests**: Direct function testing with mock dependencies
-- **Integration Tests**: Full workflow testing with simulated hardware
-- **LVGL Simulator Tests**: Real UI code tested against mocked hardware calls
-
-### Test Suites Overview
-
-| Suite | File | Tests | Coverage |
-|-------|------|-------|----------|
+| Suite | File | # | What it covers |
+|-------|------|---|----------------|
 | NVS Storage | `test/test_nvs_storage.c` | 10 | Settings save/load, photo count, interval state, type checking |
 | GPIO/BSP | `test/test_gpio_bsp.c` | 12 | Pin state, flashlight, display, I2C, SD detect, knob init |
 | UI State | `test/test_ui_state.c` | 12 | Page navigation, magnification, AI mode, SD/USB transitions |
 | AI Buffers | `test/test_ai_buffers.c` | 8 | Buffer init, alignment, circular index, deinit safety |
 | Sleep/Wakeup | `test/test_sleep_wakeup.c` | 5 | Wakeup cause, timer+interval, GPIO wakeup |
-| UI Simulator | `test/simulator/test_ui_simulator.c` | 12 | Full UI workflow, knob debounce, menu wrap, USB interrupt |
-
-**Total**: 59 tests
+| UI Simulator | `test/simulator/test_ui_simulator.c` | 13 | Full UI workflow, knob debounce, menu wrap, USB interrupt |
 
 ### Mock Infrastructure
 
-The project includes 14 mock headers in `test/mocks/` for hardware-independent testing:
+17 mock headers in `test/mocks/` enable hardware-independent testing:
 
-#### Core Mocks
+- **Hardware**: `nvs.h` (64-entry in-memory store), `nvs_flash.h`, `driver/gpio.h` (64-pin tracking), `driver/i2c_master.h`, `iot_button.h`, `iot_knob.h`
+- **BSP**: `bsp/esp32_p4_eye.h` (flashlight, I2C, SD, knob, display, buttons), `bsp/esp-bsp.h`, `bsp/display.h`, `bsp/bsp_err_check.h`
+- **System**: `esp_timer.h` (controllable), `esp_sleep.h` (configurable wakeup), `esp_system.h`, `esp_memory_utils.h`, `esp_log.h`, `esp_err.h`, `esp_check.h`
+- **UI/Config**: `esp_lvgl_port.h`, `ui_extra.h`, `sdkconfig.h`, `freertos/FreeRTOS.h`, `freertos/task.h`
 
-- **`nvs.h`**: In-memory NVS with 64-entry store, namespace isolation, type checking
-- **`driver/gpio.h`**: 64-pin state tracking with read/write capabilities
-- **`bsp/esp32_p4_eye.h`**: Full BSP mock including flashlight, I2C, SD card, knob, display, and buttons
+### LVGL Simulator
 
-#### System Mocks
+The simulator compiles **real** SquareLine Studio UI code against LVGL 8.3.11 with an SDL2 display backend. All hardware calls (camera, storage, ISP) are stubbed in `sim_hal.c`.
 
-- **`esp_timer.h`**: Controllable mock timer for time-based testing
-- **`esp_sleep.h`**: Configurable wakeup cause simulation
-- **`esp_memory_utils.h`**: Aligned allocation via stdlib for memory testing
+- **Interactive mode**: 720x720 SDL2 window with keyboard-to-button mapping
+- **Headless mode**: `--screenshot` captures framebuffer PNGs at each navigation step
+- 11 screenshots stored in `test/simulator/screenshots/`
 
-#### Support Mocks
+## CI Pipeline
 
-- **FreeRTOS stubs**: Task and queue simulation
-- **esp_log printf wrappers**: Log output capture and verification
-- **sdkconfig defines**: Configuration parameter mocks
+Three jobs run in parallel via GitHub Actions (`.github/workflows/ci.yml`):
 
-### Test Execution
-
-#### Individual Test Files
-
-```bash
-cd test/build
-./test_nvs_storage
-./test_gpio_bsp
-./test_ui_state
-./test_ai_buffers
-./test_sleep_wakeup
-```
-
-#### Full Test Suite
-
-```bash
-cd test/build
-for t in test_*; do [ -x "$t" ] && ./$t; done
-```
-
-#### CI Test Execution
-
-Tests run automatically in CI with the following phases:
-
-1. **Docker Test Image** - Builds Dockerfile.test, runs tests in container (~30s)
-2. **ESP-IDF Build** - Cross-compiles with espressif/idf:v5.5.3, uploads firmware artifacts (~4.5min)
-3. **LVGL Simulator** - Builds and runs simulator tests with screenshot capture (~20s)
-
-### Hardware Mocks Required
-
-- **Host Tests**: No hardware required - all mocks are software-based
-- **LVGL Simulator**: No hardware required - sim_hal.c provides hardware stubs
-- **ESP-IDF Build**: Requires ESP32-P4X-EYE board for flashing
-- **CI Pipeline**: Uses Docker containers for reproducible builds
+| Job | What | Time |
+|-----|------|------|
+| **host-tests** | Build + run 59 unit tests on `ubuntu-latest` | ~30s |
+| **docker-test** | Build `Dockerfile.test`, run tests in container | ~1min |
+| **idf-build** | Cross-compile in `espressif/idf:v5.5.3`, upload firmware artifacts | ~4.5min |
 
 ## Known Issues
 
-### ESP-IDF Version Compatibility
+- **ESP-IDF v5.5.3 required** — v5.5.1/5.5.2 fail to resolve components
+- **PlatformIO not supported** — ESP32-P4 requires native ESP-IDF CMake
+- **Camera viewfinder** renders empty in simulator (expected — no camera feed)
+- **SDL2 headers** required for simulator (`libsdl2-dev`), not available in all CI envs
+- **LVGL/lv_drivers** must be cloned manually into `test/simulator/` (gitignored)
+- **Dockerfile** ESP-IDF stage still references `v5.5.1` — CI uses `v5.5.3`
 
-- **ESP-IDF v5.5.3 required** - Projects using v5.5.1 or v5.5.2 will fail to build
-- **PlatformIO limitation** - PlatformIO does NOT support ESP32-P4 - must use ESP-IDF CMake directly
-- **idf_component.yml constraint** - Project enforces ESP-IDF v5.5.3 via dependency configuration
+## Hardware
 
-### LVGL Simulator Requirements
+- **ESP32-P4X-EYE Board** + USB-C cable for flashing/monitoring
+- **Camera module** required for AI detection
+- **SD card** optional for storage
+- **5V/2A USB** power supply
 
-- **SDL2 dev headers** - Required for simulator build, not available in all CI environments
-- **Camera viewfinder** - Renders as empty in simulator (expected behavior - no camera feed available)
-- **Memory constraints** - Simulator requires sufficient RAM for LVGL framebuffer (~512KB)
+## License
 
-### Build System Limitations
+See [LICENSE](./LICENSE) for terms.
 
-- **No PlatformIO support** - ESP32-P4 requires native ESP-IDF CMake build system
-- **Cross-compilation** - Requires ESP-IDF toolchain installation
-- **Docker dependencies** - ESP-IDF Docker image is large (~5GB) and slow to pull
+## Links
 
-### Test Infrastructure
-
-- **Mock coverage** - 14 mock headers cover all hardware interfaces but may not capture all edge cases
-- **Timing tests** - Sleep/wakeup tests require precise timing control from mock timers
-- **UI state transitions** - Complex state machines may have untested edge cases
-
-## Architecture
-
-### Project Structure
-
-```
-ESP32-P4X-EYE/
-├── factory_demo/           # Main ESP-IDF application
-│   ├── main/              # Application source code
-│   ├── lvgl/             # LVGL UI components
-│   ├── sim_hal.c         # Hardware simulation layer
-│   └── CMakeLists.txt    # Build configuration
-├── test/                  # Test suite
-│   ├── test_nvs_storage.c
-│   ├── test_gpio_bsp.c
-│   ├── test_ui_state.c
-│   ├── test_ai_buffers.c
-│   ├── test_sleep_wakeup.c
-│   ├── simulator/         # LVGL simulator tests
-│   │   ├── test_ui_simulator.c
-│   │   └── sim_hal.c
-│   └── mocks/            # Hardware mock implementations
-│       ├── nvs.h
-│       ├── driver/gpio.h
-│       ├── bsp/esp32_p4_eye.h
-│       ├── esp_timer.h
-│       ├── esp_sleep.h
-│       └── esp_memory_utils.h
-├── .github/workflows/     # CI/CD pipeline definitions
-├── Dockerfile.test        # Test container definition
-└── platformio.ini         # PlatformIO configuration (for reference)
-```
-
-### Key Components
-
-#### LVGL UI System
-
-- **Screens**: 4 main screens (Home, Camera, Settings, AI Status)
-- **Fonts**: 7 custom fonts for different UI elements
-- **Images**: 21 UI assets including icons and backgrounds
-- **Navigation**: Knob-based menu system with debounce handling
-- **State Machine**: Complex UI state transitions with USB/SD event handling
-
-#### AI Detection Pipeline
-
-- **Buffer Management**: Circular buffer with alignment guarantees
-- **Image Processing**: ISP (Image Signal Processor) integration
-- **Detection Algorithms**: Real-time object detection with confidence scoring
-- **Memory Safety**: Deinit safety checks and buffer overflow protection
-
-#### Power Management
-
-- **Sleep Modes**: Deep sleep, light sleep, and standby modes
-- **Wakeup Sources**: GPIO interrupts, timer triggers, and interval-based wakeup
-- **State Preservation**: NVS storage for power state recovery
-- **Power Monitoring**: Current consumption tracking and optimization
-
-#### Hardware Abstraction Layer (HAL)
-
-- **GPIO Control**: Pin configuration and state management
-- **I2C Communication**: Sensor and display interface
-- **SD Card Interface**: Storage access and file management
-- **Display Driver**: LVGL integration with hardware display
-- **Button Input**: Physical button event handling
-- **Knob Interface**: Rotary encoder for menu navigation
-
-### Data Flow
-
-```
-User Input → GPIO/BSP → State Machine → LVGL UI → Display Output
-                                    ↓
-                            AI Detection → ISP → Camera Feed
-                                    ↓
-                            NVS Storage → Settings Persistence
-                                    ↓
-                            Power Management → Sleep/Wakeup
-```
-
-## Notes
-
-### Development Guidelines
-
-1. **Always test with mocks first** - Run host tests before hardware deployment
-2. **Verify LVGL simulator** - Test UI changes in simulator before flashing
-3. **Check ESP-IDF version** - Ensure v5.5.3 is installed before building
-4. **Monitor memory usage** - LVGL and AI features are memory-intensive
-5. **Test power states** - Verify sleep/wakeup behavior in all scenarios
-
-### CI/CD Pipeline
-
-The project uses a multi-phase CI pipeline:
-
-1. **Phase 1: Host Tests** - No ESP-IDF required, runs in Docker container (~30s)
-2. **Phase 2: LVGL Simulator** - Builds and tests UI with screenshot capture (~20s)
-3. **Phase 3: ESP-IDF Build** - Cross-compiles firmware for ESP32-P4 (~4.5min)
-4. **Phase 4: Upload Artifacts** - Stores firmware binaries for deployment
-
-### Hardware Requirements
-
-- **ESP32-P4X-EYE Board**: Required for production deployment
-- **USB-C Cable**: For flashing and serial monitoring
-- **SD Card**: Optional for storage expansion
-- **Camera Module**: Required for AI detection features
-- **Power Supply**: 5V/2A USB power adapter
-
-### Debugging Tips
-
-1. **Enable verbose logging** - Use `idf.py set-log-level DEBUG`
-2. **Check NVS dumps** - Use `nvs_dump` command for storage issues
-3. **Monitor GPIO states** - Use `gpio_monitor` for pin debugging
-4. **Test with simulator** - Use LVGL simulator for UI debugging
-5. **Review mock coverage** - Check which hardware interfaces are mocked
-
-### Security Considerations
-
-1. **NVS encryption** - Sensitive settings should be encrypted
-2. **GPIO protection** - Prevent unauthorized pin access
-3. **SD card validation** - Verify file integrity before mounting
-4. **AI model signing** - Ensure firmware authenticity
-5. **Secure boot** - Enable ESP32-P4 secure boot features
-
-### Performance Optimization
-
-1. **Buffer alignment** - Use aligned allocation for AI processing
-2. **Memory pooling** - Pre-allocate common data structures
-3. **DMA usage** - Leverage DMA for camera and display transfers
-4. **Power gating** - Disable unused peripherals during sleep
-5. **Cache optimization** - Configure instruction/data cache settings
-
-### Future Enhancements
-
-1. **Multi-camera support** - Add support for additional camera modules
-2. **Cloud integration** - Enable remote firmware updates
-3. **Advanced AI models** - Support for custom neural network models
-4. **Wireless connectivity** - Add Wi-Fi/Bluetooth for remote control
-5. **Extended sensors** - Support for additional I2C/SPI sensors
-
-### Contributing
-
-1. **Fork the repository** - Create your own fork for development
-2. **Branch from main** - Use feature branches for new work
-3. **Run all tests** - Ensure 59 tests pass before submitting
-4. **Update documentation** - Keep README and MARISOL.md current
-5. **Follow coding style** - Match existing C code conventions
-
-### License
-
-This project is part of the ESP32-P4X-EYE development board firmware. See the LICENSE file in the repository for full licensing terms.
-
-### Support
-
-For technical support:
 - [ESP32-P4X-EYE User Guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32p4/esp32-p4x-eye/user_guide.html)
 - [ESP-IDF Documentation](https://docs.espressif.com/projects/esp-idf/en/latest/esp32p4/get-started/index.html)
 - [LVGL Documentation](https://docs.lvgl.io/)
-- [GitHub Issues](https://github.com/espressif/ESP32-P4X-EYE/issues)

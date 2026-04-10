@@ -85,6 +85,7 @@ void test_sim_camera_workflow(void) {
     /* Take a photo */
     sim_press_button(&sim, SIM_BTN_ENCODER);
     TEST_ASSERT_EQUAL(1, sim.photo_count);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Toggle flashlight */
     sim_press_button(&sim, SIM_BTN_UP);
@@ -94,14 +95,17 @@ void test_sim_camera_workflow(void) {
     /* Take another photo with flash */
     sim_press_button(&sim, SIM_BTN_ENCODER);
     TEST_ASSERT_EQUAL(2, sim.photo_count);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Turn off flashlight */
     sim_press_button(&sim, SIM_BTN_UP);
     TEST_ASSERT_FALSE(sim.flashlight_on);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Go back to main */
     sim_press_button(&sim, SIM_BTN_MENU);
     TEST_ASSERT_EQUAL(SIM_PAGE_MAIN, sim.current_page);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 }
 
 /* ---- Test: Zoom via knob rotation ---- */
@@ -172,18 +176,31 @@ void test_sim_settings(void) {
 
     /* Toggle flash ON */
     sim_press_button(&sim, SIM_BTN_DOWN);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
     sim_press_button(&sim, SIM_BTN_ENCODER);
     TEST_ASSERT_TRUE(sim.settings.flash_on);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Toggle OD ON */
     sim_press_button(&sim, SIM_BTN_DOWN);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
     sim_press_button(&sim, SIM_BTN_ENCODER);
     TEST_ASSERT_TRUE(sim.settings.od_enabled);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Toggle gyroscope ON */
     sim_press_button(&sim, SIM_BTN_DOWN);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
     sim_press_button(&sim, SIM_BTN_ENCODER);
     TEST_ASSERT_TRUE(sim.settings.gyroscope_on);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
+
+    /* Navigate to magnification setting */
+    sim_press_button(&sim, SIM_BTN_DOWN);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
+
+    /* Navigate to interval setting */
+    sim_press_button(&sim, SIM_BTN_DOWN);
     sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Back to main */
@@ -203,22 +220,28 @@ void test_sim_album(void) {
     sim_render_ascii(&sim);
     sim_screenshot(&sim, SCREENSHOT_DIR);
 
-    /* Browse images */
+    /* Browse images — capture each image */
     TEST_ASSERT_EQUAL(0, sim.album_image_index);
     sim_press_button(&sim, SIM_BTN_DOWN);
     TEST_ASSERT_EQUAL(1, sim.album_image_index);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
     sim_press_button(&sim, SIM_BTN_DOWN);
     TEST_ASSERT_EQUAL(2, sim.album_image_index);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
+    sim_press_button(&sim, SIM_BTN_DOWN);
+    TEST_ASSERT_EQUAL(3, sim.album_image_index);
     sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Go back */
     sim_press_button(&sim, SIM_BTN_UP);
-    TEST_ASSERT_EQUAL(1, sim.album_image_index);
+    TEST_ASSERT_EQUAL(2, sim.album_image_index);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Can't go below 0 */
     sim_press_button(&sim, SIM_BTN_UP);
     sim_press_button(&sim, SIM_BTN_UP);
     TEST_ASSERT_EQUAL(0, sim.album_image_index);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Back to main */
     sim_press_button(&sim, SIM_BTN_MENU);
@@ -260,6 +283,7 @@ void test_sim_interval(void) {
     sim.main_menu_cursor = 5;
     sim_press_button(&sim, SIM_BTN_ENCODER);
     TEST_ASSERT_EQUAL(SIM_PAGE_INTERVAL_CAM, sim.current_page);
+    sim_render_ascii(&sim);
     sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Start interval */
@@ -271,6 +295,7 @@ void test_sim_interval(void) {
     /* Stop interval */
     sim_press_button(&sim, SIM_BTN_ENCODER);
     TEST_ASSERT_FALSE(sim.interval_active);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Menu stops interval and goes back */
     sim_press_button(&sim, SIM_BTN_ENCODER);
@@ -280,16 +305,44 @@ void test_sim_interval(void) {
     TEST_ASSERT_FALSE(sim.interval_active);
 }
 
+/* ---- Test: Video mode page ---- */
+void test_sim_video_mode(void) {
+    sim_init(&sim);
+
+    /* Navigate to Video Mode */
+    sim.main_menu_cursor = 3;
+    sim_press_button(&sim, SIM_BTN_ENCODER);
+    TEST_ASSERT_EQUAL(SIM_PAGE_VIDEO_MODE, sim.current_page);
+    sim_render_ascii(&sim);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
+
+    /* Take a photo/record in video mode */
+    sim_press_button(&sim, SIM_BTN_ENCODER);
+    TEST_ASSERT_EQUAL(1, sim.photo_count);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
+
+    /* Toggle flashlight in video mode */
+    sim_press_button(&sim, SIM_BTN_UP);
+    TEST_ASSERT_TRUE(sim.flashlight_on);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
+
+    /* Back to main */
+    sim_press_button(&sim, SIM_BTN_MENU);
+    TEST_ASSERT_EQUAL(SIM_PAGE_MAIN, sim.current_page);
+}
+
 /* ---- Test: USB MSC interrupts current page ---- */
 void test_sim_usb_msc(void) {
     sim_init(&sim);
 
     /* Navigate to Camera */
     sim.current_page = SIM_PAGE_CAMERA;
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Plug in USB */
     sim_set_usb(&sim, true);
     TEST_ASSERT_EQUAL(SIM_PAGE_USB_DISK, sim.current_page);
+    sim_render_ascii(&sim);
     sim_screenshot(&sim, SCREENSHOT_DIR);
 
     /* Buttons are blocked on USB page */
@@ -299,6 +352,7 @@ void test_sim_usb_msc(void) {
     /* Unplug USB → returns to Camera */
     sim_set_usb(&sim, false);
     TEST_ASSERT_EQUAL(SIM_PAGE_CAMERA, sim.current_page);
+    sim_screenshot(&sim, SCREENSHOT_DIR);
 }
 
 /* ---- Test: SD card removal from album ---- */
@@ -384,6 +438,7 @@ int main(void) {
     RUN_TEST(test_sim_album);
     RUN_TEST(test_sim_ai_detect);
     RUN_TEST(test_sim_interval);
+    RUN_TEST(test_sim_video_mode);
     RUN_TEST(test_sim_usb_msc);
     RUN_TEST(test_sim_sd_removal);
     RUN_TEST(test_sim_full_workflow);

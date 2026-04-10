@@ -1,6 +1,11 @@
 .git
 test/build
+test/simulator/build
+test/simulator/lvgl
+test/simulator/lv_drivers
 factory_demo/build
 factory_demo/managed_components
 *.espdl
 *.onnx
+.vscode
+.idea

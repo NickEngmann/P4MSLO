@@ -1,4 +1,24 @@
+# Build outputs
 test/build/
 test/simulator/build/
+factory_demo/build/
+factory_demo/managed_components/
+
+# LVGL dependencies (cloned at build time)
 test/simulator/lvgl/
 test/simulator/lv_drivers/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old

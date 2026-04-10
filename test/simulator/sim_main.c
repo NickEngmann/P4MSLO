@@ -206,12 +206,12 @@ static void run_interactive(void)
 }
 
 /*-------------------------------------------------*/
-/* Screenshot mode: automated button sequence       */
+/* Screenshot mode: comprehensive page capture      */
 /*-------------------------------------------------*/
 static void run_screenshot_mode(void)
 {
     int screenshot_num = 0;
-    char filename[128];
+    char filename[256];
 
     /* Create screenshots directory */
     (void)system("mkdir -p screenshots");
@@ -226,63 +226,245 @@ static void run_screenshot_mode(void)
     } while(0)
 
     #define SCREENSHOT(label) do { \
-        PUMP_MS(200); \
+        PUMP_MS(300); \
         snprintf(filename, sizeof(filename), "screenshots/%02d_%s.ppm", screenshot_num++, (label)); \
         save_framebuffer_ppm(filename); \
         printf("[SCREENSHOT] %s\n", filename); \
     } while(0)
 
-    /* 1. Initial screen (Camera page) */
-    SCREENSHOT("01_camera_main");
+    /* ===== 1. MAIN MENU — all button icons visible ===== */
+    printf("\n[SIM] === Main Menu Screenshots ===\n");
+    SCREENSHOT("main_menu_camera_selected");
 
-    /* 2. Press Down to scroll menu */
+    /* Scroll through each main menu item */
     ui_extra_btn_down();
-    SCREENSHOT("02_scroll_down");
+    SCREENSHOT("main_menu_item2");
 
-    /* 3. Press Down again */
     ui_extra_btn_down();
-    SCREENSHOT("03_scroll_down2");
+    SCREENSHOT("main_menu_item3");
 
-    /* 4. Press Encoder to select */
+    ui_extra_btn_down();
+    SCREENSHOT("main_menu_item4");
+
+    ui_extra_btn_down();
+    SCREENSHOT("main_menu_item5");
+
+    ui_extra_btn_down();
+    SCREENSHOT("main_menu_item6");
+
+    /* Wrap back to top */
+    ui_extra_btn_down();
+    SCREENSHOT("main_menu_wrap_to_top");
+
+    /* ===== 2. CAMERA PAGE ===== */
+    printf("\n[SIM] === Camera Page Screenshots ===\n");
     ui_extra_btn_encoder();
-    SCREENSHOT("04_encoder_select");
+    SCREENSHOT("camera_main");
 
-    /* 5. Press Menu to go back */
-    ui_extra_btn_menu();
-    SCREENSHOT("05_menu_back");
+    /* Camera with popup (down button shows camera popup) */
+    ui_extra_btn_down();
+    PUMP_MS(200);
+    SCREENSHOT("camera_popup_down");
 
-    /* 6. Navigate to Album (scroll down several times, select) */
-    for (int i = 0; i < 4; i++) {
-        ui_extra_btn_down();
-        PUMP_MS(100);
-    }
+    /* Camera with up button popup */
+    ui_extra_btn_up();
+    PUMP_MS(200);
+    SCREENSHOT("camera_popup_up");
+
+    /* Camera encoder press (take photo / select) */
     ui_extra_btn_encoder();
-    SCREENSHOT("06_album_page");
+    PUMP_MS(200);
+    SCREENSHOT("camera_encoder_press");
 
-    /* 7. Back to main */
+    /* Back to main */
     ui_extra_btn_menu();
-    SCREENSHOT("07_back_to_main");
+    PUMP_MS(200);
 
-    /* 8. Navigate to Settings */
+    /* ===== 3. ALBUM PAGE ===== */
+    printf("\n[SIM] === Album Page Screenshots ===\n");
+    /* Navigate to album (item 2 from top — depends on menu order) */
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_encoder();
+    SCREENSHOT("album_page_main");
+
+    /* Browse album images */
+    ui_extra_btn_down();
+    PUMP_MS(200);
+    SCREENSHOT("album_next_image");
+
+    ui_extra_btn_down();
+    PUMP_MS(200);
+    SCREENSHOT("album_next_image2");
+
+    ui_extra_btn_up();
+    PUMP_MS(200);
+    SCREENSHOT("album_prev_image");
+
+    /* Back to main */
+    ui_extra_btn_menu();
+    PUMP_MS(200);
+
+    /* ===== 4. SETTINGS PAGE ===== */
+    printf("\n[SIM] === Settings Page Screenshots ===\n");
+    /* Navigate to settings */
     for (int i = 0; i < 6; i++) {
         ui_extra_btn_down();
         PUMP_MS(100);
     }
     ui_extra_btn_encoder();
-    SCREENSHOT("08_settings_page");
+    SCREENSHOT("settings_main");
 
-    /* 9. Navigate settings items */
+    /* Scroll through all settings items */
     ui_extra_btn_down();
-    SCREENSHOT("09_settings_item2");
+    SCREENSHOT("settings_item2");
+
+    ui_extra_btn_down();
+    SCREENSHOT("settings_item3");
+
+    ui_extra_btn_down();
+    SCREENSHOT("settings_item4");
+
+    /* Toggle a setting (right button) */
+    ui_extra_btn_right();
+    PUMP_MS(200);
+    SCREENSHOT("settings_toggle_right");
+
+    /* Toggle back (left button) */
+    ui_extra_btn_left();
+    PUMP_MS(200);
+    SCREENSHOT("settings_toggle_left");
+
+    /* Continue scrolling settings */
+    ui_extra_btn_down();
+    SCREENSHOT("settings_item5");
+
+    ui_extra_btn_down();
+    SCREENSHOT("settings_item6");
+
+    /* Encoder press on a settings item */
+    ui_extra_btn_encoder();
+    PUMP_MS(200);
+    SCREENSHOT("settings_encoder_press");
+
+    /* Back to main */
+    ui_extra_btn_menu();
+    PUMP_MS(200);
+
+    /* ===== 5. VIDEO MODE PAGE ===== */
+    printf("\n[SIM] === Video Mode Screenshots ===\n");
+    /* Navigate to video mode (scroll to correct menu item) */
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_encoder();
+    PUMP_MS(300);
+    SCREENSHOT("video_mode_main");
+
+    /* Video mode interactions */
+    ui_extra_btn_encoder();
+    PUMP_MS(200);
+    SCREENSHOT("video_mode_encoder");
+
+    ui_extra_btn_down();
+    PUMP_MS(200);
+    SCREENSHOT("video_mode_down");
+
+    ui_extra_btn_up();
+    PUMP_MS(200);
+    SCREENSHOT("video_mode_up");
+
+    /* Back to main */
+    ui_extra_btn_menu();
+    PUMP_MS(200);
+
+    /* ===== 6. AI DETECT PAGE ===== */
+    printf("\n[SIM] === AI Detection Screenshots ===\n");
+    /* Navigate to AI detect */
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_encoder();
+    PUMP_MS(300);
+    SCREENSHOT("ai_detect_main");
+
+    /* Cycle through AI modes */
+    ui_extra_btn_encoder();
+    PUMP_MS(300);
+    SCREENSHOT("ai_detect_mode2");
+
+    ui_extra_btn_encoder();
+    PUMP_MS(300);
+    SCREENSHOT("ai_detect_mode3");
+
+    /* AI detect with knob (zoom) */
+    ui_extra_btn_right();
+    PUMP_MS(200);
+    SCREENSHOT("ai_detect_knob_right");
+
+    ui_extra_btn_left();
+    PUMP_MS(200);
+    SCREENSHOT("ai_detect_knob_left");
+
+    /* Back to main */
+    ui_extra_btn_menu();
+    PUMP_MS(200);
+
+    /* ===== 7. INTERVAL CAMERA PAGE ===== */
+    printf("\n[SIM] === Interval Camera Screenshots ===\n");
+    /* Navigate to interval camera */
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_down();
+    PUMP_MS(100);
+    ui_extra_btn_encoder();
+    PUMP_MS(300);
+    SCREENSHOT("interval_cam_main");
+
+    /* Interval interactions */
+    ui_extra_btn_encoder();
+    PUMP_MS(300);
+    SCREENSHOT("interval_cam_encoder");
+
+    ui_extra_btn_up();
+    PUMP_MS(200);
+    SCREENSHOT("interval_cam_up");
+
+    ui_extra_btn_down();
+    PUMP_MS(200);
+    SCREENSHOT("interval_cam_down");
 
     ui_extra_btn_right();
-    SCREENSHOT("10_settings_toggle");
+    PUMP_MS(200);
+    SCREENSHOT("interval_cam_time_plus");
 
-    /* 10. Back to main */
+    ui_extra_btn_left();
+    PUMP_MS(200);
+    SCREENSHOT("interval_cam_time_minus");
+
+    /* Back to main */
     ui_extra_btn_menu();
-    SCREENSHOT("11_final_main");
+    PUMP_MS(200);
 
-    printf("[SIM] Screenshot sequence complete: %d screenshots saved.\n", screenshot_num);
+    /* ===== 8. FINAL STATE — return to main ===== */
+    printf("\n[SIM] === Final State ===\n");
+    SCREENSHOT("final_main_menu");
+
+    printf("\n[SIM] Screenshot sequence complete: %d screenshots saved to screenshots/\n", screenshot_num);
 
     #undef PUMP_MS
     #undef SCREENSHOT

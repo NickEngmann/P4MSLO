@@ -47,6 +47,9 @@ struct gif_encoder {
     int width, height;      /* Resolved target dimensions */
     size_t cache_line_size;
 
+    /* RGB565 → palette index LUT (65536 entries, built after pass 1) */
+    uint8_t *pixel_lut;
+
     /* Progress */
     gif_encoder_progress_cb_t progress_cb;
     void *progress_user;
@@ -379,7 +382,18 @@ esp_err_t gif_encoder_pass1_add_frame(gif_encoder_t *enc, const char *jpeg_path)
 
 esp_err_t gif_encoder_pass1_finalize(gif_encoder_t *enc)
 {
-    return gif_quantize_build_palette(enc->quantizer, &enc->palette);
+    esp_err_t ret = gif_quantize_build_palette(enc->quantizer, &enc->palette);
+    if (ret != ESP_OK) return ret;
+
+    /* Build RGB565 → palette index LUT for O(1) pixel mapping in pass 2 */
+    enc->pixel_lut = heap_caps_malloc(65536, MALLOC_CAP_SPIRAM);
+    if (!enc->pixel_lut) {
+        ESP_LOGE(TAG, "Failed to allocate 64KB pixel LUT");
+        return ESP_ERR_NO_MEM;
+    }
+    gif_quantize_build_lut(&enc->palette, enc->pixel_lut);
+
+    return ESP_OK;
 }
 
 esp_err_t gif_encoder_pass2_begin(gif_encoder_t *enc, const char *output_path)
@@ -404,7 +418,8 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
 
     write_frame_header(enc);
 
-    /* LZW encode with Floyd-Steinberg dithering for smooth gradients */
+    /* LZW encode with Floyd-Steinberg dithering for smooth gradients.
+     * Uses precomputed RGB565→palette LUT for O(1) pixel mapping. */
     gif_lzw_enc_t *lzw = NULL;
     ret = gif_lzw_enc_create(8, enc->fp, &lzw);  /* 8 = min code size for 256 colors */
     if (ret != ESP_OK) return ret;
@@ -413,6 +428,7 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     int w = enc->width, h = enc->height;
     int16_t *err_cur = heap_caps_calloc(w * 3, sizeof(int16_t), MALLOC_CAP_SPIRAM);
     int16_t *err_nxt = heap_caps_calloc(w * 3, sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    const uint8_t *lut = enc->pixel_lut;
 
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
@@ -429,8 +445,10 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
             if (g < 0) g = 0; else if (g > 255) g = 255;
             if (b < 0) b = 0; else if (b > 255) b = 255;
 
-            /* Find nearest palette color */
-            uint8_t idx = gif_quantize_map_pixel(&enc->palette, (uint8_t)r, (uint8_t)g, (uint8_t)b);
+            /* Map dithered color to nearest palette entry via LUT.
+             * Convert clamped RGB888 back to RGB565 for the LUT lookup. */
+            uint16_t dithered_rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            uint8_t idx = lut[dithered_rgb565];
             gif_lzw_enc_pixel(lzw, idx);
 
             /* Compute error */
@@ -507,6 +525,7 @@ void gif_encoder_destroy(gif_encoder_t *enc)
     if (enc->jpeg_buf) free(enc->jpeg_buf);
     if (enc->decode_buf) free(enc->decode_buf);
     if (enc->scaled_buf) heap_caps_free(enc->scaled_buf);
+    if (enc->pixel_lut) heap_caps_free(enc->pixel_lut);
     if (enc->quantizer) gif_quantize_destroy(enc->quantizer);
     if (enc->jpeg_handle) jpeg_del_decoder_engine(enc->jpeg_handle);
     if (enc->ppa_handle) ppa_unregister_client(enc->ppa_handle);

@@ -272,6 +272,47 @@ uint8_t gif_quantize_map_pixel(const gif_palette_t *palette, uint8_t r, uint8_t 
     return (uint8_t)best_idx;
 }
 
+void gif_quantize_build_lut(const gif_palette_t *palette, uint8_t *lut)
+{
+    ESP_LOGI(TAG, "Building RGB565 → palette LUT (65536 entries)...");
+
+    /* Precompute palette in int for fast distance calc */
+    int pr[256], pg[256], pb[256];
+    for (int i = 0; i < palette->count; i++) {
+        pr[i] = palette->entries[i].r;
+        pg[i] = palette->entries[i].g;
+        pb[i] = palette->entries[i].b;
+    }
+    int count = palette->count;
+
+    for (uint32_t px = 0; px < 65536; px++) {
+        /* RGB565 → RGB888 */
+        int r5 = (px >> 11) & 0x1F;
+        int g6 = (px >> 5) & 0x3F;
+        int b5 = px & 0x1F;
+        int r = (r5 << 3) | (r5 >> 2);
+        int g = (g6 << 2) | (g6 >> 4);
+        int b = (b5 << 3) | (b5 >> 2);
+
+        int best_idx = 0;
+        int best_dist = INT32_MAX;
+        for (int i = 0; i < count; i++) {
+            int dr = r - pr[i];
+            int dg = g - pg[i];
+            int db = b - pb[i];
+            int dist = dr * dr + dg * dg + db * db;
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = i;
+                if (dist == 0) break;
+            }
+        }
+        lut[px] = (uint8_t)best_idx;
+    }
+
+    ESP_LOGI(TAG, "LUT built");
+}
+
 void gif_quantize_destroy(gif_quantize_ctx_t *ctx)
 {
     if (!ctx) return;

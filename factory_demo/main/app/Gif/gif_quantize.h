@@ -60,6 +60,25 @@ esp_err_t gif_quantize_build_palette(gif_quantize_ctx_t *ctx, gif_palette_t *pal
 uint8_t gif_quantize_map_pixel(const gif_palette_t *palette, uint8_t r, uint8_t g, uint8_t b);
 
 /**
+ * @brief Build a lookup table mapping every RGB565 value to a palette index
+ *
+ * Precomputes the nearest palette entry for all 65536 possible RGB565 values.
+ * After building, use gif_quantize_lut_map() for O(1) pixel mapping.
+ *
+ * @param palette  The palette to build the LUT against
+ * @param[out] lut Output array of 65536 uint8_t entries (allocated by caller, 64KB)
+ */
+void gif_quantize_build_lut(const gif_palette_t *palette, uint8_t *lut);
+
+/**
+ * @brief Map an RGB565 pixel to palette index via precomputed LUT (O(1))
+ */
+static inline uint8_t gif_quantize_lut_map(const uint8_t *lut, uint16_t rgb565)
+{
+    return lut[rgb565];
+}
+
+/**
  * @brief Free quantizer context
  */
 void gif_quantize_destroy(gif_quantize_ctx_t *ctx);

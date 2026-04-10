@@ -37,16 +37,7 @@ typedef struct {
 
 /* ---- Helpers ---- */
 
-static inline void rgb565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    /* RGB565 with LV_COLOR_16_SWAP: bytes are already swapped by the album pipeline */
-    uint8_t r5 = (px >> 11) & 0x1F;
-    uint8_t g6 = (px >> 5)  & 0x3F;
-    uint8_t b5 =  px        & 0x1F;
-    *r = (r5 << 3) | (r5 >> 2);
-    *g = (g6 << 2) | (g6 >> 4);
-    *b = (b5 << 3) | (b5 >> 2);
-}
+/* Not used externally — only the accumulate function below */
 
 /* ---- Public API ---- */
 
@@ -73,12 +64,14 @@ esp_err_t gif_quantize_accumulate_rgb565(gif_quantize_ctx_t *ctx,
     if (!ctx || !rgb565) return ESP_ERR_INVALID_ARG;
     if (subsample < 1) subsample = 1;
 
+    /* The JPEG decoder outputs BGR565 (JPEG_DEC_RGB_ELEMENT_ORDER_BGR).
+     * In BGR565: bits [15:11]=B, [10:5]=G, [4:0]=R */
     int total = width * height;
     for (int i = 0; i < total; i += subsample) {
         uint16_t px = rgb565[i];
-        uint8_t r5 = (px >> 11) & 0x1F;
+        uint8_t b5 = (px >> 11) & 0x1F;       /* B in high bits */
         uint8_t g5 = ((px >> 5) & 0x3F) >> 1;  /* 6-bit green → 5-bit */
-        uint8_t b5 =  px & 0x1F;
+        uint8_t r5 =  px & 0x1F;               /* R in low bits */
         ctx->histogram[CUBE_IDX(r5, g5, b5)]++;
     }
     return ESP_OK;
@@ -185,48 +178,53 @@ esp_err_t gif_quantize_build_palette(gif_quantize_ctx_t *ctx, gif_palette_t *pal
         int gr = box->g_max - box->g_min;
         int br = box->b_max - box->b_min;
 
+        /* Save original bounds before splitting (splitting overwrites box) */
+        uint8_t orig_r_min = box->r_min, orig_r_max = box->r_max;
+        uint8_t orig_g_min = box->g_min, orig_g_max = box->g_max;
+        uint8_t orig_b_min = box->b_min, orig_b_max = box->b_max;
+
         /* Split at the median of the longest axis */
         uint8_t split;
         color_box_t new_box;
 
         if (rr >= gr && rr >= br) {
             split = (uint8_t)(box->r_sum / box->pixel_count);
-            if (split < box->r_min) split = box->r_min;
-            if (split >= box->r_max) split = box->r_max - 1;
+            if (split < orig_r_min) split = orig_r_min;
+            if (split >= orig_r_max) split = orig_r_max - 1;
             /* Lower half */
             compute_box_stats_bounded(ctx->histogram, box,
-                                      box->r_min, split,
-                                      box->g_min, box->g_max,
-                                      box->b_min, box->b_max);
+                                      orig_r_min, split,
+                                      orig_g_min, orig_g_max,
+                                      orig_b_min, orig_b_max);
             /* Upper half */
             compute_box_stats_bounded(ctx->histogram, &new_box,
-                                      split + 1, boxes[best].r_max,
-                                      boxes[best].g_min, boxes[best].g_max,
-                                      boxes[best].b_min, boxes[best].b_max);
+                                      split + 1, orig_r_max,
+                                      orig_g_min, orig_g_max,
+                                      orig_b_min, orig_b_max);
         } else if (gr >= br) {
             split = (uint8_t)(box->g_sum / box->pixel_count);
-            if (split < box->g_min) split = box->g_min;
-            if (split >= box->g_max) split = box->g_max - 1;
+            if (split < orig_g_min) split = orig_g_min;
+            if (split >= orig_g_max) split = orig_g_max - 1;
             compute_box_stats_bounded(ctx->histogram, box,
-                                      box->r_min, box->r_max,
-                                      box->g_min, split,
-                                      box->b_min, box->b_max);
+                                      orig_r_min, orig_r_max,
+                                      orig_g_min, split,
+                                      orig_b_min, orig_b_max);
             compute_box_stats_bounded(ctx->histogram, &new_box,
-                                      boxes[best].r_min, boxes[best].r_max,
-                                      split + 1, boxes[best].g_max,
-                                      boxes[best].b_min, boxes[best].b_max);
+                                      orig_r_min, orig_r_max,
+                                      split + 1, orig_g_max,
+                                      orig_b_min, orig_b_max);
         } else {
             split = (uint8_t)(box->b_sum / box->pixel_count);
-            if (split < box->b_min) split = box->b_min;
-            if (split >= box->b_max) split = box->b_max - 1;
+            if (split < orig_b_min) split = orig_b_min;
+            if (split >= orig_b_max) split = orig_b_max - 1;
             compute_box_stats_bounded(ctx->histogram, box,
-                                      box->r_min, box->r_max,
-                                      box->g_min, box->g_max,
-                                      box->b_min, split);
+                                      orig_r_min, orig_r_max,
+                                      orig_g_min, orig_g_max,
+                                      orig_b_min, split);
             compute_box_stats_bounded(ctx->histogram, &new_box,
-                                      boxes[best].r_min, boxes[best].r_max,
-                                      boxes[best].g_min, boxes[best].g_max,
-                                      split + 1, boxes[best].b_max);
+                                      orig_r_min, orig_r_max,
+                                      orig_g_min, orig_g_max,
+                                      split + 1, orig_b_max);
         }
 
         if (new_box.pixel_count > 0) {

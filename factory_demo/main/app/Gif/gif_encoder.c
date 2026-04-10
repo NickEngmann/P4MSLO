@@ -56,23 +56,16 @@ struct gif_encoder {
 
 /* ---- Helpers ---- */
 
-static inline void rgb565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
+/* The JPEG decoder outputs BGR565 (JPEG_DEC_RGB_ELEMENT_ORDER_BGR).
+ * In BGR565: bits [15:11]=B, [10:5]=G, [4:0]=R */
+static inline void bgr565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    *r = ((px >> 11) & 0x1F);
-    *r = (*r << 3) | (*r >> 2);
-    *g = ((px >> 5) & 0x3F);
-    *g = (*g << 2) | (*g >> 4);
-    *b = (px & 0x1F);
-    *b = (*b << 3) | (*b >> 2);
-}
-
-/* Swap RGB565 byte order (matching album pipeline) */
-static void swap_rgb565_bytes(uint16_t *buffer, int pixel_count)
-{
-    for (int i = 0; i < pixel_count; i++) {
-        uint16_t v = buffer[i];
-        buffer[i] = (v >> 8) | (v << 8);
-    }
+    uint8_t b5 = (px >> 11) & 0x1F;
+    uint8_t g6 = (px >> 5) & 0x3F;
+    uint8_t r5 = px & 0x1F;
+    *r = (r5 << 3) | (r5 >> 2);
+    *g = (g6 << 2) | (g6 >> 4);
+    *b = (b5 << 3) | (b5 >> 2);
 }
 
 /* Read a JPEG file from SD card, decode it, and scale to target size.
@@ -208,9 +201,6 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
         ESP_LOGE(TAG, "PPA scale failed");
         return ret;
     }
-
-    /* Swap byte order to standard RGB565 */
-    swap_rgb565_bytes(enc->scaled_buf, enc->width * enc->height);
 
     return ESP_OK;
 }
@@ -403,7 +393,7 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     int total = enc->width * enc->height;
     for (int i = 0; i < total; i++) {
         uint8_t r, g, b;
-        rgb565_to_rgb888(enc->scaled_buf[i], &r, &g, &b);
+        bgr565_to_rgb888(enc->scaled_buf[i], &r, &g, &b);
         uint8_t idx = gif_quantize_map_pixel(&enc->palette, r, g, b);
         gif_lzw_enc_pixel(lzw, idx);
     }

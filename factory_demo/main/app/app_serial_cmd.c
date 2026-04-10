@@ -194,9 +194,11 @@ static void cmd_sd_stat(const char *path)
 
     /* Check if it's a GIF */
     const char *type = "unknown";
-    if (n >= 6 && memcmp(header, "GIF89a", 6) == 0) type = "GIF89a";
-    else if (n >= 6 && memcmp(header, "GIF87a", 6) == 0) type = "GIF87a";
-    else if (n >= 2 && header[0] == 0xFF && header[1] == 0xD8) type = "JPEG";
+    if (n >= 6 && header[0] == 'G' && header[1] == 'I' && header[2] == 'F') {
+        type = (header[3] == '8' && header[4] == '9') ? "GIF89a" : "GIF87a";
+    } else if (n >= 2 && header[0] == 0xFF && header[1] == 0xD8) {
+        type = "JPEG";
+    }
 
     cmd_respond("path=%s size=%ld type=%s header=[%s]", path, (long)st.st_size, type, hex);
 }

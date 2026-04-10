@@ -404,18 +404,72 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
 
     write_frame_header(enc);
 
-    /* LZW encode: map each pixel to palette index and compress */
+    /* LZW encode with Floyd-Steinberg dithering for smooth gradients */
     gif_lzw_enc_t *lzw = NULL;
     ret = gif_lzw_enc_create(8, enc->fp, &lzw);  /* 8 = min code size for 256 colors */
     if (ret != ESP_OK) return ret;
 
-    int total = enc->width * enc->height;
-    for (int i = 0; i < total; i++) {
-        uint8_t r, g, b;
-        rgb565_to_rgb888(enc->scaled_buf[i], &r, &g, &b);
-        uint8_t idx = gif_quantize_map_pixel(&enc->palette, r, g, b);
-        gif_lzw_enc_pixel(lzw, idx);
+    /* Allocate error diffusion buffers (2 rows × width × 3 channels, int16_t) */
+    int w = enc->width, h = enc->height;
+    int16_t *err_cur = heap_caps_calloc(w * 3, sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *err_nxt = heap_caps_calloc(w * 3, sizeof(int16_t), MALLOC_CAP_SPIRAM);
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            /* Get pixel + accumulated error */
+            uint8_t r0, g0, b0;
+            rgb565_to_rgb888(enc->scaled_buf[y * w + x], &r0, &g0, &b0);
+
+            int r = r0 + err_cur[x * 3 + 0];
+            int g = g0 + err_cur[x * 3 + 1];
+            int b = b0 + err_cur[x * 3 + 2];
+
+            /* Clamp to 0-255 */
+            if (r < 0) r = 0; else if (r > 255) r = 255;
+            if (g < 0) g = 0; else if (g > 255) g = 255;
+            if (b < 0) b = 0; else if (b > 255) b = 255;
+
+            /* Find nearest palette color */
+            uint8_t idx = gif_quantize_map_pixel(&enc->palette, (uint8_t)r, (uint8_t)g, (uint8_t)b);
+            gif_lzw_enc_pixel(lzw, idx);
+
+            /* Compute error */
+            int er = r - enc->palette.entries[idx].r;
+            int eg = g - enc->palette.entries[idx].g;
+            int eb = b - enc->palette.entries[idx].b;
+
+            /* Floyd-Steinberg error distribution:
+             * right: 7/16, below-left: 3/16, below: 5/16, below-right: 1/16 */
+            if (x + 1 < w) {
+                err_cur[(x+1)*3+0] += er * 7 / 16;
+                err_cur[(x+1)*3+1] += eg * 7 / 16;
+                err_cur[(x+1)*3+2] += eb * 7 / 16;
+            }
+            if (y + 1 < h) {
+                if (x > 0) {
+                    err_nxt[(x-1)*3+0] += er * 3 / 16;
+                    err_nxt[(x-1)*3+1] += eg * 3 / 16;
+                    err_nxt[(x-1)*3+2] += eb * 3 / 16;
+                }
+                err_nxt[x*3+0] += er * 5 / 16;
+                err_nxt[x*3+1] += eg * 5 / 16;
+                err_nxt[x*3+2] += eb * 5 / 16;
+                if (x + 1 < w) {
+                    err_nxt[(x+1)*3+0] += er * 1 / 16;
+                    err_nxt[(x+1)*3+1] += eg * 1 / 16;
+                    err_nxt[(x+1)*3+2] += eb * 1 / 16;
+                }
+            }
+        }
+        /* Swap row buffers */
+        int16_t *tmp = err_cur;
+        err_cur = err_nxt;
+        err_nxt = tmp;
+        memset(err_nxt, 0, w * 3 * sizeof(int16_t));
     }
+
+    if (err_cur) heap_caps_free(err_cur);
+    if (err_nxt) heap_caps_free(err_nxt);
 
     gif_lzw_enc_finish(lzw);
     gif_lzw_enc_destroy(lzw);

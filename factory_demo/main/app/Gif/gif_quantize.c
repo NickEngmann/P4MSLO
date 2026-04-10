@@ -2,7 +2,7 @@
  * @file gif_quantize.c
  * @brief Median-cut color quantization for GIF encoding
  *
- * Uses a 5-bit-per-channel color cube (32x32x32 = 32768 entries) to
+ * Uses a 6-bit-per-channel color cube (64x64x64 = 262144 entries, 1MB) to
  * histogram pixel colors, then applies median-cut to produce a 256-color
  * palette.  Designed for PSRAM allocation on ESP32-P4.
  */
@@ -15,9 +15,9 @@
 
 static const char *TAG = "gif_quant";
 
-/* 5-bit color cube: 32x32x32 = 32768 bins */
-#define CUBE_BITS  5
-#define CUBE_SIZE  (1 << CUBE_BITS)  /* 32 */
+/* 6-bit color cube: 64x64x64 = 262144 bins (1MB in PSRAM) */
+#define CUBE_BITS  6
+#define CUBE_SIZE  (1 << CUBE_BITS)  /* 64 */
 #define CUBE_TOTAL (CUBE_SIZE * CUBE_SIZE * CUBE_SIZE)  /* 32768 */
 
 #define CUBE_IDX(r5, g5, b5) (((r5) << 10) | ((g5) << 5) | (b5))
@@ -64,14 +64,16 @@ esp_err_t gif_quantize_accumulate_rgb565(gif_quantize_ctx_t *ctx,
     if (!ctx || !rgb565) return ESP_ERR_INVALID_ARG;
     if (subsample < 1) subsample = 1;
 
-    /* Standard RGB565: R in [15:11], G in [10:5], B in [4:0] */
+    /* Standard RGB565: R5 in [15:11], G6 in [10:5], B5 in [4:0].
+     * Expand R and B from 5-bit to 6-bit for the 6-bit cube.
+     * Green is natively 6-bit in RGB565. */
     int total = width * height;
     for (int i = 0; i < total; i += subsample) {
         uint16_t px = rgb565[i];
-        uint8_t r5 = (px >> 11) & 0x1F;
-        uint8_t g5 = ((px >> 5) & 0x3F) >> 1;  /* 6-bit green → 5-bit */
-        uint8_t b5 =  px & 0x1F;
-        ctx->histogram[CUBE_IDX(r5, g5, b5)]++;
+        uint8_t r6 = ((px >> 11) & 0x1F) << 1;  /* 5-bit R → 6-bit */
+        uint8_t g6 =  (px >> 5)  & 0x3F;         /* native 6-bit G */
+        uint8_t b6 = ( px        & 0x1F) << 1;   /* 5-bit B → 6-bit */
+        ctx->histogram[CUBE_IDX(r6, g6, b6)]++;
     }
     return ESP_OK;
 }
@@ -237,13 +239,13 @@ esp_err_t gif_quantize_build_palette(gif_quantize_ctx_t *ctx, gif_palette_t *pal
 
     for (int i = 0; i < num_boxes; i++) {
         if (boxes[i].pixel_count > 0) {
-            uint8_t r5 = (uint8_t)(boxes[i].r_sum / boxes[i].pixel_count);
-            uint8_t g5 = (uint8_t)(boxes[i].g_sum / boxes[i].pixel_count);
-            uint8_t b5 = (uint8_t)(boxes[i].b_sum / boxes[i].pixel_count);
-            /* Scale 5-bit values to 8-bit */
-            palette->entries[i].r = (r5 << 3) | (r5 >> 2);
-            palette->entries[i].g = (g5 << 3) | (g5 >> 2);
-            palette->entries[i].b = (b5 << 3) | (b5 >> 2);
+            uint8_t r6 = (uint8_t)(boxes[i].r_sum / boxes[i].pixel_count);
+            uint8_t g6 = (uint8_t)(boxes[i].g_sum / boxes[i].pixel_count);
+            uint8_t b6 = (uint8_t)(boxes[i].b_sum / boxes[i].pixel_count);
+            /* Scale 6-bit values to 8-bit */
+            palette->entries[i].r = (r6 << 2) | (r6 >> 4);
+            palette->entries[i].g = (g6 << 2) | (g6 >> 4);
+            palette->entries[i].b = (b6 << 2) | (b6 >> 4);
         }
     }
 

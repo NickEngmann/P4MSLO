@@ -56,14 +56,14 @@ struct gif_encoder {
 
 /* ---- Helpers ---- */
 
-/* JPEG decoder outputs BGR565 (JPEG_DEC_RGB_ELEMENT_ORDER_BGR), PPA preserves
- * the channel order. So the scaled output is BGR565:
- *   bits [15:11]=B, [10:5]=G, [4:0]=R */
-static inline void bgr565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
+/* The JPEG decoder + PPA output is standard RGB565 regardless of the
+ * JPEG_DEC_RGB_ELEMENT_ORDER_BGR flag (verified via host-side testing).
+ * RGB565: bits [15:11]=R, [10:5]=G, [4:0]=B */
+static inline void rgb565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    uint8_t b5 = (px >> 11) & 0x1F;
+    uint8_t r5 = (px >> 11) & 0x1F;
     uint8_t g6 = (px >> 5)  & 0x3F;
-    uint8_t r5 =  px        & 0x1F;
+    uint8_t b5 =  px        & 0x1F;
     *r = (r5 << 3) | (r5 >> 2);
     *g = (g6 << 2) | (g6 >> 4);
     *b = (b5 << 3) | (b5 >> 2);
@@ -412,7 +412,7 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     int total = enc->width * enc->height;
     for (int i = 0; i < total; i++) {
         uint8_t r, g, b;
-        bgr565_to_rgb888(enc->scaled_buf[i], &r, &g, &b);
+        rgb565_to_rgb888(enc->scaled_buf[i], &r, &g, &b);
         uint8_t idx = gif_quantize_map_pixel(&enc->palette, r, g, b);
         gif_lzw_enc_pixel(lzw, idx);
     }

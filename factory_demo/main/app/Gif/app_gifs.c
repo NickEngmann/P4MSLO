@@ -504,7 +504,7 @@ esp_err_t app_gifs_create_from_album(int frame_delay_ms, int max_frames)
 
     encode_task_params_t *params = malloc(sizeof(encode_task_params_t));
     if (!params) return ESP_ERR_NO_MEM;
-    params->frame_delay_ms = (frame_delay_ms > 0) ? frame_delay_ms : 500;
+    params->frame_delay_ms = (frame_delay_ms > 0) ? frame_delay_ms : 300;
     params->max_frames = (max_frames > 0) ? max_frames : 0;
 
     s_ctx.is_encoding = true;

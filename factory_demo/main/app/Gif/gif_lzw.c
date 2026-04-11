@@ -24,16 +24,17 @@ static const char *TAG = "gif_lzw";
 /* ================================================================== */
 
 /*
- * Dictionary via hash table with open addressing.
- * Key: (prefix_code << 8) | suffix_byte → code.
+ * Dictionary via hash table with XOR-based hash (no multiply) and
+ * generation counter (no memset on reset). Open addressing, 16K slots.
  */
 
-#define HT_SIZE  8192  /* Must be power of 2, > 4096 */
+#define HT_SIZE  8192   /* Power of 2, > 4096. 8K × 8 bytes = 64KB */
 #define HT_MASK  (HT_SIZE - 1)
 
 typedef struct {
-    int32_t key;    /* (prefix << 8) | suffix, or -1 for empty */
-    int16_t value;  /* dictionary code */
+    int32_t key;      /* (prefix << 8) | suffix */
+    int16_t code;
+    uint16_t gen;
 } ht_slot_t;
 
 struct gif_lzw_enc {
@@ -44,6 +45,7 @@ struct gif_lzw_enc {
     int next_code;
     int code_size;
     int current;      /* Current prefix code, -1 = none */
+    uint16_t gen;     /* Current generation */
 
     /* Bit packer */
     uint32_t bits;
@@ -53,7 +55,7 @@ struct gif_lzw_enc {
     uint8_t blk[SUB_BLOCK_MAX];
     int blk_len;
 
-    /* Hash table dictionary */
+    /* Hash table with generation tagging */
     ht_slot_t *ht;
 };
 
@@ -89,29 +91,43 @@ static void enc_reset_dict(gif_lzw_enc_t *e)
 {
     e->next_code = e->eoi_code + 1;
     e->code_size = e->min_code_size + 1;
-    for (int i = 0; i < HT_SIZE; i++)
-        e->ht[i].key = -1;
+    e->gen++;  /* Invalidate all entries without memset */
+    if (e->gen == 0) {
+        memset(e->ht, 0, HT_SIZE * sizeof(ht_slot_t));
+        e->gen = 1;
+    }
 }
 
-static int enc_ht_find(gif_lzw_enc_t *e, int prefix, uint8_t suffix)
+/* XOR-shift hash — much faster than multiply on RISC-V */
+static inline uint32_t ht_hash(int32_t key)
+{
+    uint32_t h = (uint32_t)key;
+    h ^= h >> 16;
+    h ^= h >> 8;
+    return h & HT_MASK;
+}
+
+static inline int enc_ht_find(gif_lzw_enc_t *e, int prefix, uint8_t suffix)
 {
     int32_t key = ((int32_t)prefix << 8) | suffix;
-    uint32_t idx = ((uint32_t)key * 2654435761U) & HT_MASK;
+    uint32_t idx = ht_hash(key);
     for (;;) {
-        if (e->ht[idx].key == -1) return -1;
-        if (e->ht[idx].key == key) return e->ht[idx].value;
+        ht_slot_t *s = &e->ht[idx];
+        if (s->gen != e->gen) return -1;  /* Empty slot (stale generation) */
+        if (s->key == key) return s->code;
         idx = (idx + 1) & HT_MASK;
     }
 }
 
-static void enc_ht_insert(gif_lzw_enc_t *e, int prefix, uint8_t suffix, int code)
+static inline void enc_ht_insert(gif_lzw_enc_t *e, int prefix, uint8_t suffix, int code)
 {
     int32_t key = ((int32_t)prefix << 8) | suffix;
-    uint32_t idx = ((uint32_t)key * 2654435761U) & HT_MASK;
-    while (e->ht[idx].key != -1)
+    uint32_t idx = ht_hash(key);
+    while (e->ht[idx].gen == e->gen)
         idx = (idx + 1) & HT_MASK;
     e->ht[idx].key = key;
-    e->ht[idx].value = (int16_t)code;
+    e->ht[idx].code = (int16_t)code;
+    e->ht[idx].gen = e->gen;
 }
 
 esp_err_t gif_lzw_enc_create(int min_code_size, FILE *output, gif_lzw_enc_t **out)
@@ -119,7 +135,10 @@ esp_err_t gif_lzw_enc_create(int min_code_size, FILE *output, gif_lzw_enc_t **ou
     gif_lzw_enc_t *e = heap_caps_calloc(1, sizeof(gif_lzw_enc_t), MALLOC_CAP_SPIRAM);
     if (!e) return ESP_ERR_NO_MEM;
 
-    e->ht = heap_caps_malloc(HT_SIZE * sizeof(ht_slot_t), MALLOC_CAP_SPIRAM);
+    /* Try internal RAM for the hash table (64KB), fall back to PSRAM */
+    e->ht = heap_caps_calloc(HT_SIZE, sizeof(ht_slot_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!e->ht)
+        e->ht = heap_caps_calloc(HT_SIZE, sizeof(ht_slot_t), MALLOC_CAP_SPIRAM);
     if (!e->ht) {
         heap_caps_free(e);
         return ESP_ERR_NO_MEM;

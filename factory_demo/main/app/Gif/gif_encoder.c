@@ -20,6 +20,10 @@
 #include "driver/ppa.h"
 #include "bsp/display.h"
 
+/* SIMD-accelerated functions (gif_simd.S) */
+extern void gif_simd_distribute_below(int16_t *err_nxt, const int16_t *errors, int count);
+extern void gif_simd_memzero_s16(int16_t *buf, int count);
+
 static const char *TAG = "gif_enc";
 
 /* Align a value up to the given alignment */
@@ -36,6 +40,7 @@ struct gif_encoder {
 
     /* Buffers (PSRAM) */
     void *jpeg_buf;         /* Raw JPEG data */
+    size_t jpeg_buf_size;   /* Current jpeg_buf allocation size */
     void *decode_buf;       /* JPEG decode output (RGB565) */
     size_t decode_buf_size;
     uint16_t *scaled_buf;   /* PPA output (RGB565, target resolution) */
@@ -87,12 +92,17 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
     size_t file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (enc->jpeg_buf) free(enc->jpeg_buf);
-    enc->jpeg_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-    if (!enc->jpeg_buf) {
-        fclose(f);
-        ESP_LOGE(TAG, "OOM for JPEG buffer (%zu bytes)", file_size);
-        return ESP_ERR_NO_MEM;
+    /* Reuse JPEG buffer if big enough, otherwise reallocate */
+    if (!enc->jpeg_buf || enc->jpeg_buf_size < file_size) {
+        if (enc->jpeg_buf) free(enc->jpeg_buf);
+        enc->jpeg_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+        enc->jpeg_buf_size = file_size;
+        if (!enc->jpeg_buf) {
+            enc->jpeg_buf_size = 0;
+            fclose(f);
+            ESP_LOGE(TAG, "OOM for JPEG buffer (%zu bytes)", file_size);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     fread(enc->jpeg_buf, 1, file_size, f);
@@ -403,6 +413,9 @@ esp_err_t gif_encoder_pass2_begin(gif_encoder_t *enc, const char *output_path)
         ESP_LOGE(TAG, "Cannot create %s", output_path);
         return ESP_FAIL;
     }
+    /* Use 32KB write buffer to reduce SD card syscalls */
+    static char file_buf[32768];
+    setvbuf(enc->fp, file_buf, _IOFBF, sizeof(file_buf));
 
     write_gif_header(enc);
     enc->frame_count = 0;
@@ -413,8 +426,12 @@ esp_err_t gif_encoder_pass2_begin(gif_encoder_t *enc, const char *output_path)
 
 esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
 {
+    uint32_t t_start = esp_log_timestamp();
+
     esp_err_t ret = load_and_decode_jpeg(enc, jpeg_path);
     if (ret != ESP_OK) return ret;
+
+    uint32_t t_decode = esp_log_timestamp();
 
     write_frame_header(enc);
 
@@ -424,73 +441,137 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     ret = gif_lzw_enc_create(8, enc->fp, &lzw);  /* 8 = min code size for 256 colors */
     if (ret != ESP_OK) return ret;
 
-    /* Allocate error diffusion buffers (2 rows × width × 3 channels, int16_t) */
     int w = enc->width, h = enc->height;
-    int16_t *err_cur = heap_caps_calloc(w * 3, sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    int16_t *err_nxt = heap_caps_calloc(w * 3, sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    const uint8_t *lut = enc->pixel_lut;
+
+    /* Copy LUT to internal RAM for fast access (64KB) */
+    uint8_t *lut = heap_caps_malloc(65536, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    bool lut_internal = (lut != NULL);
+    if (lut) {
+        memcpy(lut, enc->pixel_lut, 65536);
+        ESP_LOGI(TAG, "LUT in internal RAM (64KB)");
+    } else {
+        lut = enc->pixel_lut;
+        ESP_LOGW(TAG, "LUT in PSRAM");
+    }
+
+    /* Cache palette RGB values in local array for fast access */
+    uint8_t pal_r[256], pal_g[256], pal_b[256];
+    for (int i = 0; i < 256; i++) {
+        pal_r[i] = enc->palette.entries[i].r;
+        pal_g[i] = enc->palette.entries[i].g;
+        pal_b[i] = enc->palette.entries[i].b;
+    }
+
+    /* Error diffusion buffers — try internal RAM first for speed.
+     * Each: 1920 * 3 * 2 = 11,520 bytes. Two buffers = 23KB. */
+    size_t err_size = w * 3 * sizeof(int16_t);
+    int16_t *err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!err_cur || !err_nxt) {
+        if (err_cur) { free(err_cur); err_cur = NULL; }
+        if (err_nxt) { free(err_nxt); err_nxt = NULL; }
+        err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
+        err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
+        ESP_LOGW(TAG, "Error buffers in PSRAM");
+    } else {
+        ESP_LOGI(TAG, "Error buffers in internal RAM (%zu bytes each)", err_size);
+    }
+
+    /* Prefetch pixel row into internal SRAM for fast access (3840 bytes for 1920px) */
+    uint16_t *row_cache = heap_caps_malloc(w * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    bool use_row_cache = (row_cache != NULL);
+    if (use_row_cache) {
+        ESP_LOGI(TAG, "Row prefetch buffer in internal RAM (%d bytes)", w * 2);
+    }
+
+    /* Allocate row buffers for multi-pass processing */
+    uint8_t *row_indices = heap_caps_malloc(w, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!row_indices) row_indices = heap_caps_malloc(w, MALLOC_CAP_SPIRAM);
+
+    int16_t *row_errors = NULL; /* unused — kept for future SIMD vectorization */
 
     for (int y = 0; y < h; y++) {
+        /* Prefetch entire pixel row from PSRAM to internal SRAM */
+        const uint16_t *row_px;
+        if (use_row_cache) {
+            memcpy(row_cache, &enc->scaled_buf[y * w], w * sizeof(uint16_t));
+            row_px = row_cache;
+        } else {
+            row_px = &enc->scaled_buf[y * w];
+        }
+        int16_t *restrict ec = err_cur;
+        int16_t *restrict en = err_nxt;
+        const int last_row = (y + 1 >= h);
+
+        /* Pass A: Dither + LUT → palette indices */
         for (int x = 0; x < w; x++) {
-            /* Get pixel + accumulated error */
-            uint8_t r0, g0, b0;
-            rgb565_to_rgb888(enc->scaled_buf[y * w + x], &r0, &g0, &b0);
+            uint16_t px = row_px[x];
+            int r = ((((px >> 11) & 0x1F) * 527 + 23) >> 6) + ec[x*3];
+            int g = ((((px >> 5) & 0x3F) * 259 + 33) >> 6) + ec[x*3+1];
+            int b = (((px & 0x1F) * 527 + 23) >> 6)        + ec[x*3+2];
 
-            int r = r0 + err_cur[x * 3 + 0];
-            int g = g0 + err_cur[x * 3 + 1];
-            int b = b0 + err_cur[x * 3 + 2];
+            r = r < 0 ? 0 : (r > 255 ? 255 : r);
+            g = g < 0 ? 0 : (g > 255 ? 255 : g);
+            b = b < 0 ? 0 : (b > 255 ? 255 : b);
 
-            /* Clamp to 0-255 */
-            if (r < 0) r = 0; else if (r > 255) r = 255;
-            if (g < 0) g = 0; else if (g > 255) g = 255;
-            if (b < 0) b = 0; else if (b > 255) b = 255;
+            uint16_t d16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            uint8_t idx = lut[d16];
+            row_indices[x] = idx;
 
-            /* Map dithered color to nearest palette entry via LUT.
-             * Convert clamped RGB888 back to RGB565 for the LUT lookup. */
-            uint16_t dithered_rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-            uint8_t idx = lut[dithered_rgb565];
-            gif_lzw_enc_pixel(lzw, idx);
+            int er = r - pal_r[idx];
+            int eg = g - pal_g[idx];
+            int eb = b - pal_b[idx];
 
-            /* Compute error */
-            int er = r - enc->palette.entries[idx].r;
-            int eg = g - enc->palette.entries[idx].g;
-            int eb = b - enc->palette.entries[idx].b;
-
-            /* Floyd-Steinberg error distribution:
-             * right: 7/16, below-left: 3/16, below: 5/16, below-right: 1/16 */
             if (x + 1 < w) {
-                err_cur[(x+1)*3+0] += er * 7 / 16;
-                err_cur[(x+1)*3+1] += eg * 7 / 16;
-                err_cur[(x+1)*3+2] += eb * 7 / 16;
+                ec[(x+1)*3]   += er * 7 >> 4;
+                ec[(x+1)*3+1] += eg * 7 >> 4;
+                ec[(x+1)*3+2] += eb * 7 >> 4;
             }
-            if (y + 1 < h) {
+            if (!last_row) {
                 if (x > 0) {
-                    err_nxt[(x-1)*3+0] += er * 3 / 16;
-                    err_nxt[(x-1)*3+1] += eg * 3 / 16;
-                    err_nxt[(x-1)*3+2] += eb * 3 / 16;
+                    en[(x-1)*3]   += er * 3 >> 4;
+                    en[(x-1)*3+1] += eg * 3 >> 4;
+                    en[(x-1)*3+2] += eb * 3 >> 4;
                 }
-                err_nxt[x*3+0] += er * 5 / 16;
-                err_nxt[x*3+1] += eg * 5 / 16;
-                err_nxt[x*3+2] += eb * 5 / 16;
+                en[x*3]   += er * 5 >> 4;
+                en[x*3+1] += eg * 5 >> 4;
+                en[x*3+2] += eb * 5 >> 4;
                 if (x + 1 < w) {
-                    err_nxt[(x+1)*3+0] += er * 1 / 16;
-                    err_nxt[(x+1)*3+1] += eg * 1 / 16;
-                    err_nxt[(x+1)*3+2] += eb * 1 / 16;
+                    en[(x+1)*3]   += er >> 4;
+                    en[(x+1)*3+1] += eg >> 4;
+                    en[(x+1)*3+2] += eb >> 4;
                 }
             }
         }
-        /* Swap row buffers */
+
+        /* Pass B: Feed row of indices to LZW encoder */
+        for (int x = 0; x < w; x++) {
+            gif_lzw_enc_pixel(lzw, row_indices[x]);
+        }
+
+        /* Swap row buffers and zero */
         int16_t *tmp = err_cur;
         err_cur = err_nxt;
         err_nxt = tmp;
-        memset(err_nxt, 0, w * 3 * sizeof(int16_t));
+        gif_simd_memzero_s16(err_nxt, w * 3);
     }
 
-    if (err_cur) heap_caps_free(err_cur);
-    if (err_nxt) heap_caps_free(err_nxt);
+    heap_caps_free(err_cur);
+    heap_caps_free(err_nxt);
+    if (row_cache) free(row_cache);
+    if (row_indices) free(row_indices);
+    if (row_errors) free(row_errors);
+    if (lut_internal) free(lut);
+
+    uint32_t t_dither_lzw = esp_log_timestamp();
 
     gif_lzw_enc_finish(lzw);
     gif_lzw_enc_destroy(lzw);
+
+    uint32_t t_done = esp_log_timestamp();
+    ESP_LOGI(TAG, "Frame timing: decode=%lums dither+lzw=%lums flush=%lums total=%lums",
+             t_decode - t_start, t_dither_lzw - t_decode,
+             t_done - t_dither_lzw, t_done - t_start);
 
     enc->frame_count++;
     if (enc->progress_cb)

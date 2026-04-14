@@ -425,7 +425,7 @@ esp_err_t gif_encoder_pass1_finalize(gif_encoder_t *enc)
 
 esp_err_t gif_encoder_pass2_begin(gif_encoder_t *enc, const char *output_path)
 {
-    enc->fp = fopen(output_path, "wb");
+    enc->fp = fopen(output_path, "w+b"); /* w+b: read+write for frame replay */
     if (!enc->fp) {
         ESP_LOGE(TAG, "Cannot create %s", output_path);
         return ESP_FAIL;
@@ -594,6 +594,60 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     if (enc->progress_cb)
         enc->progress_cb(enc->frame_count, enc->total_frames, 2, enc->progress_user);
 
+    return ESP_OK;
+}
+
+long gif_encoder_get_file_pos(gif_encoder_t *enc)
+{
+    if (!enc || !enc->fp) return -1;
+    fflush(enc->fp);
+    return ftell(enc->fp);
+}
+
+esp_err_t gif_encoder_pass2_replay_frame(gif_encoder_t *enc,
+                                          long src_offset, size_t length)
+{
+    if (!enc || !enc->fp) return ESP_ERR_INVALID_STATE;
+    if (length == 0) return ESP_ERR_INVALID_ARG;
+
+    /* Remember where we need to write (current end of file) */
+    fflush(enc->fp);
+    long write_pos = ftell(enc->fp);
+
+    /* Copy frame data using the largest buffer we can allocate.
+     * Each seek+read+seek+write cycle has SD overhead, so bigger = faster. */
+    size_t buf_size = length;  /* Try full frame first */
+    uint8_t *buf = NULL;
+    while (buf_size >= 32768 && !buf) {
+        buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+        if (!buf) buf_size /= 2;
+    }
+    if (!buf) {
+        buf_size = 32768;
+        buf = malloc(buf_size);  /* Internal RAM fallback */
+    }
+    if (!buf) {
+        ESP_LOGE(TAG, "Cannot allocate replay buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t remaining = length;
+    long rpos = src_offset;
+    while (remaining > 0) {
+        size_t n = remaining > buf_size ? buf_size : remaining;
+        fseek(enc->fp, rpos, SEEK_SET);
+        size_t got = fread(buf, 1, n, enc->fp);
+        if (got == 0) break;
+        fseek(enc->fp, write_pos, SEEK_SET);
+        fwrite(buf, 1, got, enc->fp);
+        write_pos += got;
+        rpos += got;
+        remaining -= got;
+    }
+    free(buf);
+
+    enc->frame_count++;
+    ESP_LOGI(TAG, "Replayed frame: %zu bytes from offset %ld", length, src_offset);
     return ESP_OK;
 }
 

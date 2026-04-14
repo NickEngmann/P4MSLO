@@ -99,6 +99,30 @@ esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
     const uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop);
 
 /**
+ * @brief Get current write position in the GIF file
+ *
+ * Use before/after pass2_add_frame to record frame byte ranges,
+ * then use pass2_replay_frame_data to copy them for duplicate frames.
+ */
+long gif_encoder_get_file_pos(gif_encoder_t *enc);
+
+/**
+ * @brief Replay previously-written frame data from the GIF file
+ *
+ * Copies bytes from [src_offset, src_offset+length) to the current
+ * write position. Used for oscillating GIF sequences where reverse
+ * frames are identical to forward frames — avoids re-decoding and
+ * re-encoding, saving ~5 seconds per duplicated frame.
+ *
+ * @param enc         Encoder context
+ * @param src_offset  Byte offset in the GIF file where the frame starts
+ * @param length      Number of bytes to copy
+ * @return ESP_OK on success
+ */
+esp_err_t gif_encoder_pass2_replay_frame(gif_encoder_t *enc,
+                                          long src_offset, size_t length);
+
+/**
  * @brief Destroy encoder and free all resources
  */
 void gif_encoder_destroy(gif_encoder_t *enc);

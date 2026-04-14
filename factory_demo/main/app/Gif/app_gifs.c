@@ -640,10 +640,12 @@ static void pimslo_encode_task(void *param)
     ret = gif_encoder_pass1_finalize(enc);
     if (ret != ESP_OK) goto cleanup_enc;
 
-    /* Pass 2: Encode oscillating sequence.
-     * 4 cameras: 1→2→3→4→3→2→1 (7 frames)
-     * 3 cameras: 1→2→3→2→1 (5 frames)
-     * 2 cameras: 1→2→1 (3 frames) */
+    /* Pass 2: Encode oscillating sequence with frame replay optimization.
+     * Forward pass (0→num_cams-1): full decode + dither + LZW encode
+     * Reverse pass: replay the already-encoded frame bytes from the GIF file
+     *
+     * For 4 cameras: forward = 1,2,3,4, reverse = 3,2,1 (replayed)
+     * Saves ~5s per replayed frame = ~15s for 4 cameras */
     ensure_gif_dir();
     char output_path[MAX_PATH_LEN];
     snprintf(output_path, sizeof(output_path), "%s/%s/pimslo_%ld.gif",
@@ -652,19 +654,14 @@ static void pimslo_encode_task(void *param)
     ret = gif_encoder_pass2_begin(enc, output_path);
     if (ret != ESP_OK) goto cleanup_enc;
 
-    /* Build oscillation: forward + reverse (skip endpoints) */
-    int frame_order[14];  /* Max: 4 + 3 + ... */
-    int num_frames = 0;
-    for (int i = 0; i < num_cams; i++)
-        frame_order[num_frames++] = i;
-    for (int i = num_cams - 2; i >= 1; i--)
-        frame_order[num_frames++] = i;
+    /* Forward pass: encode each unique camera frame, record file offsets */
+    long frame_offsets[MAX_PIMSLO_CAMS];
+    long frame_sizes[MAX_PIMSLO_CAMS];
+    for (int i = 0; i < num_cams; i++) {
+        frame_offsets[i] = gif_encoder_get_file_pos(enc);
 
-    ESP_LOGI(TAG, "Oscillation: %d frames from %d cameras", num_frames, num_cams);
-    for (int f = 0; f < num_frames; f++) {
-        int idx = frame_order[f];
         char path[64];
-        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", idx + 1);
+        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
         FILE *ff = fopen(path, "rb");
         if (!ff) { ESP_LOGW(TAG, "Cannot reopen %s", path); continue; }
         fseek(ff, 0, SEEK_END);
@@ -674,11 +671,32 @@ static void pimslo_encode_task(void *param)
         if (!data) { fclose(ff); continue; }
         fread(data, 1, sz, ff);
         fclose(ff);
-        ret = gif_encoder_pass2_add_frame_from_buffer(enc, data, sz, &crops[idx]);
+        ret = gif_encoder_pass2_add_frame_from_buffer(enc, data, sz, &crops[i]);
         heap_caps_free(data);
+
+        long end_pos = gif_encoder_get_file_pos(enc);
+        frame_sizes[i] = end_pos - frame_offsets[i];
+
         if (ret != ESP_OK)
-            ESP_LOGW(TAG, "Pass 2 failed for frame %d (pos %d)", f, idx+1);
+            ESP_LOGW(TAG, "Pass 2 encode failed for pos %d", i + 1);
+        else
+            ESP_LOGI(TAG, "Forward frame %d: %ld bytes at offset %ld",
+                     i + 1, frame_sizes[i], frame_offsets[i]);
     }
+
+    /* Reverse pass: replay frames from the file (skip first and last endpoints) */
+    int reverse_count = 0;
+    for (int i = num_cams - 2; i >= 1; i--) {
+        if (frame_sizes[i] > 0) {
+            ret = gif_encoder_pass2_replay_frame(enc, frame_offsets[i],
+                                                  (size_t)frame_sizes[i]);
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "Replay failed for pos %d", i + 1);
+            reverse_count++;
+        }
+    }
+    ESP_LOGI(TAG, "Replayed %d reverse frames (saved ~%ds encoding time)",
+             reverse_count, reverse_count * 5);
 
     ret = gif_encoder_pass2_finish(enc);
     if (ret == ESP_OK) {

@@ -654,11 +654,16 @@ static void pimslo_encode_task(void *param)
     ret = gif_encoder_pass2_begin(enc, output_path);
     if (ret != ESP_OK) goto cleanup_enc;
 
-    /* Forward pass: encode each unique camera frame, record file offsets */
-    long frame_offsets[MAX_PIMSLO_CAMS];
-    long frame_sizes[MAX_PIMSLO_CAMS];
+    /* Forward pass: encode each unique camera frame.
+     * Cache the middle frames' GIF data in PSRAM for instant replay
+     * during the reverse pass (avoids SD card read-back). */
+    uint8_t *frame_cache[MAX_PIMSLO_CAMS];
+    size_t   frame_cache_size[MAX_PIMSLO_CAMS];
+    memset(frame_cache, 0, sizeof(frame_cache));
+    memset(frame_cache_size, 0, sizeof(frame_cache_size));
+
     for (int i = 0; i < num_cams; i++) {
-        frame_offsets[i] = gif_encoder_get_file_pos(enc);
+        long start_pos = gif_encoder_get_file_pos(enc);
 
         char path[64];
         snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
@@ -675,28 +680,46 @@ static void pimslo_encode_task(void *param)
         heap_caps_free(data);
 
         long end_pos = gif_encoder_get_file_pos(enc);
-        frame_sizes[i] = end_pos - frame_offsets[i];
+        size_t frame_len = (size_t)(end_pos - start_pos);
 
-        if (ret != ESP_OK)
+        if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Pass 2 encode failed for pos %d", i + 1);
-        else
-            ESP_LOGI(TAG, "Forward frame %d: %ld bytes at offset %ld",
-                     i + 1, frame_sizes[i], frame_offsets[i]);
+            continue;
+        }
+
+        /* Cache middle frames (not first/last) in PSRAM for reverse pass.
+         * First frame (i=0) and last frame (i=num_cams-1) are endpoints
+         * of the oscillation and don't appear in the reverse. */
+        if (i > 0 && i < num_cams - 1) {
+            frame_cache[i] = heap_caps_malloc(frame_len, MALLOC_CAP_SPIRAM);
+            if (frame_cache[i]) {
+                /* Read back the just-written frame data from the GIF file */
+                esp_err_t rb = gif_encoder_read_back(enc, start_pos,
+                                                      frame_cache[i], frame_len);
+                if (rb == ESP_OK) {
+                    frame_cache_size[i] = frame_len;
+                    ESP_LOGI(TAG, "Cached frame %d: %zu bytes in PSRAM", i + 1, frame_len);
+                } else {
+                    heap_caps_free(frame_cache[i]);
+                    frame_cache[i] = NULL;
+                }
+            }
+        }
     }
 
-    /* Reverse pass: replay frames from the file (skip first and last endpoints) */
+    /* Reverse pass: write cached frames directly from PSRAM (no SD read) */
     int reverse_count = 0;
+    uint32_t t_replay = esp_log_timestamp();
     for (int i = num_cams - 2; i >= 1; i--) {
-        if (frame_sizes[i] > 0) {
-            ret = gif_encoder_pass2_replay_frame(enc, frame_offsets[i],
-                                                  (size_t)frame_sizes[i]);
-            if (ret != ESP_OK)
-                ESP_LOGW(TAG, "Replay failed for pos %d", i + 1);
+        if (frame_cache[i] && frame_cache_size[i] > 0) {
+            gif_encoder_pass2_write_raw_frame(enc, frame_cache[i], frame_cache_size[i]);
+            heap_caps_free(frame_cache[i]);
+            frame_cache[i] = NULL;
             reverse_count++;
         }
     }
-    ESP_LOGI(TAG, "Replayed %d reverse frames (saved ~%ds encoding time)",
-             reverse_count, reverse_count * 5);
+    ESP_LOGI(TAG, "Replayed %d frames from PSRAM in %lums",
+             reverse_count, (unsigned long)(esp_log_timestamp() - t_replay));
 
     ret = gif_encoder_pass2_finish(enc);
     if (ret == ESP_OK) {

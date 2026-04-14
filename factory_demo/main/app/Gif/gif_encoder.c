@@ -651,6 +651,26 @@ esp_err_t gif_encoder_pass2_replay_frame(gif_encoder_t *enc,
     return ESP_OK;
 }
 
+esp_err_t gif_encoder_pass2_write_raw_frame(gif_encoder_t *enc,
+                                             const void *data, size_t length)
+{
+    if (!enc || !enc->fp || !data) return ESP_ERR_INVALID_STATE;
+    fwrite(data, 1, length, enc->fp);
+    enc->frame_count++;
+    return ESP_OK;
+}
+
+esp_err_t gif_encoder_read_back(gif_encoder_t *enc, long offset, void *buf, size_t length)
+{
+    if (!enc || !enc->fp || !buf) return ESP_ERR_INVALID_STATE;
+    fflush(enc->fp);
+    long save_pos = ftell(enc->fp);
+    fseek(enc->fp, offset, SEEK_SET);
+    size_t got = fread(buf, 1, length, enc->fp);
+    fseek(enc->fp, save_pos, SEEK_SET);
+    return (got == length) ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t gif_encoder_pass2_finish(gif_encoder_t *enc)
 {
     if (!enc->fp) return ESP_ERR_INVALID_STATE;

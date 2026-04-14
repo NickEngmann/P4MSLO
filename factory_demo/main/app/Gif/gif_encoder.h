@@ -123,6 +123,22 @@ esp_err_t gif_encoder_pass2_replay_frame(gif_encoder_t *enc,
                                           long src_offset, size_t length);
 
 /**
+ * @brief Write raw frame data directly to the GIF file from a memory buffer
+ *
+ * Used for PSRAM-cached frame replay. The buffer must contain a complete
+ * GIF frame (GCE + Image Descriptor + LZW data + terminator).
+ */
+esp_err_t gif_encoder_pass2_write_raw_frame(gif_encoder_t *enc,
+                                             const void *data, size_t length);
+
+/**
+ * @brief Read back frame data from the GIF file into a buffer
+ *
+ * Reads bytes from [offset, offset+length) without moving the write cursor.
+ */
+esp_err_t gif_encoder_read_back(gif_encoder_t *enc, long offset, void *buf, size_t length);
+
+/**
  * @brief Destroy encoder and free all resources
  */
 void gif_encoder_destroy(gif_encoder_t *enc);

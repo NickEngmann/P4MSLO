@@ -24,11 +24,13 @@
 #include "network/HttpServer.h"
 #include "ota/OTAManager.h"
 #include "led/StatusLED.h"
+#include "spi/SPISlave.h"
 
 static const char *TAG = "moment";
 
 static CameraManager  cameraManager;
 static SDCardManager  sdCardManager;
+static SPISlave       spiSlave;
 WiFiManager           wifiManager;
 static HttpServer     httpServer;
 static OTAManager     otaManager;
@@ -70,17 +72,36 @@ static void savePhotoCounter() {
 }
 
 static void doCapture() {
+#if ENABLE_SPI_SLAVE
+    if (!cameraManager.isInitialized()) {
+        ESP_LOGE(TAG, "Cannot capture — camera not ready");
+        return;
+    }
+#else
     if (!cameraManager.isInitialized() || !sdCardManager.isMounted()) {
         ESP_LOGE(TAG, "Cannot capture — camera or SD not ready");
         return;
     }
+#endif
 
     statusLED.setState(LEDState::CAPTURING);
+
+    /* Clear any previous JPEG data from SPI slave */
+    spiSlave.clearJpegData();
 
     uint8_t *jpegBuf = nullptr;
     size_t jpegLen = 0;
 
     if (cameraManager.capturePhoto(&jpegBuf, &jpegLen)) {
+#if ENABLE_SPI_SLAVE
+        /* Make JPEG available for SPI transfer (don't release camera fb yet!) */
+        spiSlave.setJpegData(jpegBuf, jpegLen);
+        photoCounter++;
+        savePhotoCounter();
+        ESP_LOGI(TAG, "Photo captured: %zu bytes (available via SPI)", jpegLen);
+        /* NOTE: camera fb is NOT released here — it stays valid until
+         * the SPI master reads the data, then we release on next capture */
+#else
         photoCounter++;
         std::string filename = sdCardManager.savePhoto(jpegBuf, jpegLen, photoCounter);
         cameraManager.releasePhoto();
@@ -91,6 +112,7 @@ static void doCapture() {
         } else {
             ESP_LOGE(TAG, "Failed to save photo to SD");
         }
+#endif
     } else {
         ESP_LOGE(TAG, "Capture failed");
     }
@@ -204,6 +226,15 @@ extern "C" void app_main(void) {
 
     vTaskDelay(pdMS_TO_TICKS(200));
 
+#if ENABLE_SPI_SLAVE
+    // ─── SPI Slave (replaces SD card) ───────────────────
+    ESP_LOGI(TAG, "[4/6] SPI Slave...");
+    if (spiSlave.begin()) {
+        ESP_LOGI(TAG, "[4/6] SPI Slave: OK (SD card disabled)");
+    } else {
+        ESP_LOGE(TAG, "[4/6] SPI Slave: FAILED");
+    }
+#else
     // ─── SD Card (FAT32) ────────────────────────────────
     ESP_LOGI(TAG, "[4/6] SD Card (FAT32)...");
     if (sdCardManager.begin()) {
@@ -213,6 +244,7 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "[4/6] SD Card: FAILED");
         statusLED.setState(LEDState::NO_SD_CARD);
     }
+#endif
 
     // ─── WiFi (dual-SSID) ───────────────────────────────
     ESP_LOGI(TAG, "[5/6] WiFi...");

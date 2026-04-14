@@ -27,6 +27,7 @@
 
 #include "ui_extra.h"
 #include "app_gifs.h"
+#include "spi_camera.h"
 
 static const char *TAG = "serial_cmd";
 
@@ -392,6 +393,88 @@ static void dispatch_command(char *line)
         cmd_ping();
     } else if (strcmp(line, "trigger") == 0) {
         cmd_trigger(arg);
+    } else if (strcmp(line, "spi_init") == 0) {
+        esp_err_t ret = spi_camera_init();
+        cmd_respond("%s spi_init", ret == ESP_OK ? "ok" : "error");
+    } else if (strcmp(line, "spi_capture") == 0) {
+        /* Trigger cameras, then receive JPEG via SPI from camera #1 */
+        spi_camera_init();
+        trigger_init();
+
+        /* Pulse GPIO34 to trigger capture */
+        gpio_set_level((gpio_num_t)TRIGGER_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level((gpio_num_t)TRIGGER_GPIO, 1);
+        ESP_LOGI(TAG, "Trigger sent, waiting for capture...");
+        vTaskDelay(pdMS_TO_TICKS(500));  /* Wait for S3 to capture */
+
+        /* Receive JPEG via SPI */
+        uint8_t *jpeg_buf = NULL;
+        size_t jpeg_size = 0;
+        uint32_t transfer_ms = 0;
+
+        esp_err_t ret = spi_camera_receive_jpeg(0, &jpeg_buf, &jpeg_size, &transfer_ms);
+        if (ret == ESP_OK && jpeg_buf) {
+            /* Verify JPEG */
+            bool valid = (jpeg_size >= 2 && jpeg_buf[0] == 0xFF && jpeg_buf[1] == 0xD8);
+
+            /* Optionally save to SD card for verification */
+            if (valid) {
+                mkdir("/sdcard/pimslo", 0755);
+                FILE *f = fopen("/sdcard/pimslo/spi_test.jpg", "wb");
+                if (f) {
+                    fwrite(jpeg_buf, 1, jpeg_size, f);
+                    fclose(f);
+                }
+            }
+
+            cmd_respond("ok spi_capture size=%zu transfer_ms=%lu valid=%s",
+                        jpeg_size, (unsigned long)transfer_ms,
+                        valid ? "yes" : "no");
+            free(jpeg_buf);
+        } else {
+            cmd_respond("error spi_capture ret=0x%x", ret);
+        }
+    } else if (strcmp(line, "spi_pimslo") == 0) {
+        /* Full pipeline: trigger → SPI receive all 4 → save to SD → encode GIF */
+        spi_camera_init();
+        trigger_init();
+
+        uint8_t *jpeg_bufs[4] = {NULL};
+        size_t jpeg_sizes[4] = {0};
+        uint32_t capture_ms = 0;
+
+        esp_err_t ret = spi_camera_capture_all(jpeg_bufs, jpeg_sizes, &capture_ms);
+
+        /* Save received JPEGs to SD for the pimslo encoder */
+        int saved = 0;
+        mkdir("/sdcard/pimslo", 0755);
+        for (int i = 0; i < 4; i++) {
+            if (jpeg_bufs[i] && jpeg_sizes[i] > 0) {
+                char path[64];
+                snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(jpeg_bufs[i], 1, jpeg_sizes[i], f);
+                    fclose(f);
+                    saved++;
+                }
+                free(jpeg_bufs[i]);
+            }
+        }
+
+        if (saved == 4) {
+            cmd_respond("ok spi_pimslo capture_ms=%lu saved=4 encoding...",
+                        (unsigned long)capture_ms);
+            /* Now trigger PIMSLO GIF encoding */
+            int delay = 150;
+            float parallax = 0.05f;
+            if (arg && *arg) sscanf(arg, "%d %f", &delay, &parallax);
+            app_gifs_create_pimslo(delay, parallax);
+        } else {
+            cmd_respond("error spi_pimslo capture_ms=%lu saved=%d/4",
+                        (unsigned long)capture_ms, saved);
+        }
     } else if (strcmp(line, "pimslo") == 0) {
         /* Create PIMSLO GIF from /sdcard/pimslo/pos{1-4}.jpg */
         int delay = 150;

@@ -46,6 +46,16 @@
 // OTA
 #define OTA_VALID_TIMEOUT_MS    30000
 
+// SPI Slave — shares pins with SD card (SD must be disabled)
+#define SPI_SLAVE_CLK_PIN       7
+#define SPI_SLAVE_MOSI_PIN      9   // Master→Slave (commands from P4)
+#define SPI_SLAVE_MISO_PIN      8   // Slave→Master (JPEG data to P4)
+#define SPI_SLAVE_CS_PIN        2
+#define SPI_SLAVE_DMA_CHAN      SPI_DMA_CH_AUTO
+
+// Set to 1 to enable SPI slave mode (disables SD card)
+#define ENABLE_SPI_SLAVE        1
+
 // NVS
 #define NVS_NAMESPACE           "moment"
 #define NVS_KEY_CAMERA_POS      "cam_pos"   // Camera position 1-4 (0 = unset)

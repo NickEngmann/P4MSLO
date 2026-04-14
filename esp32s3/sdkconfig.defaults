@@ -1,0 +1,75 @@
+# Moment Camera - ESP-IDF SDK Configuration Defaults
+#
+# Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Memory
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# Camera — OV5640 at 720p needs larger stack for JPEG encoding callbacks
+CONFIG_CAMERA_TASK_STACK_SIZE=8192
+CONFIG_CAMERA_CORE1_TASK_PINNED_TO_CORE=y
+CONFIG_SCCB_CLK_FREQ=100000
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=32768
+CONFIG_OV5640_SUPPORT=y
+CONFIG_OV3660_SUPPORT=y
+CONFIG_OV2640_SUPPORT=y
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
+
+# WiFi — tuned for fast file transfer (was defaulting to minimal buffers)
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_RX_BA_WIN=16
+
+# Bluetooth — disabled entirely (no BLE provisioning needed)
+CONFIG_BT_ENABLED=n
+
+# FAT32 — long filenames support
+CONFIG_FATFS_LFN_HEAP=y
+
+# HTTP Server
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# OTA
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Disable unused components to save flash
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# Watchdog — increased to 30s to avoid false triggers during WiFi connect
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# USB CDC — required for serial monitor on XIAO ESP32-S3 (native USB, no UART bridge)
+CONFIG_ESP_CONSOLE_USB_CDC=y
+
+# CPU at full speed (was 160MHz — 240MHz gives ~50% faster throughput)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# Compiler optimization for performance (was debug -Og)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# TCP tuning — THE BIGGEST WIN for WiFi transfer speed
+# Default TCP window is 5760 bytes which caps throughput at ~1.5 Mbps.
+# 32KB window allows much more in-flight data = 5-10x faster transfers.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+
+# lwIP in IRAM for faster packet processing
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+
+# Logging — INFO level for production (DEBUG was adding serial overhead)
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y

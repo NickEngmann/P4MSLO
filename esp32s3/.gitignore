@@ -1,0 +1,45 @@
+# PlatformIO
+.pio
+.pioenvs
+.piolibdeps
+
+# Build artifacts
+build/
+make/
+
+# IDE
+.vscode
+.idea
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and debug
+*.log
+*.bk
+
+# Test artifacts
+*.ppm
+
+# Secrets / credentials
+.env
+credentials.json
+secrets.h
+
+# Compiled files
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+
+# Python venv (if used for tooling)
+__pycache__/
+*.pyc
+venv/
+.venv/
+sdkconfig.xiao_esp32s3

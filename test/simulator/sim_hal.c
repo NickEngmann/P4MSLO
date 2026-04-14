@@ -408,3 +408,8 @@ esp_err_t app_gifs_create_from_album(int delay_ms, int max_frames) {
     return ESP_OK;
 }
 bool app_gifs_is_encoding(void) { return false; }
+esp_err_t app_gifs_create_pimslo(int delay_ms, float parallax) {
+    (void)delay_ms; (void)parallax;
+    printf("[SIM] app_gifs_create_pimslo(%d, %.2f)\n", delay_ms, parallax);
+    return ESP_OK;
+}

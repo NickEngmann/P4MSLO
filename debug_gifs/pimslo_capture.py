@@ -185,8 +185,82 @@ def main():
     gif_path = os.path.join(OUTPUT_DIR, f"pimslo_{timestamp}.gif")
     create_pimslo_gif(images, gif_path)
 
+    # Step 5: Transfer JPEGs to P4 SD card for on-device GIF encoding
+    print("\nTransferring photos to ESP32-P4 SD card...")
+    ser = serial.Serial(P4_SERIAL, 115200, timeout=5)
+    ser.dtr = True
+    time.sleep(0.5)
+    ser.reset_input_buffer()
+
+    # Create /sdcard/pimslo/ directory
+    ser.write(b"sd_ls /sdcard/pimslo\r\n")
+    ser.flush()
+    time.sleep(1)
+    ser.read(4096)  # discard
+
+    for pos in range(1, 5):
+        data = jpegs[pos]
+        path = f"/sdcard/pimslo/pos{pos}.jpg"
+        print(f"  Writing {path} ({len(data)//1024}KB)...", end="", flush=True)
+
+        cmd_str = f"sd_write {path} {len(data)}\r\n"
+        ser.write(cmd_str.encode())
+        ser.flush()
+        time.sleep(0.5)  # Wait for "ready" response
+
+        # Read until we see "ready"
+        resp = ser.read(4096).decode("utf-8", errors="replace")
+        if "ready" not in resp:
+            print(f" ERROR: {resp[:80]}")
+            continue
+
+        # Send raw binary data
+        sent = 0
+        while sent < len(data):
+            chunk = data[sent:sent+4096]
+            ser.write(chunk)
+            sent += len(chunk)
+        ser.flush()
+
+        time.sleep(1)
+        resp = ser.read(4096).decode("utf-8", errors="replace")
+        if "ok wrote" in resp:
+            print(" OK")
+        else:
+            print(f" {resp.strip()[:60]}")
+
+    # Step 6: Trigger PIMSLO GIF creation on P4
+    print("\nTriggering PIMSLO GIF encoding on ESP32-P4...")
+    ser.reset_input_buffer()
+    ser.write(b"pimslo 150 0.05\r\n")
+    ser.flush()
+    time.sleep(2)
+    resp = ser.read(4096).decode("utf-8", errors="replace")
+    for l in resp.split("\n"):
+        l = l.strip()
+        if l: print(f"  {l}")
+
+    # Wait for encoding to finish
+    print("\nWaiting for P4 encoding...")
+    for i in range(60):
+        time.sleep(3)
+        ser.reset_input_buffer()
+        ser.write(b"status\r\n")
+        ser.flush()
+        time.sleep(1)
+        resp = ser.read(4096).decode("utf-8", errors="replace")
+        if "gifs_encoding=0" in resp:
+            print(f"  P4 encoding done in ~{(i+1)*3}s")
+            break
+        if i % 5 == 0:
+            print(f"  [{(i+1)*3}s] encoding...")
+
+    ser.close()
+
     print(f"\n{'=' * 50}")
-    print(f"Done! Open {gif_path} to see the 3D effect.")
+    print(f"Done!")
+    print(f"  Host GIF: {gif_path}")
+    print(f"  P4 GIF: check SD card /esp32_p4_gif_save/")
     print(f"{'=' * 50}")
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@
 #include "app_gifs.h"
 #include "gif_encoder.h"
 #include "gif_decoder.h"
+#include "driver/jpeg_decode.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -522,3 +523,180 @@ esp_err_t app_gifs_create_from_album(int frame_delay_ms, int max_frames)
 }
 
 bool app_gifs_is_encoding(void) { return s_ctx.is_encoding; }
+
+/* ---- PIMSLO stereoscopic GIF ---- */
+
+typedef struct {
+    int frame_delay_ms;
+    float parallax;
+} pimslo_task_params_t;
+
+static void pimslo_encode_task(void *param)
+{
+    pimslo_task_params_t *p = (pimslo_task_params_t *)param;
+    esp_err_t ret;
+
+    /* Read all 4 JPEGs into memory */
+    uint8_t *jpeg_data[4] = {NULL};
+    size_t jpeg_size[4] = {0};
+
+    for (int i = 0; i < 4; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            ESP_LOGE(TAG, "Cannot open %s", path);
+            goto cleanup;
+        }
+        fseek(f, 0, SEEK_END);
+        jpeg_size[i] = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        jpeg_data[i] = heap_caps_malloc(jpeg_size[i], MALLOC_CAP_SPIRAM);
+        if (!jpeg_data[i]) {
+            fclose(f);
+            ESP_LOGE(TAG, "OOM for %s (%zu bytes)", path, jpeg_size[i]);
+            goto cleanup;
+        }
+        fread(jpeg_data[i], 1, jpeg_size[i], f);
+        fclose(f);
+        ESP_LOGI(TAG, "Loaded %s: %zu bytes", path, jpeg_size[i]);
+    }
+
+    /* Get source dimensions from first JPEG */
+    jpeg_decode_picture_info_t info;
+    ret = jpeg_decoder_get_info(jpeg_data[0], jpeg_size[0], &info);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot read JPEG header");
+        goto cleanup;
+    }
+
+    int src_w = info.width, src_h = info.height;
+    float strength = p->parallax;
+    int total_crop = (int)(src_w * strength);
+    int crop_w = src_w - total_crop;
+
+    ESP_LOGI(TAG, "PIMSLO: %dx%d source, parallax=%.2f, crop_w=%d",
+             src_w, src_h, strength, crop_w);
+
+    /* Calculate parallax crop rects for each position */
+    gif_crop_rect_t crops[4];
+    for (int i = 0; i < 4; i++) {
+        float crop_ratio = (float)i / 3.0f;
+        crops[i].x = (int)(crop_ratio * total_crop);
+        crops[i].y = 0;
+        crops[i].w = crop_w;
+        crops[i].h = src_h;
+        ESP_LOGI(TAG, "  Pos %d: crop(%d, 0, %d, %d)", i+1, crops[i].x, crop_w, src_h);
+    }
+
+    /* Free camera buffers for PSRAM */
+    app_video_stream_free_buffers();
+
+    /* Free the JPEG data buffers — they'll be re-read from SD for each pass */
+    for (int i = 0; i < 4; i++) {
+        heap_caps_free(jpeg_data[i]);
+        jpeg_data[i] = NULL;
+    }
+
+    /* Create encoder — full resolution, no downscaling */
+    gif_encoder_config_t cfg = {
+        .frame_delay_cs = p->frame_delay_ms / 10,
+        .loop_count = 0,
+        .target_width = crop_w,
+        .target_height = src_h,
+    };
+    ESP_LOGI(TAG, "PIMSLO GIF: %dx%d (full resolution)", crop_w, src_h);
+
+    gif_encoder_t *enc = NULL;
+    ret = gif_encoder_create(&cfg, &enc);
+    if (ret != ESP_OK) goto cleanup_buffers;
+
+    /* Pass 1: Build palette from all 4 unique frames (re-read each from SD) */
+    for (int i = 0; i < 4; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+        FILE *f = fopen(path, "rb");
+        if (!f) { ESP_LOGW(TAG, "Cannot reopen %s", path); continue; }
+        fseek(f, 0, SEEK_END);
+        size_t sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        uint8_t *data = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+        if (!data) { fclose(f); continue; }
+        fread(data, 1, sz, f);
+        fclose(f);
+        ret = gif_encoder_pass1_add_frame_from_buffer(enc, data, sz, &crops[i]);
+        heap_caps_free(data);
+        if (ret != ESP_OK)
+            ESP_LOGW(TAG, "Pass 1 failed for pos %d", i+1);
+    }
+    ret = gif_encoder_pass1_finalize(enc);
+    if (ret != ESP_OK) goto cleanup_enc;
+
+    /* Pass 2: Encode oscillating 7-frame sequence (1→2→3→4→3→2→1) */
+    ensure_gif_dir();
+    char output_path[MAX_PATH_LEN];
+    snprintf(output_path, sizeof(output_path), "%s/%s/pimslo_%ld.gif",
+             BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, (long)esp_log_timestamp());
+
+    ret = gif_encoder_pass2_begin(enc, output_path);
+    if (ret != ESP_OK) goto cleanup_enc;
+
+    int frame_order[] = {0, 1, 2, 3, 2, 1, 0};
+    for (int f = 0; f < 7; f++) {
+        int idx = frame_order[f];
+        char path[64];
+        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", idx + 1);
+        FILE *ff = fopen(path, "rb");
+        if (!ff) { ESP_LOGW(TAG, "Cannot reopen %s", path); continue; }
+        fseek(ff, 0, SEEK_END);
+        size_t sz = ftell(ff);
+        fseek(ff, 0, SEEK_SET);
+        uint8_t *data = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+        if (!data) { fclose(ff); continue; }
+        fread(data, 1, sz, ff);
+        fclose(ff);
+        ret = gif_encoder_pass2_add_frame_from_buffer(enc, data, sz, &crops[idx]);
+        heap_caps_free(data);
+        if (ret != ESP_OK)
+            ESP_LOGW(TAG, "Pass 2 failed for frame %d (pos %d)", f, idx+1);
+    }
+
+    ret = gif_encoder_pass2_finish(enc);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "PIMSLO GIF saved to %s", output_path);
+    }
+
+cleanup_enc:
+    gif_encoder_destroy(enc);
+cleanup_buffers:
+    app_video_stream_realloc_buffers();
+cleanup:
+    for (int i = 0; i < 4; i++) {
+        if (jpeg_data[i]) heap_caps_free(jpeg_data[i]);
+    }
+    free(p);
+    s_ctx.is_encoding = false;
+    app_gifs_scan();
+    vTaskDelete(NULL);
+}
+
+esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax)
+{
+    if (s_ctx.is_encoding) return ESP_ERR_INVALID_STATE;
+
+    pimslo_task_params_t *params = malloc(sizeof(*params));
+    if (!params) return ESP_ERR_NO_MEM;
+    params->frame_delay_ms = (frame_delay_ms > 0) ? frame_delay_ms : 150;
+    params->parallax = (parallax > 0.0f && parallax <= 1.0f) ? parallax : 0.05f;
+
+    s_ctx.is_encoding = true;
+
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        pimslo_encode_task, "pimslo_enc", 16384, params, 5, NULL, 1);
+    if (ret != pdPASS) {
+        free(params);
+        s_ctx.is_encoding = false;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}

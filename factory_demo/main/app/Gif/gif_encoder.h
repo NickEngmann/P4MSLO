@@ -27,6 +27,14 @@ typedef struct {
 
 typedef struct gif_encoder gif_encoder_t;
 
+/** Crop rectangle for parallax cropping during decode+scale */
+typedef struct {
+    int x;      /**< Left offset in source image pixels */
+    int y;      /**< Top offset in source image pixels */
+    int w;      /**< Width of crop region */
+    int h;      /**< Height of crop region */
+} gif_crop_rect_t;
+
 /** Progress callback — called after each frame is processed */
 typedef void (*gif_encoder_progress_cb_t)(int current_frame, int total_frames,
                                           int pass, void *user_data);
@@ -77,6 +85,18 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
  * @brief Pass 2: Finish the GIF file (writes trailer, closes file)
  */
 esp_err_t gif_encoder_pass2_finish(gif_encoder_t *enc);
+
+/**
+ * @brief Pass 1: Add a frame from in-memory JPEG data with optional crop
+ */
+esp_err_t gif_encoder_pass1_add_frame_from_buffer(gif_encoder_t *enc,
+    const uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop);
+
+/**
+ * @brief Pass 2: Encode a frame from in-memory JPEG data with optional crop
+ */
+esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
+    const uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop);
 
 /**
  * @brief Destroy encoder and free all resources

@@ -392,6 +392,64 @@ static void dispatch_command(char *line)
         cmd_ping();
     } else if (strcmp(line, "trigger") == 0) {
         cmd_trigger(arg);
+    } else if (strcmp(line, "pimslo") == 0) {
+        /* Create PIMSLO GIF from /sdcard/pimslo/pos{1-4}.jpg */
+        int delay = 150;
+        float parallax = 0.05f;
+        if (arg && *arg) {
+            sscanf(arg, "%d %f", &delay, &parallax);
+        }
+        esp_err_t ret = app_gifs_create_pimslo(delay, parallax);
+        cmd_respond("%s pimslo delay=%d parallax=%.2f",
+                    ret == ESP_OK ? "ok" : "error", delay, parallax);
+    } else if (strcmp(line, "sd_write") == 0) {
+        /* Write raw binary data to SD card file.
+         * Usage: sd_write <path> <size>
+         * Then send exactly <size> raw bytes immediately after newline. */
+        if (!arg || !*arg) {
+            cmd_respond("error: usage: sd_write <path> <size>");
+        } else {
+            char path[256] = {0};
+            long size = 0;
+            sscanf(arg, "%255s %ld", path, &size);
+            if (size <= 0 || size > 2000000) {
+                cmd_respond("error: invalid size %ld (max 2MB)", size);
+            } else {
+                /* Create parent directory if needed */
+                char dir[256];
+                char *lastslash = strrchr(path, '/');
+                if (lastslash) {
+                    int dirlen = lastslash - path;
+                    strncpy(dir, path, dirlen);
+                    dir[dirlen] = '\0';
+                    mkdir(dir, 0755);
+                }
+
+                FILE *f = fopen(path, "wb");
+                if (!f) {
+                    cmd_respond("error: cannot create %s", path);
+                } else {
+                    cmd_respond("ready %ld", size);
+                    long remaining = size;
+                    uint8_t *buf = malloc(4096);
+                    if (buf) {
+                        while (remaining > 0) {
+                            int to_read = remaining > 4096 ? 4096 : (int)remaining;
+                            int n = read(STDIN_FILENO, buf, to_read);
+                            if (n <= 0) {
+                                vTaskDelay(pdMS_TO_TICKS(5));
+                                continue;
+                            }
+                            fwrite(buf, 1, n, f);
+                            remaining -= n;
+                        }
+                        free(buf);
+                    }
+                    fclose(f);
+                    cmd_respond("ok wrote %ld bytes to %s", size, path);
+                }
+            }
+        }
     } else if (strcmp(line, "gpio_read") == 0) {
         cmd_gpio_read(arg);
     } else if (strcmp(line, "status") == 0) {
@@ -477,7 +535,7 @@ static void serial_cmd_task(void *param)
 esp_err_t app_serial_cmd_init(void)
 {
     BaseType_t ret = xTaskCreatePinnedToCore(
-        serial_cmd_task, "serial_cmd", 4096, NULL, 3, NULL, 0);
+        serial_cmd_task, "serial_cmd", 8192, NULL, 3, NULL, 0);
 
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create serial command task");

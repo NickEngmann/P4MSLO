@@ -87,3 +87,34 @@ usbipd attach --wsl --busid <BUSID>
 # Auto-attach (persists across reconnects)
 usbipd attach --wsl --busid <BUSID> --auto-attach
 ```
+
+## GPIO34 — External Camera Trigger
+
+GPIO34 is configured as a push-pull output that triggers all 4 ESP32-S3 cameras simultaneously. The S3 cameras detect a falling edge (HIGH→LOW) on their D0/GPIO1 pin.
+
+```
+ESP32-P4 GPIO34 ──────┬──── S3 #1 D0 (GPIO1)
+                      ├──── S3 #2 D0 (GPIO1)
+                      ├──── S3 #3 D0 (GPIO1)
+                      └──── S3 #4 D0 (GPIO1)
+```
+
+Trigger via serial: `trigger 200` (200ms LOW pulse)
+
+## Serial Command Interface
+
+The P4 runs a serial command interface on the USB-Serial/JTAG console (ttyACM1 in WSL2). Commands are newline-terminated, responses prefixed with `CMD>`.
+
+| Command | Description |
+|---------|-------------|
+| `ping` | Returns `pong` |
+| `status` | Device status (page, SD, heap, GIF state) |
+| `trigger [ms]` | Pulse GPIO34 LOW for N ms (default 200) |
+| `pimslo [delay] [parallax]` | Create PIMSLO GIF from `/sdcard/pimslo/pos{1-4}.jpg` |
+| `gifs_create [delay] [frames]` | Create GIF from album photos |
+| `menu_goto <page>` | Navigate UI (main, camera, gifs, etc.) |
+| `sd_ls [path]` | List SD card directory |
+| `sd_stat <path>` | File info + header hex |
+| `sd_write <path> <size>` | Write raw binary data to SD card |
+| `sd_rm <path>` | Delete file |
+| `btn_up/down/encoder/menu` | Simulate button presses |

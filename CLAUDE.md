@@ -121,6 +121,46 @@ P4MSLO/
 └── Dockerfile.test            # Lightweight test-only image
 ```
 
+## PIMSLO Stereoscopic 3D GIF Pipeline
+
+4 ESP32-S3 cameras (OV3660 2048×1536) triggered simultaneously via ESP32-P4 GPIO34, producing oscillating 3D GIFs.
+
+### Camera Positions (persisted in NVS)
+| Device | IP | Position |
+|--------|-----|----------|
+| #1 | 192.168.1.119 | 1 (leftmost) |
+| #2 | 192.168.1.248 | 2 |
+| #3 | 192.168.1.66 | 3 |
+| #4 | 192.168.1.38 | 4 (rightmost) |
+
+Set via: `curl -X POST http://<ip>/api/v1/config/position -d '{"position":N}'`
+
+### Capture + GIF Creation
+```bash
+# Full automated pipeline (trigger, download, transfer, encode on P4)
+python3 debug_gifs/pimslo_capture.py
+
+# Or manually via serial:
+# 1. Transfer 4 photos to P4 SD card at /sdcard/pimslo/pos{1-4}.jpg
+# 2. Send: pimslo 150 0.05
+#    (150ms frame delay, 0.05 parallax strength)
+```
+
+### Parallax Algorithm
+- Horizontal-only crop per position, same formula as original PIMSLO
+- GIF sequence: 1→2→3→4→3→2→1 (7 oscillating frames)
+- Parallax strength 0.05 works best for separate cameras (vs 0.2 for quad-lens)
+
+### S3 API Additions
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/v1/config/position` | Set camera position 1-4 (persisted in NVS) |
+| GET | `/api/v1/latest-photo` | Download the most recent JPEG directly |
+
+### Future Improvements
+- Save raw RGB565 pixels on S3 instead of JPEG to skip decode on P4
+- Physical camera positioning for better 3D parallax effect
+
 ## Known Issues
 
 - **ESP-IDF v5.5.3 required** — v5.5.1/5.5.2 fail component resolution
@@ -137,6 +177,10 @@ docker run --rm -v $(pwd):/workspace -w /workspace/factory_demo \
   --device=/dev/ttyACM0 espressif/idf:v5.5.3 \
   bash -c ". \$IDF_PATH/export.sh && idf.py -p /dev/ttyACM0 flash"
 ```
+
+## ABSOLUTE REQUIREMENTS
+
+- **NEVER downscale resolution.** All GIFs must be encoded at the full source resolution (e.g., 2048x1536 from OV3660, 1920x1080 from P4 camera). Image quality is the #1 priority. If memory is tight, find another way (free buffers, process one frame at a time, use smaller intermediate structures) — but NEVER reduce the output resolution.
 
 ## Gotchas
 

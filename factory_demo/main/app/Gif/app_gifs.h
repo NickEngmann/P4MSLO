@@ -64,6 +64,17 @@ esp_err_t app_gifs_create_from_album(int frame_delay_ms, int max_frames);
 /** @brief Check if GIF creation is in progress */
 bool app_gifs_is_encoding(void);
 
+/**
+ * @brief Create a PIMSLO stereoscopic 3D GIF from 4 camera JPEGs on SD card
+ *
+ * Reads 4 JPEGs from /sdcard/pimslo/pos{1-4}.jpg, applies parallax crop
+ * per position, and creates an oscillating 7-frame GIF (1→2→3→4→3→2→1).
+ *
+ * @param frame_delay_ms  Frame delay (default 150ms)
+ * @param parallax        Parallax strength (0.0-1.0, default 0.05)
+ */
+esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax);
+
 #ifdef __cplusplus
 }
 #endif

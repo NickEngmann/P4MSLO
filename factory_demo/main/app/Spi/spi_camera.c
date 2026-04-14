@@ -48,29 +48,38 @@ static spi_device_handle_t get_device(int cam_idx)
     if (cam_idx < SPI_MAX_HW_CS) {
         return s_spi_dev[cam_idx];
     }
-    /* Camera 3 — reuse slot 2 by swapping CS */
+
+    /* Camera 3 (index 3): SPI3 only has 3 HW CS slots.
+     * Temporarily swap slot 2 to camera 3's CS pin. */
     if (s_dev2_current_cs != s_cs_pins[cam_idx]) {
+        ESP_LOGI(TAG, "Swapping CS slot 2: GPIO%d → GPIO%d for camera %d",
+                 s_dev2_current_cs, s_cs_pins[cam_idx], cam_idx + 1);
         spi_bus_remove_device(s_spi_dev[2]);
         spi_device_interface_config_t cfg = {
             .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
+            .clock_speed_hz = 16 * 1000 * 1000,
             .spics_io_num = s_cs_pins[cam_idx],
             .queue_size = 1,
         };
-        spi_bus_add_device(SPI3_HOST, &cfg, &s_spi_dev[2]);
+        esp_err_t ret = spi_bus_add_device(SPI3_HOST, &cfg, &s_spi_dev[2]);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to swap CS for camera %d: 0x%x", cam_idx + 1, ret);
+            s_dev2_current_cs = -1;
+            return NULL;
+        }
         s_dev2_current_cs = s_cs_pins[cam_idx];
     }
     return s_spi_dev[2];
 }
 
+/* Restore slot 2 to camera #3 (index 2) after using it for camera #4 */
 static void restore_dev2(void)
 {
-    /* Restore device 2 to camera 2's CS pin if it was swapped */
     if (s_dev2_current_cs != s_cs_pins[2] && s_dev2_current_cs >= 0) {
         spi_bus_remove_device(s_spi_dev[2]);
         spi_device_interface_config_t cfg = {
             .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
+            .clock_speed_hz = 16 * 1000 * 1000,
             .spics_io_num = s_cs_pins[2],
             .queue_size = 1,
         };
@@ -111,11 +120,11 @@ esp_err_t spi_camera_init(void)
         return ret;
     }
 
-    /* Register 3 devices (SPI3 max) for cameras 0-2 */
+    /* Register 3 devices (SPI3 max HW CS) for cameras 0-2 */
     for (int i = 0; i < SPI_MAX_HW_CS; i++) {
         spi_device_interface_config_t dev_cfg = {
             .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
+            .clock_speed_hz = 16 * 1000 * 1000,
             .spics_io_num = s_cs_pins[i],
             .queue_size = 1,
         };
@@ -200,6 +209,7 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
 
     /* Get the SPI device handle for this camera */
     spi_device_handle_t dev = get_device(camera_idx);
+    if (!dev) return ESP_ERR_NOT_SUPPORTED;
 
     /* Poll for JPEG ready and get size in one step */
     uint32_t size = 0;
@@ -306,7 +316,8 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
     ESP_LOGI(TAG, "Trigger sent, waiting for captures...");
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    /* Receive from each camera sequentially (they share the SPI bus) */
+    /* Receive from each camera sequentially.
+     * Camera #4 uses device slot swapping (SPI3 only has 3 HW CS). */
     int success_count = 0;
     for (int i = 0; i < SPI_CAM_COUNT; i++) {
         uint32_t xfer_ms = 0;
@@ -323,6 +334,9 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
     }
 
     *total_ms = esp_log_timestamp() - t_start;
+    /* Restore device slot 2 if it was swapped for camera #4 */
+    restore_dev2();
+
     ESP_LOGI(TAG, "Capture all: %d/%d cameras, total %lums",
              success_count, SPI_CAM_COUNT, (unsigned long)*total_ms);
 

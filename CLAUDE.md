@@ -157,9 +157,23 @@ python3 debug_gifs/pimslo_capture.py
 | POST | `/api/v1/config/position` | Set camera position 1-4 (persisted in NVS) |
 | GET | `/api/v1/latest-photo` | Download the most recent JPEG directly |
 
+### SPI Direct Transfer (Current Method)
+JPEG photos transfer directly from S3 cameras to P4 via SPI at 16MHz (~1.6MB/s).
+No WiFi or host PC needed — fully autonomous pipeline.
+
+| Step | Time |
+|------|------|
+| GPIO34 trigger + capture | ~700ms |
+| SPI transfer × 4 cameras (sequential) | ~1,300ms |
+| GIF encoding (7 frames, full resolution) | ~35s |
+| **Total** | **~40s** |
+
+Hardware: 330Ω series resistors on each S3 MISO line required for bus integrity.
+SPI3_HOST on P4 supports 3 HW CS pins — camera #4 uses dynamic CS slot swapping.
+
 ### Future Improvements
-- Save raw RGB565 pixels on S3 instead of JPEG to skip decode on P4
 - Physical camera positioning for better 3D parallax effect
+- Speed optimizations to reduce total pipeline time
 
 ## Known Issues
 

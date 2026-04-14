@@ -536,17 +536,19 @@ static void pimslo_encode_task(void *param)
     pimslo_task_params_t *p = (pimslo_task_params_t *)param;
     esp_err_t ret;
 
-    /* Read all 4 JPEGs into memory */
-    uint8_t *jpeg_data[4] = {NULL};
-    size_t jpeg_size[4] = {0};
+    /* Read JPEGs from SD — support 3 or 4 cameras */
+    #define MAX_PIMSLO_CAMS 4
+    uint8_t *jpeg_data[MAX_PIMSLO_CAMS] = {NULL};
+    size_t jpeg_size[MAX_PIMSLO_CAMS] = {0};
+    int num_cams = 0;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
         FILE *f = fopen(path, "rb");
         if (!f) {
-            ESP_LOGE(TAG, "Cannot open %s", path);
-            goto cleanup;
+            ESP_LOGW(TAG, "No file %s — using %d cameras", path, i);
+            break;
         }
         fseek(f, 0, SEEK_END);
         jpeg_size[i] = ftell(f);
@@ -555,11 +557,17 @@ static void pimslo_encode_task(void *param)
         if (!jpeg_data[i]) {
             fclose(f);
             ESP_LOGE(TAG, "OOM for %s (%zu bytes)", path, jpeg_size[i]);
-            goto cleanup;
+            break;
         }
         fread(jpeg_data[i], 1, jpeg_size[i], f);
         fclose(f);
         ESP_LOGI(TAG, "Loaded %s: %zu bytes", path, jpeg_size[i]);
+        num_cams++;
+    }
+
+    if (num_cams < 2) {
+        ESP_LOGE(TAG, "Need at least 2 cameras, found %d", num_cams);
+        goto cleanup;
     }
 
     /* Get source dimensions from first JPEG */
@@ -575,13 +583,13 @@ static void pimslo_encode_task(void *param)
     int total_crop = (int)(src_w * strength);
     int crop_w = src_w - total_crop;
 
-    ESP_LOGI(TAG, "PIMSLO: %dx%d source, parallax=%.2f, crop_w=%d",
-             src_w, src_h, strength, crop_w);
+    ESP_LOGI(TAG, "PIMSLO: %dx%d source, %d cameras, parallax=%.2f, crop_w=%d",
+             src_w, src_h, num_cams, strength, crop_w);
 
     /* Calculate parallax crop rects for each position */
-    gif_crop_rect_t crops[4];
-    for (int i = 0; i < 4; i++) {
-        float crop_ratio = (float)i / 3.0f;
+    gif_crop_rect_t crops[MAX_PIMSLO_CAMS];
+    for (int i = 0; i < num_cams; i++) {
+        float crop_ratio = (num_cams > 1) ? (float)i / (num_cams - 1) : 0.0f;
         crops[i].x = (int)(crop_ratio * total_crop);
         crops[i].y = 0;
         crops[i].w = crop_w;
@@ -593,7 +601,7 @@ static void pimslo_encode_task(void *param)
     app_video_stream_free_buffers();
 
     /* Free the JPEG data buffers — they'll be re-read from SD for each pass */
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < num_cams; i++) {
         heap_caps_free(jpeg_data[i]);
         jpeg_data[i] = NULL;
     }
@@ -611,8 +619,8 @@ static void pimslo_encode_task(void *param)
     ret = gif_encoder_create(&cfg, &enc);
     if (ret != ESP_OK) goto cleanup_buffers;
 
-    /* Pass 1: Build palette from all 4 unique frames (re-read each from SD) */
-    for (int i = 0; i < 4; i++) {
+    /* Pass 1: Build palette from all unique frames (re-read each from SD) */
+    for (int i = 0; i < num_cams; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
         FILE *f = fopen(path, "rb");
@@ -632,7 +640,10 @@ static void pimslo_encode_task(void *param)
     ret = gif_encoder_pass1_finalize(enc);
     if (ret != ESP_OK) goto cleanup_enc;
 
-    /* Pass 2: Encode oscillating 7-frame sequence (1→2→3→4→3→2→1) */
+    /* Pass 2: Encode oscillating sequence.
+     * 4 cameras: 1→2→3→4→3→2→1 (7 frames)
+     * 3 cameras: 1→2→3→2→1 (5 frames)
+     * 2 cameras: 1→2→1 (3 frames) */
     ensure_gif_dir();
     char output_path[MAX_PATH_LEN];
     snprintf(output_path, sizeof(output_path), "%s/%s/pimslo_%ld.gif",
@@ -641,8 +652,16 @@ static void pimslo_encode_task(void *param)
     ret = gif_encoder_pass2_begin(enc, output_path);
     if (ret != ESP_OK) goto cleanup_enc;
 
-    int frame_order[] = {0, 1, 2, 3, 2, 1, 0};
-    for (int f = 0; f < 7; f++) {
+    /* Build oscillation: forward + reverse (skip endpoints) */
+    int frame_order[14];  /* Max: 4 + 3 + ... */
+    int num_frames = 0;
+    for (int i = 0; i < num_cams; i++)
+        frame_order[num_frames++] = i;
+    for (int i = num_cams - 2; i >= 1; i--)
+        frame_order[num_frames++] = i;
+
+    ESP_LOGI(TAG, "Oscillation: %d frames from %d cameras", num_frames, num_cams);
+    for (int f = 0; f < num_frames; f++) {
         int idx = frame_order[f];
         char path[64];
         snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", idx + 1);

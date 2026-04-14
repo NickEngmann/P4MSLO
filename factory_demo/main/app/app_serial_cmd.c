@@ -463,16 +463,16 @@ static void dispatch_command(char *line)
             }
         }
 
-        if (saved == 4) {
-            cmd_respond("ok spi_pimslo capture_ms=%lu saved=4 encoding...",
-                        (unsigned long)capture_ms);
-            /* Now trigger PIMSLO GIF encoding */
+        if (saved >= 4) {
+            cmd_respond("ok spi_pimslo capture_ms=%lu saved=%d encoding...",
+                        (unsigned long)capture_ms, saved);
+            /* Trigger PIMSLO GIF encoding */
             int delay = 150;
             float parallax = 0.05f;
             if (arg && *arg) sscanf(arg, "%d %f", &delay, &parallax);
             app_gifs_create_pimslo(delay, parallax);
         } else {
-            cmd_respond("error spi_pimslo capture_ms=%lu saved=%d/4",
+            cmd_respond("error spi_pimslo capture_ms=%lu saved=%d",
                         (unsigned long)capture_ms, saved);
         }
     } else if (strcmp(line, "pimslo") == 0) {

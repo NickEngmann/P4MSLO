@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_vfs_dev.h"
 #include "freertos/FreeRTOS.h"
@@ -43,11 +44,68 @@ static void cmd_respond(const char *fmt, ...)
     fflush(stdout);
 }
 
+/* ---- GPIO trigger for external cameras ---- */
+
+#define TRIGGER_GPIO  34
+static bool trigger_gpio_initialized = false;
+
+static void trigger_init(void)
+{
+    if (trigger_gpio_initialized) return;
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << TRIGGER_GPIO),
+        .mode = GPIO_MODE_INPUT_OUTPUT,  /* Push-pull output + readable */
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t ret = gpio_config(&io_conf);
+    gpio_set_level((gpio_num_t)TRIGGER_GPIO, 1);  /* Start HIGH (not triggering) */
+    trigger_gpio_initialized = true;
+    ESP_LOGI(TAG, "Trigger GPIO %d initialized (push-pull, pull-up), config ret=%d", TRIGGER_GPIO, ret);
+}
+
 /* ---- Command handlers ---- */
 
 static void cmd_ping(void)
 {
     cmd_respond("pong");
+}
+
+static void cmd_trigger(const char *arg)
+{
+    int pulse_ms = 200;
+    if (arg && *arg) pulse_ms = atoi(arg);
+    if (pulse_ms <= 0) pulse_ms = 200;
+    if (pulse_ms > 5000) pulse_ms = 5000;
+
+    trigger_init();
+
+    /* Read GPIO state before */
+    int before = gpio_get_level((gpio_num_t)TRIGGER_GPIO);
+
+    /* Pulse LOW */
+    gpio_set_level((gpio_num_t)TRIGGER_GPIO, 0);
+    int during = gpio_get_level((gpio_num_t)TRIGGER_GPIO);
+    vTaskDelay(pdMS_TO_TICKS(pulse_ms));
+
+    /* Release HIGH */
+    gpio_set_level((gpio_num_t)TRIGGER_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    int after = gpio_get_level((gpio_num_t)TRIGGER_GPIO);
+
+    cmd_respond("ok trigger gpio=%d pulse_ms=%d levels: before=%d during=%d after=%d",
+                TRIGGER_GPIO, pulse_ms, before, during, after);
+}
+
+static void cmd_gpio_read(const char *arg)
+{
+    int pin = TRIGGER_GPIO;
+    if (arg && *arg) pin = atoi(arg);
+
+    /* Configure as input to read */
+    int level = gpio_get_level((gpio_num_t)pin);
+    cmd_respond("gpio %d = %d", pin, level);
 }
 
 static void cmd_status(void)
@@ -332,6 +390,10 @@ static void dispatch_command(char *line)
 
     if (strcmp(line, "ping") == 0) {
         cmd_ping();
+    } else if (strcmp(line, "trigger") == 0) {
+        cmd_trigger(arg);
+    } else if (strcmp(line, "gpio_read") == 0) {
+        cmd_gpio_read(arg);
     } else if (strcmp(line, "status") == 0) {
         cmd_status();
     } else if (strcmp(line, "menu_goto") == 0) {

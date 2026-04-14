@@ -64,7 +64,7 @@ bool HttpServer::begin(CameraManager *cam, SDCardManager *sd, OTAManager *ota) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_SERVER_PORT;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
     config.stack_size = 16384;
     config.recv_wait_timeout = 30;   // OTA uploads need time
     config.send_wait_timeout = 30;  // Large photos need time to send
@@ -105,6 +105,8 @@ bool HttpServer::registerRoutes() {
         { "/api/v1/ota/upload",   HTTP_POST, handleOTAUpload,    this },
         { "/api/v1/sd/format",    HTTP_POST, handleSDFormat,     this },
         { "/api/v1/factory-reset",HTTP_POST, handleFactoryReset, this },
+        { "/api/v1/config/position", HTTP_POST, handleSetPosition, this },
+        { "/api/v1/latest-photo",    HTTP_GET,  handleGetLatestPhoto, this },
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
@@ -145,6 +147,10 @@ esp_err_t HttpServer::handleStatus(httpd_req_t *req) {
     } else {
         cJSON_AddBoolToObject(root, "sd_ok", false);
     }
+
+    // PIMSLO camera position (1-4, 0=unset)
+    extern uint8_t cameraPosition;
+    cJSON_AddNumberToObject(root, "camera_position", (double)cameraPosition);
 
     return send_json(req, root);
 }
@@ -409,6 +415,88 @@ esp_err_t HttpServer::handleFactoryReset(httpd_req_t *req) {
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
     return ret;
+}
+
+// ─── POST /api/v1/config/position ──────────────────────────
+
+esp_err_t HttpServer::handleSetPosition(httpd_req_t *req) {
+    char body[128] = {0};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) return send_error(req, 400, "No body");
+
+    cJSON *json = cJSON_Parse(body);
+    if (!json) return send_error(req, 400, "Invalid JSON");
+
+    cJSON *pos = cJSON_GetObjectItem(json, "position");
+    if (!pos || !cJSON_IsNumber(pos) || pos->valueint < 1 || pos->valueint > 4) {
+        cJSON_Delete(json);
+        return send_error(req, 400, "position must be 1-4");
+    }
+
+    extern uint8_t cameraPosition;
+    cameraPosition = (uint8_t)pos->valueint;
+
+    // Persist to NVS
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, NVS_KEY_CAMERA_POS, cameraPosition);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+
+    cJSON_Delete(json);
+    ESP_LOGI(TAG, "Camera position set to %d", cameraPosition);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status", "ok");
+    cJSON_AddNumberToObject(root, "position", (double)cameraPosition);
+    return send_json(req, root);
+}
+
+// ─── GET /api/v1/latest-photo ──────────────────────────────
+
+esp_err_t HttpServer::handleGetLatestPhoto(httpd_req_t *req) {
+    HttpServer *srv = GET_SERVER(req);
+
+    if (!srv->_sd || !srv->_sd->isMounted())
+        return send_error(req, 503, "SD card not ready");
+
+    auto photos = srv->_sd->listPhotos();
+    if (photos.empty())
+        return send_error(req, 404, "No photos");
+
+    // Photos are sorted — last one is the latest
+    std::string latest = photos.back();
+    std::string path = std::string(PHOTO_DIR) + "/" + latest;
+
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return send_error(req, 404, "File not found");
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    httpd_resp_set_type(req, "image/jpeg");
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "attachment; filename=\"%s\"", latest.c_str());
+    httpd_resp_set_hdr(req, "Content-Disposition", hdr);
+
+    // Stream in 4KB chunks
+    char *buf = (char *)malloc(4096);
+    if (!buf) { fclose(f); return send_error(req, 500, "OOM"); }
+
+    while (fsize > 0) {
+        int to_read = fsize > 4096 ? 4096 : (int)fsize;
+        int n = fread(buf, 1, to_read, f);
+        if (n <= 0) break;
+        httpd_resp_send_chunk(req, buf, n);
+        fsize -= n;
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    free(buf);
+    fclose(f);
+    return ESP_OK;
 }
 
 #else  // NATIVE_BUILD

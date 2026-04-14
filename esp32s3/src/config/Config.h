@@ -34,10 +34,9 @@
 // Network
 #define HTTP_SERVER_PORT        80
 
-// Trigger — D0 (GPIO 0) external shutter trigger (active LOW)
-// WARNING: GPIO 0 is a strapping pin. Must have pull-up, trigger must be
-// momentary pulse (not sustained low, or chip enters download mode on reset).
-#define TRIGGER_PIN             0
+// Trigger — D0 (GPIO 1) external shutter trigger (active LOW)
+// D0 on XIAO ESP32-S3 = GPIO 1 (not GPIO 0!)
+#define TRIGGER_PIN             1
 #define TRIGGER_DEBOUNCE_MS     100
 
 // NeoPixel (external WS2812 on GPIO 1)
@@ -49,3 +48,4 @@
 
 // NVS
 #define NVS_NAMESPACE           "moment"
+#define NVS_KEY_CAMERA_POS      "cam_pos"   // Camera position 1-4 (0 = unset)

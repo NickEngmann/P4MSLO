@@ -38,6 +38,19 @@ StatusLED             statusLED;
 static uint32_t photoCounter = 0;
 static volatile bool captureRequested = false;
 
+// Camera position (1-4) for PIMSLO parallax cropping, persisted in NVS
+uint8_t cameraPosition = 0;
+
+static void loadCameraPosition() {
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+        nvs_get_u8(handle, NVS_KEY_CAMERA_POS, &cameraPosition);
+        nvs_close(handle);
+    }
+    ESP_LOGI(TAG, "Camera position: %d%s", cameraPosition,
+             cameraPosition == 0 ? " (unset)" : "");
+}
+
 static void loadPhotoCounter() {
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
@@ -172,6 +185,7 @@ extern "C" void app_main(void) {
     }
     if (ret == ESP_OK) {
         loadPhotoCounter();
+        loadCameraPosition();
         ESP_LOGI(TAG, "[2/6] NVS: OK");
     } else {
         ESP_LOGE(TAG, "[2/6] NVS: FAILED (0x%x)", ret);

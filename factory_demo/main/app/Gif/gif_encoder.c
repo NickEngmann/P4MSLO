@@ -18,6 +18,7 @@
 #include "esp_private/esp_cache_private.h"
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
+#include "gif_tjpgd.h"          /* Tiny JPEG decoder — handles 4:2:2 and 4:2:0 */
 #include "bsp/display.h"
 
 /* SIMD-accelerated functions (gif_simd.S) */
@@ -77,20 +78,134 @@ static inline void rgb565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t
     *b = (b5 << 3) | (b5 >> 2);
 }
 
+/* ---- tjpgd callbacks for software JPEG decode ---- */
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    uint16_t *out_buf;      /* RGB565 output buffer */
+    int out_width;          /* Stride in pixels */
+} tjpgd_ctx_t;
+
+static size_t tjpgd_input(JDEC *jd, uint8_t *buff, size_t ndata)
+{
+    tjpgd_ctx_t *ctx = (tjpgd_ctx_t *)jd->device;
+    size_t avail = ctx->size - ctx->pos;
+    if (ndata > avail) ndata = avail;
+    if (buff) {
+        memcpy(buff, ctx->data + ctx->pos, ndata);
+    }
+    ctx->pos += ndata;
+    return ndata;
+}
+
+static int tjpgd_output(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    tjpgd_ctx_t *ctx = (tjpgd_ctx_t *)jd->device;
+    const uint8_t *src = (const uint8_t *)bitmap;  /* RGB888 */
+    int w = rect->right - rect->left + 1;
+    int h = rect->bottom - rect->top + 1;
+
+    for (int y = 0; y < h; y++) {
+        int dst_y = rect->top + y;
+        for (int x = 0; x < w; x++) {
+            int dst_x = rect->left + x;
+            int si = (y * w + x) * 3;
+            uint8_t r = src[si], g = src[si + 1], b = src[si + 2];
+            ctx->out_buf[dst_y * ctx->out_width + dst_x] =
+                ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        }
+    }
+    return 1;  /* Continue decoding */
+}
+
+/**
+ * Strip non-essential JPEG markers that the ESP32-P4 HW decoder can't handle.
+ * Keeps only: SOI, SOF0, DHT, DQT, DRI, SOS, EOI.
+ * Removes: APP0-APP15 (0xE0-0xEF), COM (0xFE), and other unknown markers.
+ * Returns new size (always <= original). Operates in-place.
+ */
+static size_t jpeg_strip_markers(uint8_t *data, size_t size)
+{
+    if (size < 2 || data[0] != 0xFF || data[1] != 0xD8)
+        return size;  /* Not a JPEG */
+
+    size_t r = 2, w = 2;  /* Read/write pointers (skip SOI) */
+
+    while (r + 1 < size) {
+        if (data[r] != 0xFF) {
+            /* Shouldn't happen outside SOS data, just copy */
+            data[w++] = data[r++];
+            continue;
+        }
+
+        uint8_t marker = data[r + 1];
+
+        /* Skip padding 0xFF bytes */
+        if (marker == 0xFF) { r++; continue; }
+        if (marker == 0x00) { data[w++] = data[r++]; data[w++] = data[r++]; continue; }
+
+        /* SOS (0xDA) — copy marker + header, then everything until next marker */
+        if (marker == 0xDA) {
+            /* Copy the rest as-is (SOS + entropy data + EOI) */
+            memmove(data + w, data + r, size - r);
+            w += size - r;
+            break;
+        }
+
+        /* Markers to KEEP: SOF0 (0xC0), SOF1 (0xC1), DHT (0xC4),
+         * DQT (0xDB), DRI (0xDD), SOF2 (0xC2) */
+        bool keep = (marker == 0xC0 || marker == 0xC1 || marker == 0xC2 ||
+                     marker == 0xC4 || marker == 0xDB || marker == 0xDD);
+
+        if (r + 3 < size) {
+            uint16_t seg_len = ((uint16_t)data[r + 2] << 8) | data[r + 3];
+            if (keep) {
+                memmove(data + w, data + r, 2 + seg_len);
+                w += 2 + seg_len;
+            } else {
+                ESP_LOGD(TAG, "Stripped JPEG marker 0xFF%02X (%u bytes)", marker, seg_len);
+            }
+            r += 2 + seg_len;
+        } else {
+            break;
+        }
+    }
+
+    if (w < size) {
+        ESP_LOGI(TAG, "JPEG stripped: %zu → %zu bytes (removed %zu)", size, w, size - w);
+    }
+    return w;
+}
+
 /* Decode JPEG data in memory, apply optional crop, and scale to target size.
  * Output is in enc->scaled_buf as RGB565.
  * If crop is NULL, uses the full image. */
 static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
-                                        const uint8_t *jpeg_data, size_t jpeg_size,
+                                        uint8_t *jpeg_data, size_t jpeg_size,
                                         const gif_crop_rect_t *crop)
 {
-    /* Get JPEG dimensions */
-    jpeg_decode_picture_info_t info;
-    esp_err_t ret = jpeg_decoder_get_info(jpeg_data, jpeg_size, &info);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG header parse failed");
-        return ret;
+    /* Get JPEG dimensions using tjpgd */
+    tjpgd_ctx_t tjctx = {
+        .data = jpeg_data,
+        .size = jpeg_size,
+        .pos = 0,
+    };
+    JDEC jdec;
+    /* tjpgd with JD_FASTDECODE=2 needs ~20KB for fast Huffman LUTs */
+    static uint8_t tjwork[32768] __attribute__((aligned(4)));
+    JRESULT jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, sizeof(tjwork), &tjctx);
+    if (jres != JDR_OK) {
+        ESP_LOGE(TAG, "JPEG header parse failed: %d", jres);
+        return ESP_FAIL;
     }
+
+    /* Use tjpgd's parsed dimensions */
+    struct { uint32_t width; uint32_t height; } info;
+    info.width = jdec.width;
+    info.height = jdec.height;
+    esp_err_t ret = ESP_OK;
 
     ESP_LOGI(TAG, "JPEG: %ux%u (%zu bytes)%s", info.width, info.height, jpeg_size,
              crop ? " [cropped]" : "");
@@ -113,35 +228,41 @@ static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
         ESP_LOGI(TAG, "GIF dimensions: %dx%d", enc->width, enc->height);
     }
 
-    /* Allocate decode buffer for full JPEG (HW decoder needs full image) */
+    /* Allocate decode buffer for RGB565 output */
     uint32_t aligned_w = (info.width + 15) & ~15;
     uint32_t aligned_h = (info.height + 15) & ~15;
     size_t needed = (size_t)aligned_w * aligned_h * 2;
     if (!enc->decode_buf || enc->decode_buf_size < needed) {
         if (enc->decode_buf) heap_caps_free(enc->decode_buf);
-        enc->decode_buf = heap_caps_aligned_calloc(enc->cache_line_size, 1,
-                                                    needed, MALLOC_CAP_SPIRAM);
+        enc->decode_buf = heap_caps_aligned_calloc(16, 1, needed, MALLOC_CAP_SPIRAM);
         if (!enc->decode_buf) {
-            ESP_LOGE(TAG, "Cannot allocate %zu byte decode buffer (free: %zu)",
+            ESP_LOGE(TAG, "Cannot allocate decode buffer (%zu bytes, free: %zu)",
                      needed, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             return ESP_ERR_NO_MEM;
         }
         enc->decode_buf_size = needed;
-        ESP_LOGI(TAG, "Allocated decode buffer: %zu bytes", needed);
+        ESP_LOGI(TAG, "Decode buffer: %zu bytes for %ux%u", needed, aligned_w, aligned_h);
     }
 
-    /* Decode JPEG to RGB565 */
-    jpeg_decode_cfg_t decode_cfg = {
-        .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
-        .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
-    };
-    uint32_t out_size = 0;
-    ret = jpeg_decoder_process(enc->jpeg_handle, &decode_cfg,
-                               jpeg_data, jpeg_size,
-                               enc->decode_buf, enc->decode_buf_size, &out_size);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG decode failed");
-        return ret;
+    /* Decode JPEG to RGB565 using tjpgd (handles 4:2:2 and 4:2:0) */
+    {
+        tjctx.pos = 0;  /* Reset input position for full decode */
+        tjctx.out_buf = (uint16_t *)enc->decode_buf;
+        tjctx.out_width = info.width;
+
+        /* Re-prepare (resets internal state) */
+        jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, sizeof(tjwork), &tjctx);
+        if (jres != JDR_OK) {
+            ESP_LOGE(TAG, "tjpgd re-prepare failed: %d", jres);
+            return ESP_FAIL;
+        }
+
+        jres = gif_jd_decomp(&jdec, tjpgd_output, 0);
+        if (jres != JDR_OK) {
+            ESP_LOGE(TAG, "tjpgd decode failed: %d", jres);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "SW decode OK: %ux%u → RGB565", info.width, info.height);
     }
 
     /* Allocate scaled output buffer if needed */
@@ -251,7 +372,8 @@ static esp_err_t load_and_decode_jpeg(gif_encoder_t *enc, const char *jpeg_path)
     size_t size;
     esp_err_t ret = load_jpeg_from_file(enc, jpeg_path, &data, &size);
     if (ret != ESP_OK) return ret;
-    return decode_and_scale_jpeg(enc, data, size, NULL);
+    /* jpeg_buf is heap-allocated and mutable — cast is safe */
+    return decode_and_scale_jpeg(enc, (uint8_t *)data, size, NULL);
 }
 
 /* ---- GIF file format writers ---- */
@@ -354,14 +476,8 @@ esp_err_t gif_encoder_create(const gif_encoder_config_t *config, gif_encoder_t *
         return ret;
     }
 
-    /* Create JPEG decoder engine */
-    jpeg_decode_engine_cfg_t dec_cfg = { .timeout_ms = 100 };
-    ret = jpeg_new_decoder_engine(&dec_cfg, &enc->jpeg_handle);
-    if (ret != ESP_OK) {
-        gif_quantize_destroy(enc->quantizer);
-        free(enc);
-        return ret;
-    }
+    /* JPEG decode uses tjpgd (software) — no HW engine needed.
+     * Decode buffer is allocated lazily in decode_and_scale_jpeg(). */
 
     /* Create PPA client */
     ppa_client_config_t ppa_cfg = { .oper_type = PPA_OPERATION_SRM };
@@ -613,7 +729,7 @@ esp_err_t gif_encoder_pass2_finish(gif_encoder_t *enc)
 }
 
 esp_err_t gif_encoder_pass1_add_frame_from_buffer(gif_encoder_t *enc,
-    const uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop)
+    uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop)
 {
     esp_err_t ret = decode_and_scale_jpeg(enc, jpeg_data, jpeg_size, crop);
     if (ret != ESP_OK) return ret;
@@ -627,7 +743,7 @@ esp_err_t gif_encoder_pass1_add_frame_from_buffer(gif_encoder_t *enc,
 }
 
 esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
-    const uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop)
+    uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop)
 {
     uint32_t t_start = esp_log_timestamp();
 

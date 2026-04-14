@@ -234,6 +234,14 @@ esp_err_t app_album_delete_current_image(void) {
     return ESP_OK;
 }
 
+void app_album_release_jpeg_decoder(void) {
+    printf("[SIM] app_album_release_jpeg_decoder\n");
+}
+
+void app_album_reacquire_jpeg_decoder(void) {
+    printf("[SIM] app_album_reacquire_jpeg_decoder\n");
+}
+
 bool app_album_can_store_new_image(void) {
     return s_hw.album_can_store;
 }
@@ -411,5 +419,9 @@ bool app_gifs_is_encoding(void) { return false; }
 esp_err_t app_gifs_create_pimslo(int delay_ms, float parallax) {
     (void)delay_ms; (void)parallax;
     printf("[SIM] app_gifs_create_pimslo(%d, %.2f)\n", delay_ms, parallax);
+    return ESP_OK;
+}
+esp_err_t app_gifs_create_pimslo_fast(void *a, void *b, int c, float d) {
+    (void)a; (void)b; (void)c; (void)d;
     return ESP_OK;
 }

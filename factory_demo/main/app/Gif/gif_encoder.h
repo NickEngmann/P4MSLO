@@ -90,13 +90,13 @@ esp_err_t gif_encoder_pass2_finish(gif_encoder_t *enc);
  * @brief Pass 1: Add a frame from in-memory JPEG data with optional crop
  */
 esp_err_t gif_encoder_pass1_add_frame_from_buffer(gif_encoder_t *enc,
-    const uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop);
+    uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop);
 
 /**
  * @brief Pass 2: Encode a frame from in-memory JPEG data with optional crop
  */
 esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
-    const uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop);
+    uint8_t *jpeg_data, size_t jpeg_size, const gif_crop_rect_t *crop);
 
 /**
  * @brief Destroy encoder and free all resources

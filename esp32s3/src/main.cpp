@@ -25,6 +25,7 @@
 #include "ota/OTAManager.h"
 #include "led/StatusLED.h"
 #include "spi/SPISlave.h"
+#include "camera/JpegReencoder.h"
 
 static const char *TAG = "moment";
 
@@ -42,6 +43,10 @@ static volatile bool captureRequested = false;
 
 // Camera position (1-4) for PIMSLO parallax cropping, persisted in NVS
 uint8_t cameraPosition = 0;
+
+// Re-encoded JPEG buffer (4:2:0 for P4 HW decoder compatibility)
+static uint8_t *s_reencoded_jpeg = nullptr;
+static size_t   s_reencoded_len = 0;
 
 static void loadCameraPosition() {
     nvs_handle_t handle;

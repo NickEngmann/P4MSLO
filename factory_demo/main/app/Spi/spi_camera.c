@@ -216,8 +216,8 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
     esp_err_t ret = poll_and_get_size(dev, 5000, &size);
     if (ret != ESP_OK) return ret;
 
-    /* Allocate PSRAM buffer for the JPEG */
-    uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    /* Allocate cache-aligned PSRAM buffer for the JPEG (HW decoder needs alignment) */
+    uint8_t *buf = heap_caps_aligned_alloc(64, size, MALLOC_CAP_SPIRAM);
     if (!buf) {
         ESP_LOGE(TAG, "OOM for JPEG buffer (%lu bytes)", (unsigned long)size);
         return ESP_ERR_NO_MEM;

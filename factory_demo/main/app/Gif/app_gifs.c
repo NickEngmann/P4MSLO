@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "app_video_stream.h"
+#include "app_album.h"
 
 static const char *TAG = "app_gifs";
 
@@ -237,6 +238,10 @@ static void encode_task(void *param)
 
     /* Free camera buffers to make PSRAM available for JPEG decoding */
     app_video_stream_free_buffers();
+
+    /* Release album's JPEG decoder — ESP32-P4 has only one HW JPEG decoder */
+    app_album_release_jpeg_decoder();
+
     ESP_LOGI(TAG, "Free PSRAM after releasing camera buffers: %zu",
              heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
@@ -293,7 +298,8 @@ cleanup:
     heap_caps_free(jpeg_files);
     free(p);
 
-    /* Restore camera buffers */
+    /* Restore JPEG decoder and camera buffers */
+    app_album_reacquire_jpeg_decoder();
     esp_err_t realloc_ret = app_video_stream_realloc_buffers();
     if (realloc_ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to restore camera buffers: 0x%x", realloc_ret);
@@ -600,6 +606,9 @@ static void pimslo_encode_task(void *param)
     /* Free camera buffers for PSRAM */
     app_video_stream_free_buffers();
 
+    /* Release album's JPEG decoder — ESP32-P4 has only one HW JPEG decoder */
+    app_album_release_jpeg_decoder();
+
     /* Free the JPEG data buffers — they'll be re-read from SD for each pass */
     for (int i = 0; i < num_cams; i++) {
         heap_caps_free(jpeg_data[i]);
@@ -688,6 +697,7 @@ static void pimslo_encode_task(void *param)
 cleanup_enc:
     gif_encoder_destroy(enc);
 cleanup_buffers:
+    app_album_reacquire_jpeg_decoder();
     app_video_stream_realloc_buffers();
 cleanup:
     for (int i = 0; i < 4; i++) {
@@ -712,6 +722,191 @@ esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax)
 
     BaseType_t ret = xTaskCreatePinnedToCore(
         pimslo_encode_task, "pimslo_enc", 16384, params, 5, NULL, 1);
+    if (ret != pdPASS) {
+        free(params);
+        s_ctx.is_encoding = false;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* ---- Fast PIMSLO: in-memory JPEGs, no SD round-trip ---- */
+
+typedef struct {
+    uint8_t *jpeg_bufs[4];
+    size_t jpeg_sizes[4];
+    int frame_delay_ms;
+    float parallax;
+} pimslo_fast_params_t;
+
+static void pimslo_fast_task(void *param)
+{
+    pimslo_fast_params_t *p = (pimslo_fast_params_t *)param;
+    esp_err_t ret;
+
+    uint32_t t_start = esp_log_timestamp();
+
+    /* Get source dimensions */
+    jpeg_decode_picture_info_t info;
+    ret = jpeg_decoder_get_info(p->jpeg_bufs[0], p->jpeg_sizes[0], &info);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot read JPEG header");
+        goto cleanup;
+    }
+
+    int src_w = info.width, src_h = info.height;
+    float strength = p->parallax;
+
+    /* Square center crop: 1536×1536 from 2048×1536.
+     * Apply parallax within the square crop. */
+    int square = (src_w < src_h) ? src_w : src_h;  /* 1536 */
+    int h_margin = (src_w - square) / 2;            /* 256 for 2048 source */
+    int total_parallax = (int)(square * strength);
+    int crop_w = square - total_parallax;
+
+    ESP_LOGI(TAG, "PIMSLO fast: %dx%d → %dx%d square, parallax=%.2f, crop_w=%d",
+             src_w, src_h, square, square, strength, crop_w);
+
+    /* Calculate crop rects — square center with parallax */
+    gif_crop_rect_t crops[4];
+    for (int i = 0; i < 4; i++) {
+        float crop_ratio = (float)i / 3.0f;
+        int parallax_offset = (int)(crop_ratio * total_parallax);
+        crops[i].x = h_margin + parallax_offset;
+        crops[i].y = 0;
+        crops[i].w = crop_w;
+        crops[i].h = square;
+        ESP_LOGI(TAG, "  Pos %d: crop(%d, 0, %d, %d)", i+1, crops[i].x, crop_w, square);
+    }
+
+    /* Save JPEGs to SD card (fast, ~100ms each) so we can free PSRAM for decode */
+    ensure_gif_dir();
+    mkdir("/sdcard/pimslo", 0755);
+    for (int i = 0; i < 4; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(p->jpeg_bufs[i], 1, p->jpeg_sizes[i], f);
+            fclose(f);
+        }
+        /* Free PSRAM buffer immediately after saving */
+        heap_caps_free(p->jpeg_bufs[i]);
+        p->jpeg_bufs[i] = NULL;
+    }
+    ESP_LOGI(TAG, "JPEGs saved to SD, PSRAM freed");
+
+    /* Free camera buffers for more PSRAM */
+    app_video_stream_free_buffers();
+
+    /* Release album's JPEG decoder — ESP32-P4 has only one HW JPEG decoder */
+    app_album_release_jpeg_decoder();
+
+    /* Create encoder at full crop resolution */
+    gif_encoder_config_t cfg = {
+        .frame_delay_cs = p->frame_delay_ms / 10,
+        .loop_count = 0,
+        .target_width = crop_w,
+        .target_height = square,
+    };
+
+    gif_encoder_t *enc = NULL;
+    ret = gif_encoder_create(&cfg, &enc);
+    if (ret != ESP_OK) goto cleanup_buffers;
+
+    uint32_t t_init = esp_log_timestamp();
+    ESP_LOGI(TAG, "Init: %lums", (unsigned long)(t_init - t_start));
+
+    /* Helper: read JPEG from SD, decode+crop, free */
+    #define READ_AND_PROCESS(pass_func, pos_idx) do { \
+        char _path[64]; \
+        snprintf(_path, sizeof(_path), "/sdcard/pimslo/pos%d.jpg", (pos_idx)+1); \
+        FILE *_f = fopen(_path, "rb"); \
+        if (_f) { \
+            fseek(_f, 0, SEEK_END); size_t _sz = ftell(_f); fseek(_f, 0, SEEK_SET); \
+            uint8_t *_data = heap_caps_malloc(_sz, MALLOC_CAP_SPIRAM); \
+            if (_data) { \
+                fread(_data, 1, _sz, _f); fclose(_f); \
+                ret = pass_func(enc, _data, _sz, &crops[pos_idx]); \
+                heap_caps_free(_data); \
+                if (ret != ESP_OK) ESP_LOGW(TAG, #pass_func " failed pos %d", (pos_idx)+1); \
+            } else { fclose(_f); } \
+        } \
+    } while(0)
+
+    /* Pass 1: palette from 4 unique frames (read from SD one at a time) */
+    for (int i = 0; i < 4; i++) {
+        READ_AND_PROCESS(gif_encoder_pass1_add_frame_from_buffer, i);
+    }
+    ret = gif_encoder_pass1_finalize(enc);
+    if (ret != ESP_OK) goto cleanup_enc;
+
+    uint32_t t_palette = esp_log_timestamp();
+    ESP_LOGI(TAG, "Palette: %lums", (unsigned long)(t_palette - t_init));
+
+    /* Pass 2: encode oscillation (1→2→3→4→3→2→1) */
+    char output_path[MAX_PATH_LEN];
+    snprintf(output_path, sizeof(output_path), "%s/%s/pimslo_%ld.gif",
+             BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, (long)esp_log_timestamp());
+
+    ret = gif_encoder_pass2_begin(enc, output_path);
+    if (ret != ESP_OK) goto cleanup_enc;
+
+    int frame_order[] = {0, 1, 2, 3, 2, 1, 0};
+    int num_frames = 7;
+
+    for (int f = 0; f < num_frames; f++) {
+        int idx = frame_order[f];
+        READ_AND_PROCESS(gif_encoder_pass2_add_frame_from_buffer, idx);
+    }
+    #undef READ_AND_PROCESS
+
+    ret = gif_encoder_pass2_finish(enc);
+
+    uint32_t t_done = esp_log_timestamp();
+    ESP_LOGI(TAG, "PIMSLO fast complete: %lums total (init=%lu palette=%lu encode=%lu)",
+             (unsigned long)(t_done - t_start),
+             (unsigned long)(t_init - t_start),
+             (unsigned long)(t_palette - t_init),
+             (unsigned long)(t_done - t_palette));
+
+    if (ret == ESP_OK)
+        ESP_LOGI(TAG, "GIF saved: %s", output_path);
+
+cleanup_enc:
+    gif_encoder_destroy(enc);
+cleanup_buffers:
+    app_album_reacquire_jpeg_decoder();
+    app_video_stream_realloc_buffers();
+cleanup:
+    for (int i = 0; i < 4; i++) {
+        if (p->jpeg_bufs[i]) heap_caps_free(p->jpeg_bufs[i]);
+    }
+    free(p);
+    s_ctx.is_encoding = false;
+    app_gifs_scan();
+    vTaskDelete(NULL);
+}
+
+esp_err_t app_gifs_create_pimslo_fast(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
+                                       int frame_delay_ms, float parallax)
+{
+    if (s_ctx.is_encoding) return ESP_ERR_INVALID_STATE;
+
+    pimslo_fast_params_t *params = malloc(sizeof(*params));
+    if (!params) return ESP_ERR_NO_MEM;
+
+    for (int i = 0; i < 4; i++) {
+        params->jpeg_bufs[i] = jpeg_bufs[i];
+        params->jpeg_sizes[i] = jpeg_sizes[i];
+    }
+    params->frame_delay_ms = (frame_delay_ms > 0) ? frame_delay_ms : 150;
+    params->parallax = (parallax > 0.0f && parallax <= 1.0f) ? parallax : 0.05f;
+
+    s_ctx.is_encoding = true;
+
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        pimslo_fast_task, "pimslo_fast", 16384, params, 5, NULL, 1);
     if (ret != pdPASS) {
         free(params);
         s_ctx.is_encoding = false;

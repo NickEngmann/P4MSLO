@@ -75,6 +75,20 @@ bool app_gifs_is_encoding(void);
  */
 esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax);
 
+/**
+ * @brief Create PIMSLO GIF directly from in-memory JPEG buffers (no SD round-trip)
+ *
+ * Takes ownership of the JPEG buffers — caller must NOT free them.
+ * Uses square 1536×1536 center crop for speed while maintaining resolution.
+ *
+ * @param jpeg_bufs   Array of 4 JPEG buffer pointers (this function frees them)
+ * @param jpeg_sizes  Array of 4 sizes
+ * @param frame_delay_ms  Frame delay
+ * @param parallax    Parallax strength
+ */
+esp_err_t app_gifs_create_pimslo_fast(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
+                                       int frame_delay_ms, float parallax);
+
 #ifdef __cplusplus
 }
 #endif

@@ -316,6 +316,30 @@ static void cmd_sd_rm(const char *path)
     }
 }
 
+static void cmd_sd_cp(const char *args)
+{
+    char src[256] = {0}, dst[256] = {0};
+    if (sscanf(args, "%255s %255s", src, dst) != 2) {
+        cmd_respond("error: usage: sd_cp <src> <dst>");
+        return;
+    }
+    FILE *fin = fopen(src, "rb");
+    if (!fin) { cmd_respond("error: cannot open '%s'", src); return; }
+    FILE *fout = fopen(dst, "wb");
+    if (!fout) { fclose(fin); cmd_respond("error: cannot create '%s'", dst); return; }
+
+    uint8_t buf[4096];
+    size_t total = 0;
+    int n;
+    while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
+        fwrite(buf, 1, n, fout);
+        total += n;
+    }
+    fclose(fin);
+    fclose(fout);
+    cmd_respond("ok copied %s -> %s (%zu bytes)", src, dst, total);
+}
+
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static void cmd_sd_base64(const char *args)
@@ -434,6 +458,37 @@ static void dispatch_command(char *line)
             free(jpeg_buf);
         } else {
             cmd_respond("error spi_capture ret=0x%x", ret);
+        }
+    } else if (strcmp(line, "spi_fast") == 0) {
+        /* Fast pipeline: trigger → SPI receive all 4 → encode GIF in-memory (no SD) */
+        spi_camera_init();
+        trigger_init();
+
+        uint8_t *jpeg_bufs[4] = {NULL};
+        size_t jpeg_sizes[4] = {0};
+        uint32_t capture_ms = 0;
+
+        esp_err_t ret = spi_camera_capture_all(jpeg_bufs, jpeg_sizes, &capture_ms);
+
+        int valid = 0;
+        for (int i = 0; i < 4; i++) {
+            if (jpeg_bufs[i] && jpeg_sizes[i] > 2 &&
+                jpeg_bufs[i][0] == 0xFF && jpeg_bufs[i][1] == 0xD8)
+                valid++;
+        }
+
+        if (valid == 4) {
+            cmd_respond("ok spi_fast capture_ms=%lu encoding...", (unsigned long)capture_ms);
+            int delay = 150;
+            float parallax = 0.05f;
+            if (arg && *arg) sscanf(arg, "%d %f", &delay, &parallax);
+            /* Passes ownership of jpeg_bufs to the encoder — don't free here */
+            app_gifs_create_pimslo_fast(jpeg_bufs, jpeg_sizes, delay, parallax);
+        } else {
+            cmd_respond("error spi_fast capture_ms=%lu valid=%d/4",
+                        (unsigned long)capture_ms, valid);
+            for (int i = 0; i < 4; i++)
+                if (jpeg_bufs[i]) free(jpeg_bufs[i]);
         }
     } else if (strcmp(line, "spi_pimslo") == 0) {
         /* Full pipeline: trigger → SPI receive all 4 → save to SD → encode GIF */
@@ -571,6 +626,8 @@ static void dispatch_command(char *line)
         cmd_sd_hexdump(arg ? arg : "");
     } else if (strcmp(line, "sd_rm") == 0) {
         cmd_sd_rm(arg);
+    } else if (strcmp(line, "sd_cp") == 0) {
+        cmd_sd_cp(arg ? arg : "");
     } else if (strcmp(line, "sd_base64") == 0) {
         cmd_sd_base64(arg ? arg : "");
     } else {

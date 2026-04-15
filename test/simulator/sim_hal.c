@@ -413,3 +413,8 @@ esp_err_t app_gifs_create_pimslo(int delay_ms, float parallax) {
     printf("[SIM] app_gifs_create_pimslo(%d, %.2f)\n", delay_ms, parallax);
     return ESP_OK;
 }
+esp_err_t app_gifs_encode_pimslo_from_dir(const char *dir, int delay_ms, float parallax) {
+    (void)dir; (void)delay_ms; (void)parallax;
+    printf("[SIM] app_gifs_encode_pimslo_from_dir(%s, %d, %.2f)\n", dir, delay_ms, parallax);
+    return ESP_OK;
+}

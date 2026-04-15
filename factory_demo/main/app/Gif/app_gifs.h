@@ -75,6 +75,19 @@ bool app_gifs_is_encoding(void);
  */
 esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax);
 
+/**
+ * @brief Encode a PIMSLO GIF from JPEGs in a capture directory
+ *
+ * Blocking call — runs the full two-pass GIF encode pipeline.
+ * Frees camera buffers during encoding and restores them after.
+ *
+ * @param capture_dir  Directory containing pos{1-4}.jpg files
+ * @param frame_delay_ms  Frame delay (default 150ms)
+ * @param parallax        Parallax strength (0.0-1.0, default 0.05)
+ */
+esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
+                                           int frame_delay_ms, float parallax);
+
 #ifdef __cplusplus
 }
 #endif

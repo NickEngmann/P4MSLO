@@ -27,6 +27,7 @@
 
 #include "ui_extra.h"
 #include "app_gifs.h"
+#include "app_pimslo.h"
 #include "spi_camera.h"
 
 static const char *TAG = "serial_cmd";
@@ -122,12 +123,14 @@ static void cmd_status(void)
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     bool sd_mounted = ui_extra_get_sd_card_mounted();
 
-    cmd_respond("page=%s sd=%s free_heap=%zu free_psram=%zu gifs_count=%d gifs_encoding=%d gifs_playing=%d",
+    cmd_respond("page=%s sd=%s free_heap=%zu free_psram=%zu gifs_count=%d gifs_encoding=%d gifs_playing=%d pimslo_queue=%d pimslo_encoding=%d",
                 page_name, sd_mounted ? "yes" : "no",
                 free_heap, free_psram,
                 app_gifs_get_count(),
                 app_gifs_is_encoding() ? 1 : 0,
-                app_gifs_is_playing() ? 1 : 0);
+                app_gifs_is_playing() ? 1 : 0,
+                app_pimslo_get_queue_depth(),
+                app_pimslo_is_encoding() ? 1 : 0);
 }
 
 static void cmd_menu_goto(const char *arg)

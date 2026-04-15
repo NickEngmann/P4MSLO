@@ -17,6 +17,9 @@ file(GLOB APP_GIF_ASM_SOURCES ${APP_DIR}/Gif/*.S)
 # Collect SPI camera module source files
 file(GLOB APP_SPI_C_SOURCES ${APP_DIR}/Spi/*.c)
 
+# Collect PIMSLO pipeline source files
+file(GLOB APP_PIMSLO_C_SOURCES ${APP_DIR}/Pimslo/*.c)
+
 # Combine all app source files
 set(APP_ALL_SOURCES
     ${APP_CORE_C_SOURCES}
@@ -26,13 +29,14 @@ set(APP_ALL_SOURCES
     ${APP_GIF_C_SOURCES}
     ${APP_GIF_ASM_SOURCES}
     ${APP_SPI_C_SOURCES}
+    ${APP_PIMSLO_C_SOURCES}
 )
 
 set(LV_UI_DIR ui)
 file(GLOB_RECURSE LV_UI_SOURCES ${LV_UI_DIR}/*.c)
 
 idf_component_register(SRCS "main.c" ${LV_UI_SOURCES} ${APP_ALL_SOURCES}
-                    INCLUDE_DIRS "." ${LV_UI_DIR} ${APP_DIR} ${APP_DIR}/AI ${APP_DIR}/Video ${APP_DIR}/Gif ${APP_DIR}/Spi
+                    INCLUDE_DIRS "." ${LV_UI_DIR} ${APP_DIR} ${APP_DIR}/AI ${APP_DIR}/Video ${APP_DIR}/Gif ${APP_DIR}/Spi ${APP_DIR}/Pimslo
                     REQUIRES esp_driver_ppa esp_driver_spi nvs_flash human_face_detect pedestrian_detect coco_detect esp_painter)
 
 # Optimize GIF encoder and LZW at -O2 for maximum performance (rest of project uses -Og)

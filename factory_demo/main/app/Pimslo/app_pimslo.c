@@ -1,0 +1,248 @@
+/**
+ * @file app_pimslo.c
+ * @brief Background PIMSLO capture + GIF encoding pipeline
+ *
+ * Two persistent FreeRTOS tasks:
+ *   1. Capture task (Core 0): waits on semaphore → SPI capture → save to SD → enqueue
+ *   2. Encode task (Core 1): waits on queue → GIF encode from saved JPEGs
+ */
+
+#include "app_pimslo.h"
+#include "spi_camera.h"
+#include "app_gifs.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+static const char *TAG = "pimslo";
+
+#define PIMSLO_QUEUE_DEPTH   8
+#define PIMSLO_BASE_DIR      "/sdcard/pimslo"
+#define NVS_NAMESPACE        "storage"
+#define NVS_KEY_CAPTURE_NUM  "pimslo_num"
+
+/* GIF encode job — just the capture number */
+typedef struct {
+    uint16_t capture_num;
+} pimslo_gif_job_t;
+
+static SemaphoreHandle_t s_capture_sem = NULL;
+static QueueHandle_t     s_gif_queue   = NULL;
+static uint16_t          s_next_capture_num = 1;
+static bool              s_encoding = false;
+static bool              s_initialized = false;
+
+/* ---- NVS persistence for capture counter ---- */
+
+static void load_capture_counter(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u16(h, NVS_KEY_CAPTURE_NUM, &s_next_capture_num);
+        nvs_close(h);
+    }
+    if (s_next_capture_num == 0) s_next_capture_num = 1;
+
+    /* Also scan existing directories in case NVS is behind */
+    DIR *dir = opendir(PIMSLO_BASE_DIR);
+    if (dir) {
+        struct dirent *entry;
+        uint16_t max_num = 0;
+        while ((entry = readdir(dir)) != NULL) {
+            unsigned int num = 0;
+            if (sscanf(entry->d_name, "capture_%u", &num) == 1 && num > max_num) {
+                max_num = (uint16_t)num;
+            }
+        }
+        closedir(dir);
+        if (max_num >= s_next_capture_num) {
+            s_next_capture_num = max_num + 1;
+        }
+    }
+
+    ESP_LOGI(TAG, "Next capture number: %d", s_next_capture_num);
+}
+
+static void save_capture_counter(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, NVS_KEY_CAPTURE_NUM, s_next_capture_num);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* ---- SPI Capture Task (Core 0, persistent) ---- */
+
+static void pimslo_capture_task(void *param)
+{
+    ESP_LOGI(TAG, "Capture task started (Core %d)", xPortGetCoreID());
+
+    while (1) {
+        /* Block until capture requested */
+        xSemaphoreTake(s_capture_sem, portMAX_DELAY);
+
+        uint16_t num = s_next_capture_num++;
+        save_capture_counter();
+
+        /* Create capture directory */
+        char dir_path[64];
+        mkdir(PIMSLO_BASE_DIR, 0755);
+        snprintf(dir_path, sizeof(dir_path), "%s/capture_%03d", PIMSLO_BASE_DIR, num);
+        mkdir(dir_path, 0755);
+
+        ESP_LOGI(TAG, "Capture %03d: triggering SPI cameras...", num);
+
+        /* Initialize SPI (idempotent) and capture from all cameras */
+        spi_camera_init();
+
+        uint8_t *jpeg_bufs[4] = {NULL};
+        size_t jpeg_sizes[4] = {0};
+        uint32_t capture_ms = 0;
+
+        esp_err_t ret = spi_camera_capture_all(jpeg_bufs, jpeg_sizes, &capture_ms);
+
+        /* Save JPEGs to the capture directory */
+        int saved = 0;
+        for (int i = 0; i < 4; i++) {
+            if (jpeg_bufs[i] && jpeg_sizes[i] > 0) {
+                char path[80];
+                snprintf(path, sizeof(path), "%s/pos%d.jpg", dir_path, i + 1);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(jpeg_bufs[i], 1, jpeg_sizes[i], f);
+                    fclose(f);
+                    saved++;
+                    ESP_LOGI(TAG, "  pos%d: %zu bytes", i + 1, jpeg_sizes[i]);
+                }
+                free(jpeg_bufs[i]);
+            }
+        }
+
+        ESP_LOGI(TAG, "Capture %03d: %d/4 cameras in %lums",
+                 num, saved, (unsigned long)capture_ms);
+
+        /* Enqueue GIF encode job if we got enough cameras */
+        if (saved >= 2) {
+            pimslo_gif_job_t job = { .capture_num = num };
+            if (xQueueSend(s_gif_queue, &job, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "GIF queue full — dropping capture_%03d", num);
+            } else {
+                ESP_LOGI(TAG, "Queued GIF encode for capture_%03d (queue: %d)",
+                         num, (int)uxQueueMessagesWaiting(s_gif_queue));
+            }
+        } else {
+            ESP_LOGW(TAG, "Capture %03d: only %d cameras — skipping GIF", num, saved);
+        }
+    }
+}
+
+/* ---- GIF Encode Queue Task (Core 1, persistent) ---- */
+
+static void pimslo_encode_queue_task(void *param)
+{
+    ESP_LOGI(TAG, "Encode queue task started (Core %d)", xPortGetCoreID());
+
+    pimslo_gif_job_t job;
+
+    while (1) {
+        /* Block until a job is available */
+        xQueueReceive(s_gif_queue, &job, portMAX_DELAY);
+
+        /* Wait if album GIF encoding is in progress (shared PSRAM) */
+        while (app_gifs_is_encoding()) {
+            ESP_LOGI(TAG, "Waiting for album GIF encode to finish...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+
+        s_encoding = true;
+
+        char dir_path[64];
+        snprintf(dir_path, sizeof(dir_path), "%s/capture_%03d",
+                 PIMSLO_BASE_DIR, job.capture_num);
+
+        ESP_LOGI(TAG, "Encoding GIF from %s (queue remaining: %d)",
+                 dir_path, (int)uxQueueMessagesWaiting(s_gif_queue));
+
+        uint32_t t0 = esp_log_timestamp();
+        esp_err_t ret = app_gifs_encode_pimslo_from_dir(dir_path, 150, 0.05f);
+        uint32_t elapsed = esp_log_timestamp() - t0;
+
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "GIF encode complete for capture_%03d in %lus",
+                     job.capture_num, (unsigned long)(elapsed / 1000));
+
+            /* Clean up the capture directory to save SD space */
+            for (int i = 1; i <= 4; i++) {
+                char path[80];
+                snprintf(path, sizeof(path), "%s/pos%d.jpg", dir_path, i);
+                unlink(path);
+            }
+            rmdir(dir_path);
+            ESP_LOGI(TAG, "Cleaned up %s", dir_path);
+        } else {
+            ESP_LOGE(TAG, "GIF encode failed for capture_%03d: 0x%x",
+                     job.capture_num, ret);
+        }
+
+        s_encoding = false;
+    }
+}
+
+/* ---- Public API ---- */
+
+esp_err_t app_pimslo_init(void)
+{
+    if (s_initialized) return ESP_OK;
+
+    load_capture_counter();
+
+    s_capture_sem = xSemaphoreCreateBinary();
+    if (!s_capture_sem) return ESP_ERR_NO_MEM;
+
+    s_gif_queue = xQueueCreate(PIMSLO_QUEUE_DEPTH, sizeof(pimslo_gif_job_t));
+    if (!s_gif_queue) return ESP_ERR_NO_MEM;
+
+    /* SPI capture task on Core 0 (I/O bound — doesn't compete with GIF encode) */
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        pimslo_capture_task, "pimslo_cap", 8192, NULL, 5, NULL, 0);
+    if (ret != pdPASS) return ESP_FAIL;
+
+    /* GIF encode queue task on Core 1 (CPU bound — dithering + LZW) */
+    ret = xTaskCreatePinnedToCore(
+        pimslo_encode_queue_task, "pimslo_gif", 16384, NULL, 4, NULL, 1);
+    if (ret != pdPASS) return ESP_FAIL;
+
+    s_initialized = true;
+    ESP_LOGI(TAG, "PIMSLO subsystem initialized (queue depth=%d)", PIMSLO_QUEUE_DEPTH);
+    return ESP_OK;
+}
+
+void app_pimslo_request_capture(void)
+{
+    if (s_capture_sem) {
+        xSemaphoreGive(s_capture_sem);
+    }
+}
+
+int app_pimslo_get_queue_depth(void)
+{
+    if (!s_gif_queue) return 0;
+    return (int)uxQueueMessagesWaiting(s_gif_queue);
+}
+
+bool app_pimslo_is_encoding(void)
+{
+    return s_encoding;
+}

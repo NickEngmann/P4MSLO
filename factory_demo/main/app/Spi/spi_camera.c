@@ -136,8 +136,17 @@ esp_err_t spi_camera_init(void)
     }
     s_dev2_current_cs = s_cs_pins[2];
 
+    /* Configure GPIO34 as trigger output (shared by all S3 cameras) */
+    gpio_config_t trig_cfg = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_34),
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&trig_cfg);
+    gpio_set_level(GPIO_NUM_34, 1);
+
     s_initialized = true;
-    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 40MHz",
+    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 16MHz, trigger=GPIO34",
              SPI_CAM_COUNT, SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN);
     return ESP_OK;
 }

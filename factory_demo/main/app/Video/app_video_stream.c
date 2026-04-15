@@ -23,6 +23,7 @@
 #include "app_video_stream.h"
 #include "app_video_utils.h"
 #include "app_video_photo.h"
+#include "app_pimslo.h"
 #include "app_video_record.h"
 #include "app_ai_detect.h"
 #include "app_qma6100.h"
@@ -708,7 +709,11 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
             // Reset photo flag and take a photo
             camera_state.flags.is_take_photo = false;
             take_and_save_photo(camera_buf, camera_buf_hes, camera_buf_ves);
-        } 
+            // Also trigger PIMSLO SPI capture in background (non-blocking)
+            if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
+                app_pimslo_request_capture();
+            }
+        }
         // Handle video request
         else if (camera_state.flags.is_take_video && ui_extra_get_current_page() == UI_PAGE_VIDEO_MODE) {
             take_and_save_video(camera_buf, camera_buf_hes, camera_buf_ves);

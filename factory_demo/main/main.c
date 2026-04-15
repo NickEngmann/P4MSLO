@@ -20,6 +20,7 @@
 #include "app_ai_detect.h"
 #include "app_qma6100.h"
 #include "app_serial_cmd.h"
+#include "app_pimslo.h"
 
 static const char *TAG = "main";
 
@@ -79,6 +80,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Initialize the video streaming application");
     ESP_ERROR_CHECK(app_video_stream_init(i2c_handle));
     
+    // Initialize PIMSLO background capture + GIF pipeline
+    ESP_LOGI(TAG, "Initialize PIMSLO subsystem");
+    app_pimslo_init();
+
     // Initialize serial command interface for automated testing
     ESP_LOGI(TAG, "Initialize serial command interface");
     app_serial_cmd_init();

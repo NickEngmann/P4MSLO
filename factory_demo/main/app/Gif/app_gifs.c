@@ -531,20 +531,26 @@ typedef struct {
     float parallax;
 } pimslo_task_params_t;
 
-static void pimslo_encode_task(void *param)
-{
-    pimslo_task_params_t *p = (pimslo_task_params_t *)param;
-    esp_err_t ret;
+/* ---- Reusable PIMSLO encode function ---- */
+#define MAX_PIMSLO_CAMS 4
 
-    /* Read JPEGs from SD — support 3 or 4 cameras */
-    #define MAX_PIMSLO_CAMS 4
+esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
+                                           int frame_delay_ms, float parallax)
+{
+    esp_err_t ret = ESP_FAIL;
+    int delay_cs = (frame_delay_ms > 0 ? frame_delay_ms : 150) / 10;
+    float strength = (parallax > 0.0f && parallax <= 1.0f) ? parallax : 0.05f;
+
+    s_ctx.is_encoding = true;
+
+    /* Read JPEGs from the capture directory — support 2-4 cameras */
     uint8_t *jpeg_data[MAX_PIMSLO_CAMS] = {NULL};
     size_t jpeg_size[MAX_PIMSLO_CAMS] = {0};
     int num_cams = 0;
 
     for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {
-        char path[64];
-        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+        char path[80];
+        snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, i + 1);
         FILE *f = fopen(path, "rb");
         if (!f) {
             ESP_LOGW(TAG, "No file %s — using %d cameras", path, i);
@@ -579,7 +585,6 @@ static void pimslo_encode_task(void *param)
     }
 
     int src_w = info.width, src_h = info.height;
-    float strength = p->parallax;
     int total_crop = (int)(src_w * strength);
     int crop_w = src_w - total_crop;
 
@@ -608,7 +613,7 @@ static void pimslo_encode_task(void *param)
 
     /* Create encoder — full resolution, no downscaling */
     gif_encoder_config_t cfg = {
-        .frame_delay_cs = p->frame_delay_ms / 10,
+        .frame_delay_cs = delay_cs,
         .loop_count = 0,
         .target_width = crop_w,
         .target_height = src_h,
@@ -621,8 +626,8 @@ static void pimslo_encode_task(void *param)
 
     /* Pass 1: Build palette from all unique frames (re-read each from SD) */
     for (int i = 0; i < num_cams; i++) {
-        char path[64];
-        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+        char path[80];
+        snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, i + 1);
         FILE *f = fopen(path, "rb");
         if (!f) { ESP_LOGW(TAG, "Cannot reopen %s", path); continue; }
         fseek(f, 0, SEEK_END);
@@ -665,8 +670,8 @@ static void pimslo_encode_task(void *param)
     for (int i = 0; i < num_cams; i++) {
         long start_pos = gif_encoder_get_file_pos(enc);
 
-        char path[64];
-        snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+        char path[80];
+        snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, i + 1);
         FILE *ff = fopen(path, "rb");
         if (!ff) { ESP_LOGW(TAG, "Cannot reopen %s", path); continue; }
         fseek(ff, 0, SEEK_END);
@@ -731,12 +736,21 @@ cleanup_enc:
 cleanup_buffers:
     app_video_stream_realloc_buffers();
 cleanup:
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {
         if (jpeg_data[i]) heap_caps_free(jpeg_data[i]);
     }
-    free(p);
     s_ctx.is_encoding = false;
     app_gifs_scan();
+    return ret;
+}
+
+/* Legacy task wrapper for serial command backward compatibility */
+static void pimslo_encode_task(void *param)
+{
+    pimslo_task_params_t *p = (pimslo_task_params_t *)param;
+    app_gifs_encode_pimslo_from_dir("/sdcard/pimslo",
+                                     p->frame_delay_ms, p->parallax);
+    free(p);
     vTaskDelete(NULL);
 }
 

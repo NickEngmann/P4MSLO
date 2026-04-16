@@ -25,13 +25,11 @@ static const char *TAG = "spi_cam";
 #define STATUS_JPEG_READY 0x01
 #define STATUS_BUSY       0x02
 
-/* SPI transfer chunk size — MUST match the S3 slave's CHUNK_SIZE (4096).
- * If mismatched, the slave advances by its chunk size while master reads less,
- * causing data to be skipped and zeros to appear at the end. */
+/* SPI transfer chunk size — MUST match the S3 slave's CHUNK_SIZE (4096) */
 #define SPI_CHUNK_SIZE    4096
 
 /* Maximum retries per camera for corrupted transfers */
-#define SPI_MAX_RETRIES   3
+#define SPI_MAX_RETRIES   2
 
 /* SPI3 on ESP32-P4 supports max 3 hardware CS pins.
  * We register 3 devices for cameras 0-2, and for camera 3 we
@@ -62,7 +60,7 @@ static spi_device_handle_t get_device(int cam_idx)
         spi_bus_remove_device(s_spi_dev[2]);
         spi_device_interface_config_t cfg = {
             .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
+            .clock_speed_hz = 16 * 1000 * 1000,
             .spics_io_num = s_cs_pins[cam_idx],
             .queue_size = 1,
         };
@@ -84,7 +82,7 @@ static void restore_dev2(void)
         spi_bus_remove_device(s_spi_dev[2]);
         spi_device_interface_config_t cfg = {
             .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
+            .clock_speed_hz = 16 * 1000 * 1000,
             .spics_io_num = s_cs_pins[2],
             .queue_size = 1,
         };
@@ -129,7 +127,7 @@ esp_err_t spi_camera_init(void)
     for (int i = 0; i < SPI_MAX_HW_CS; i++) {
         spi_device_interface_config_t dev_cfg = {
             .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
+            .clock_speed_hz = 16 * 1000 * 1000,
             .spics_io_num = s_cs_pins[i],
             .queue_size = 1,
         };
@@ -151,7 +149,7 @@ esp_err_t spi_camera_init(void)
     gpio_set_level(GPIO_NUM_34, 1);
 
     s_initialized = true;
-    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 10MHz, trigger=GPIO34",
+    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 16MHz, trigger=GPIO34",
              SPI_CAM_COUNT, SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN);
     return ESP_OK;
 }
@@ -264,7 +262,7 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
 
     /* Poll for JPEG ready and get size in one step */
     uint32_t size = 0;
-    esp_err_t ret = poll_and_get_size(dev, 5000, &size);
+    esp_err_t ret = poll_and_get_size(dev, 2000, &size);
     if (ret != ESP_OK) return ret;
 
     /* Allocate PSRAM buffer for the JPEG */
@@ -283,8 +281,8 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
         return ret;
     }
 
-    /* Give slave time to enter data transmit loop and queue first chunk */
-    vTaskDelay(pdMS_TO_TICKS(100));
+    /* Give slave time to enter data transmit loop */
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     /* Read JPEG data in chunks with inter-chunk delays for bus settling */
     uint32_t t_start = esp_log_timestamp();
@@ -321,11 +319,6 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
         memcpy(buf + offset, chunk_rx, chunk);
         offset += chunk;
         remaining -= chunk;
-
-        /* Brief yield between chunks to let the slave prepare next TX buffer */
-        if (remaining > 0) {
-            vTaskDelay(1);  /* 1 tick yield */
-        }
     }
 
     free(chunk_tx);
@@ -388,10 +381,10 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
 
         /* Trigger all cameras simultaneously via GPIO34 */
         gpio_set_level(GPIO_NUM_34, 0);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(100));
         gpio_set_level(GPIO_NUM_34, 1);
         ESP_LOGI(TAG, "Trigger sent (attempt %d), waiting for captures...", attempt + 1);
-        vTaskDelay(pdMS_TO_TICKS(800));  /* Extra wait for OV5640 which is slower */
+        vTaskDelay(pdMS_TO_TICKS(500));
 
         /* Receive from each camera sequentially, one at a time.
          * Add delay between cameras to let the bus fully settle. */
@@ -416,11 +409,11 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
                 ESP_LOGW(TAG, "Camera %d: FAILED (0x%x)", i + 1, ret);
             }
 
-            /* Wait between cameras to let the bus settle */
-            vTaskDelay(pdMS_TO_TICKS(50));
+            /* Brief yield between cameras */
+            vTaskDelay(1);
         }
 
-        if (success_count == SPI_CAM_COUNT) break;  /* All good! */
+        if (success_count >= 2) break;  /* Good enough for PIMSLO (needs 2+) */
         ESP_LOGW(TAG, "Got %d/%d cameras — %s", success_count, SPI_CAM_COUNT,
                  attempt < SPI_MAX_RETRIES ? "retrying..." : "giving up");
     }
@@ -432,5 +425,5 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
     ESP_LOGI(TAG, "Capture all: %d/%d cameras, total %lums",
              success_count, SPI_CAM_COUNT, (unsigned long)*total_ms);
 
-    return (success_count == SPI_CAM_COUNT) ? ESP_OK : ESP_FAIL;
+    return (success_count >= 2) ? ESP_OK : ESP_FAIL;
 }

@@ -466,7 +466,7 @@ static void dispatch_command(char *line)
             }
         }
 
-        if (saved >= 4) {
+        if (saved >= 2) {
             cmd_respond("ok spi_pimslo capture_ms=%lu saved=%d encoding...",
                         (unsigned long)capture_ms, saved);
             /* Trigger PIMSLO GIF encoding */

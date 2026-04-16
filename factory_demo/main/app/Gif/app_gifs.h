@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 /** @brief Directory for GIF files on SD card */
-#define GIF_FOLDER_NAME "esp32_p4_gif_save"
+#define GIF_FOLDER_NAME "p4mslo_gifs"
 
 /**
  * @brief Initialize the GIF feature

@@ -5,6 +5,8 @@
  */
 
 #include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
 #include "esp_log.h"
 #include "esp_memory_utils.h"
 #include "nvs_flash.h"
@@ -34,6 +36,10 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Set default system time to 2026-01-01 (no RTC, files get 1980 otherwise)
+    struct timeval tv = { .tv_sec = 1767225600 };  /* 2026-01-01 00:00:00 UTC */
+    settimeofday(&tv, NULL);
 
     // Initialize the flashlight
     ESP_LOGI(TAG, "Initialize the flashlight");

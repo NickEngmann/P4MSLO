@@ -671,8 +671,11 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
      * Saves ~5s per replayed frame = ~15s for 4 cameras */
     ensure_gif_dir();
     char output_path[MAX_PATH_LEN];
-    snprintf(output_path, sizeof(output_path), "%s/%s/pimslo_%ld.gif",
-             BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, (long)esp_log_timestamp());
+    /* Extract capture name from directory (e.g. "/sdcard/p4mslo/P4M0001" → "P4M0001") */
+    const char *dir_name = strrchr(capture_dir, '/');
+    dir_name = dir_name ? dir_name + 1 : capture_dir;
+    snprintf(output_path, sizeof(output_path), "%s/%s/%s.gif",
+             BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, dir_name);
 
     ret = gif_encoder_pass2_begin(enc, output_path);
     if (ret != ESP_OK) goto cleanup_enc;

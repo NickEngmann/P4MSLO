@@ -27,7 +27,7 @@
 static const char *TAG = "pimslo";
 
 #define PIMSLO_QUEUE_DEPTH   8
-#define PIMSLO_BASE_DIR      "/sdcard/pimslo"
+#define PIMSLO_BASE_DIR      "/sdcard/p4mslo"
 #define NVS_NAMESPACE        "storage"
 #define NVS_KEY_CAPTURE_NUM  "pimslo_num"
 
@@ -60,7 +60,7 @@ static void load_capture_counter(void)
         uint16_t max_num = 0;
         while ((entry = readdir(dir)) != NULL) {
             unsigned int num = 0;
-            if (sscanf(entry->d_name, "capture_%u", &num) == 1 && num > max_num) {
+            if (sscanf(entry->d_name, "P4M%u", &num) == 1 && num > max_num) {
                 max_num = (uint16_t)num;
             }
         }
@@ -99,7 +99,7 @@ static void pimslo_capture_task(void *param)
         /* Create capture directory */
         char dir_path[64];
         mkdir(PIMSLO_BASE_DIR, 0755);
-        snprintf(dir_path, sizeof(dir_path), "%s/capture_%03d", PIMSLO_BASE_DIR, num);
+        snprintf(dir_path, sizeof(dir_path), "%s/P4M%04d", PIMSLO_BASE_DIR, num);
         mkdir(dir_path, 0755);
 
         ESP_LOGI(TAG, "Capture %03d: triggering SPI cameras...", num);
@@ -137,9 +137,9 @@ static void pimslo_capture_task(void *param)
         if (saved >= 2) {
             pimslo_gif_job_t job = { .capture_num = num };
             if (xQueueSend(s_gif_queue, &job, 0) != pdTRUE) {
-                ESP_LOGW(TAG, "GIF queue full — dropping capture_%03d", num);
+                ESP_LOGW(TAG, "GIF queue full — dropping P4M%04d", num);
             } else {
-                ESP_LOGI(TAG, "Queued GIF encode for capture_%03d (queue: %d)",
+                ESP_LOGI(TAG, "Queued GIF encode for P4M%04d (queue: %d)",
                          num, (int)uxQueueMessagesWaiting(s_gif_queue));
             }
         } else {
@@ -169,7 +169,7 @@ static void pimslo_encode_queue_task(void *param)
         s_encoding = true;
 
         char dir_path[64];
-        snprintf(dir_path, sizeof(dir_path), "%s/capture_%03d",
+        snprintf(dir_path, sizeof(dir_path), "%s/P4M%04d",
                  PIMSLO_BASE_DIR, job.capture_num);
 
         ESP_LOGI(TAG, "Encoding GIF from %s (queue remaining: %d)",
@@ -180,7 +180,7 @@ static void pimslo_encode_queue_task(void *param)
         uint32_t elapsed = esp_log_timestamp() - t0;
 
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "GIF encode complete for capture_%03d in %lus",
+            ESP_LOGI(TAG, "GIF encode complete for P4M%04d in %lus",
                      job.capture_num, (unsigned long)(elapsed / 1000));
 
             /* Clean up the capture directory to save SD space */
@@ -192,7 +192,7 @@ static void pimslo_encode_queue_task(void *param)
             rmdir(dir_path);
             ESP_LOGI(TAG, "Cleaned up %s", dir_path);
         } else {
-            ESP_LOGE(TAG, "GIF encode failed for capture_%03d: 0x%x",
+            ESP_LOGE(TAG, "GIF encode failed for P4M%04d: 0x%x",
                      job.capture_num, ret);
         }
 

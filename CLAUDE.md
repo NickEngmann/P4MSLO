@@ -123,57 +123,127 @@ P4MSLO/
 
 ## PIMSLO Stereoscopic 3D GIF Pipeline
 
-4 ESP32-S3 cameras (OV3660 2048×1536) triggered simultaneously via ESP32-P4 GPIO34, producing oscillating 3D GIFs.
+4 ESP32-S3 cameras (OV5640 2560×1920) triggered simultaneously via ESP32-P4 GPIO34, producing oscillating 3D GIFs. Background capture + queued GIF encoding lets the user keep taking photos without waiting.
 
 ### Camera Positions (persisted in NVS)
-| Device | IP | Position |
-|--------|-----|----------|
-| #1 | 192.168.1.119 | 1 (leftmost) |
-| #2 | 192.168.1.248 | 2 |
-| #3 | 192.168.1.66 | 3 |
-| #4 | 192.168.1.38 | 4 (rightmost) |
+| Device | IP | Sensor | Position |
+|--------|-----|--------|----------|
+| #1 | 192.168.1.119 | OV5640 5MP | 1 (leftmost) |
+| #2 | 192.168.1.248 | OV5640 5MP | 2 |
+| #3 | 192.168.1.66 | OV5640 5MP | 3 |
+| #4 | 192.168.1.38 | OV5640 5MP | 4 (rightmost) |
 
 Set via: `curl -X POST http://<ip>/api/v1/config/position -d '{"position":N}'`
 
-### Capture + GIF Creation
-```bash
-# Full automated pipeline (trigger, download, transfer, encode on P4)
-python3 debug_gifs/pimslo_capture.py
+### How It Works
+1. **Photo button** → takes P4 camera photo + triggers background SPI capture
+2. **SPI capture task** (Core 0) → GPIO34 trigger → receives 4 JPEGs via SPI → saves to `/sdcard/p4mslo/P4M0001/pos{1-4}.jpg`
+3. **GIF encode queue** (Core 1) → picks up capture folders → encodes PIMSLO GIF → saves to `/sdcard/p4mslo_gifs/P4M0001.gif` → deletes raw JPEGs
 
-# Or manually via serial:
-# 1. Transfer 4 photos to P4 SD card at /sdcard/pimslo/pos{1-4}.jpg
-# 2. Send: pimslo 150 0.05
-#    (150ms frame delay, 0.05 parallax strength)
+User can take photos every ~3-4 seconds. GIF encoding happens asynchronously in background.
+
+### Manual Serial Commands
+```bash
+# Trigger + SPI capture + save + encode (all-in-one)
+spi_pimslo 150 0.05
+
+# Encode from existing files on SD card
+pimslo 150 0.05
+# (reads /sdcard/pimslo/pos{1-4}.jpg, 150ms frame delay, 0.05 parallax)
+
+# Check pipeline status
+status
+# → pimslo_queue=N pimslo_encoding=0/1
 ```
 
 ### Parallax Algorithm
-- Horizontal-only crop per position, same formula as original PIMSLO
-- GIF sequence: 1→2→3→4→3→2→1 (7 oscillating frames)
+- Square center crop from source (1920×1920 from 2560×1920)
+- Horizontal parallax offset per camera position within the square
+- GIF sequence: 1→2→3→4→3→2→1 (6 encoded frames, 2 replayed from PSRAM cache)
 - Parallax strength 0.05 works best for separate cameras (vs 0.2 for quad-lens)
+
+### JPEG Decoding
+- **tjpgd** software decoder (standalone from LVGL, renamed to `gif_jd_prepare`/`gif_jd_decomp`)
+- Handles 4:2:0 AND 4:2:2 subsampled JPEGs
+- Decodes directly into crop-sized output buffer (no full-image intermediate)
+- ~2.2s per frame at 2560×1920
+- ESP32-P4 HW JPEG decoder only works with 4:2:0 — cannot be used for OV5640/OV3660
+
+### SPI Bus Architecture
+
+**Bus**: SPI3_HOST on ESP32-P4, shared MISO/MOSI/CLK with per-camera CS lines.
+
+| Signal | P4 GPIO | Direction | Notes |
+|--------|---------|-----------|-------|
+| CLK | 37 | P4→S3 | |
+| MOSI | 38 | P4→S3 | |
+| MISO | 50 | S3→P4 | 330Ω series resistor per S3 required |
+| CS0 | 51 | P4→S3 #1 | |
+| CS1 | 52 | P4→S3 #2 | |
+| CS2 | 53 | P4→S3 #3 | |
+| CS3 | 54 | P4→S3 #4 | Dynamic slot swap (SPI3 max 3 HW CS) |
+| TRIGGER | 34 | P4→all S3 | Active LOW pulse, shared by all cameras |
+
+**Speed**: 16MHz max stable. Tested: 20/26/40MHz all fail (S3 SPI slave can't keep up).
+
+**Throughput**: ~1.3 MB/s effective per camera. A typical 600KB JPEG transfers in ~470ms.
+
+### SPI Signal Integrity
+
+**Required**: 330Ω series resistors on each S3 camera's MISO output line. Without these, the shared MISO bus has contention when multiple cameras drive it (only one CS is active at a time, but floating MISO outputs cause noise).
+
+**Recommended additional measures** (for long wires or unreliable connections):
+- **100pF capacitor** on CLK near each S3 — filters high-frequency ringing on clock edges. Place between CLK and GND at the S3 end.
+- **Pull-up resistor (10KΩ)** on each CS line — ensures cameras stay deselected when P4 boots. The P4 firmware pre-drives CS HIGH at init, but external pull-ups add a safety margin.
+- **Keep wires short** — under 15cm for the SPI bus. Longer wires increase capacitance and reduce max clock speed.
+- **MOSI**: No resistor needed (single driver, P4 only).
+- **CLK**: No series resistor (single driver), but a small capacitor at each S3 end helps.
+
+**Chunk size**: Master and slave MUST use matching 4KB (4096 byte) chunk sizes. If mismatched, the slave advances by its chunk size while the master reads less, causing data gaps that appear as zeros at the end of the transfer.
+
+### Pipeline Timing (OV5640, 4 cameras working)
+
+| Step | Time |
+|------|------|
+| GPIO34 trigger + OV5640 capture | ~600ms |
+| SPI transfer × 4 cameras @ 16MHz | ~2,000ms |
+| Save 4 JPEGs to SD card | ~800ms |
+| **Capture + save total** | **~3,400ms** |
+| | |
+| GIF pass 1: palette (4 decodes) | ~11s |
+| GIF pass 2: 4 forward frames | ~32s |
+| GIF pass 2: 2 replayed frames | ~7s |
+| **GIF encode total** | **~50s** |
+| | |
+| **Full pipeline (capture + encode)** | **~54s** |
+
+GIF encoding runs in the background — the user only waits for the capture phase (~3.4s).
+
+### SD Card Layout
+```
+/sdcard/
+├── p4mslo/                    # PIMSLO capture directories
+│   ├── P4M0001/               # First capture
+│   │   ├── pos1.jpg           # Camera 1 JPEG
+│   │   ├── pos2.jpg           # Camera 2 JPEG
+│   │   ├── pos3.jpg           # Camera 3 JPEG
+│   │   └── pos4.jpg           # Camera 4 JPEG
+│   ├── P4M0002/               # Second capture (cleaned up after GIF encode)
+│   └── ...
+├── p4mslo_gifs/               # Completed GIF files
+│   ├── P4M0001.gif            # GIF from capture 0001
+│   ├── P4M0002.gif
+│   └── ...
+└── esp32_p4_pic_save/         # P4 camera photos (existing)
+    ├── pic_0001.jpg
+    └── ...
+```
 
 ### S3 API Additions
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
 | POST | `/api/v1/config/position` | Set camera position 1-4 (persisted in NVS) |
 | GET | `/api/v1/latest-photo` | Download the most recent JPEG directly |
-
-### SPI Direct Transfer (Current Method)
-JPEG photos transfer directly from S3 cameras to P4 via SPI at 16MHz (~1.6MB/s).
-No WiFi or host PC needed — fully autonomous pipeline.
-
-| Step | Time |
-|------|------|
-| GPIO34 trigger + capture | ~700ms |
-| SPI transfer × 4 cameras (sequential) | ~1,300ms |
-| GIF encoding (7 frames, full resolution) | ~35s |
-| **Total** | **~40s** |
-
-Hardware: 330Ω series resistors on each S3 MISO line required for bus integrity.
-SPI3_HOST on P4 supports 3 HW CS pins — camera #4 uses dynamic CS slot swapping.
-
-### Future Improvements
-- Physical camera positioning for better 3D parallax effect
-- Speed optimizations to reduce total pipeline time
 
 ## Known Issues
 
@@ -183,6 +253,10 @@ SPI3_HOST on P4 supports 3 HW CS pins — camera #4 uses dynamic CS slot swappin
 - **SDL2 + libpng dependencies** — LVGL simulator needs `libsdl2-dev` and `libpng-dev`
 - **LVGL/lv_drivers** — Must be manually cloned into `test/simulator/` (gitignored)
 - **Chip revision** — ESP32-P4X-EYE dev boards are rev v1.3; ESP-IDF v5.5.3 defaults to rev v3.01+ minimum
+- **ESP32-P4 HW JPEG decoder** — Cannot decode 4:2:2 subsampled JPEGs (OV5640/OV3660 output). Use tjpgd software decoder instead.
+- **PSRAM fragmentation** — 32MB PSRAM but largest contiguous block is ~8.26MB after boot. Buffers over 8MB fail to allocate regardless of total free memory.
+- **SPI max 16MHz** — ESP32-S3 SPI slave can't sustain 20MHz+. Tested 20/26/40MHz — all fail with timeouts.
+- **Single HW JPEG decoder** — The album module and GIF encoder cannot both hold a `jpeg_decoder_engine` simultaneously. The GIF encoder releases the album's decoder before encoding and reacquires after.
 
 ## Flash via Docker
 
@@ -194,7 +268,9 @@ docker run --rm -v $(pwd):/workspace -w /workspace/factory_demo \
 
 ## ABSOLUTE REQUIREMENTS
 
-- **NEVER downscale resolution.** All GIFs must be encoded at the full source resolution (e.g., 2048x1536 from OV3660, 1920x1080 from P4 camera). Image quality is the #1 priority. If memory is tight, find another way (free buffers, process one frame at a time, use smaller intermediate structures) — but NEVER reduce the output resolution.
+- **NEVER downscale resolution.** All GIFs must be encoded at the full source resolution (square crop from OV5640 2560×1920 → 1920×1920, or full 1920×1080 from P4 camera). Image quality is the #1 priority. If memory is tight, find another way (free buffers, process one frame at a time, use smaller intermediate structures) — but NEVER reduce the output resolution.
+- **Camera JPEG quality minimum 4.** Never set `CAMERA_JPEG_QUALITY` below 4. Quality 2 produces non-standard Huffman tables that software decoders (tjpgd, esp_new_jpeg) cannot handle.
+- **SPI chunk size must match.** P4 master and S3 slave MUST use the same chunk size (4096 bytes). Mismatch causes data corruption (slave advances by its chunk size, skipping data).
 
 ## Gotchas
 
@@ -207,3 +283,7 @@ docker run --rm -v $(pwd):/workspace -w /workspace/factory_demo \
 7. Chip rev v1.3 needs `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` and `CONFIG_ESP32P4_REV_MIN_100=y` in sdkconfig.defaults
 8. `ui_extra_clear_page()` must hide `ui_PanelCameraSettings` — otherwise ISP sliders bleed into other pages
 9. The popup timer (`lv_popup_timer`) is shared across pages — call `ui_extra_cancel_popup_timer()` when programmatically switching pages
+10. OV5640 cameras produce 4:2:2 JPEGs at QSXGA — the P4 HW JPEG decoder rejects these with `ESP_ERR_INVALID_STATE (0x103)`. Use tjpgd software decoder.
+11. SPI clock speeds above 16MHz cause all S3 cameras to timeout — the SPI slave firmware can't keep up. Don't try 20MHz+.
+12. After failed high-speed SPI tests, S3 cameras may get stuck in DATA mode. OTA reflash to reset their SPI state.
+13. System time defaults to 2026-01-01 (set in `main.c` via `settimeofday`). Without RTC, files would otherwise get 1980 timestamps.

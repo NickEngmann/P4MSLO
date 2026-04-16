@@ -51,12 +51,13 @@ Base URL: `http://<device-ip>/api/v1`
 
 | Device | IP Address | Camera | SD Card | Status |
 |--------|------------|--------|---------|--------|
-| #1 | **192.168.1.119** | OV3660 2048x1536 | 120MB (81MB free) | Running, USB on /dev/ttyACM0 |
-| #2 | **192.168.1.248** | OV3660 2048x1536 | 120MB (92MB free) | Running |
-| #3 | **192.168.1.66** | OV3660 2048x1536 | 120MB (93MB free) | Running |
-| #4 | **192.168.1.38** | OV3660 2048x1536 | 120MB (104MB free) | Running |
+| #1 | **192.168.1.119** | OV5640 2560x1920 | SD disabled (SPI mode) | Running |
+| #2 | **192.168.1.248** | OV5640 2560x1920 | SD disabled (SPI mode) | Running |
+| #3 | **192.168.1.66** | OV5640 2560x1920 | SD disabled (SPI mode) | Running |
+| #4 | **192.168.1.38** | OV5640 2560x1920 | SD disabled (SPI mode) | Running |
 
-All on WiFi "The Garden", all running firmware v0.2.0.
+All on WiFi "The Garden". Cameras switched from OV3660 (3MP) to OV5640 (5MP).
+SD card is disabled when SPI slave mode is active (shares pins).
 
 ## How to Verify All Devices Are Up
 
@@ -144,4 +145,7 @@ Hardcoded in `src/config/Config.h`:
 - **No BLE**: Bluetooth disabled. WiFi creds hardcoded.
 - **Camera GDMA patch**: `scripts/patch_camera_lib.py` patches esp32-camera v2.0.4 GDMA allocation.
 - **OTA direct upload**: The preferred OTA method is `POST /api/v1/ota/upload` with the firmware.bin as the request body. No external HTTP server needed.
-- **Photo quality**: JPEG quality factor 4 (lowest number = highest quality). Photos are ~250-500KB each at 2048x1536.
+- **Photo quality**: JPEG quality factor 4 (lowest number = highest quality). Never go below 4 — quality 2 produces non-standard Huffman tables that software decoders can't handle.
+- **OV5640 vs OV3660**: Firmware auto-detects both. OV5640 produces 2560×1920 JPEGs (~500-900KB at quality 4). OV3660 produces 2048×1536. Both use 4:2:2 subsampling.
+- **SPI slave chunk size**: 4096 bytes. The P4 master MUST use the same chunk size or data will be corrupted (slave advances by its full chunk size regardless of how much the master read).
+- **SPI slave stuck in DATA mode**: If the P4 master disconnects mid-transfer or uses the wrong clock speed, the S3 SPI slave can get stuck. OTA reflash to reset.

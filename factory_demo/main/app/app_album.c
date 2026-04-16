@@ -898,6 +898,40 @@ esp_err_t app_album_refresh(void) {
     return ret;
 }
 
+void app_album_release_jpeg_decoder(void) {
+    if (album_ctx.jpeg_handle) {
+        jpeg_del_decoder_engine(album_ctx.jpeg_handle);
+        album_ctx.jpeg_handle = NULL;
+        ESP_LOGI(TAG, "Released JPEG decoder for GIF encoding");
+    }
+    if (album_ctx.ppa_buffer) {
+        heap_caps_free(album_ctx.ppa_buffer);
+        album_ctx.ppa_buffer = NULL;
+        ESP_LOGI(TAG, "Released PPA buffer");
+    }
+}
+
+void app_album_reacquire_jpeg_decoder(void) {
+    if (!album_ctx.jpeg_handle) {
+        jpeg_decode_engine_cfg_t cfg = { .timeout_ms = 40 };
+        esp_err_t ret = jpeg_new_decoder_engine(&cfg, &album_ctx.jpeg_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to reacquire JPEG decoder: 0x%x", ret);
+            return;
+        }
+    }
+    if (!album_ctx.ppa_buffer) {
+        jpeg_decode_memory_alloc_cfg_t mem_cfg = {
+            .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
+        };
+        album_ctx.ppa_buffer = jpeg_alloc_decoder_mem(1920 * 1088 * 3, &mem_cfg, &tx_buffer_size);
+        if (!album_ctx.ppa_buffer) {
+            ESP_LOGE(TAG, "Failed to reacquire PPA buffer");
+        }
+    }
+    ESP_LOGI(TAG, "Reacquired JPEG decoder + PPA buffer");
+}
+
 // Clean up album resources
 void app_album_deinit(void) {
     if (album_ctx.img_buffer) {

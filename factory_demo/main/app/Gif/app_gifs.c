@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "app_video_stream.h"
+#include "app_album.h"
 
 static const char *TAG = "app_gifs";
 
@@ -235,9 +236,10 @@ static void encode_task(void *param)
 
     ESP_LOGI(TAG, "Creating GIF from %d JPEGs (of %d available)", use_count, jpeg_count);
 
-    /* Free camera buffers to make PSRAM available for JPEG decoding */
+    /* Free camera buffers and album JPEG decoder to make PSRAM available */
     app_video_stream_free_buffers();
-    ESP_LOGI(TAG, "Free PSRAM after releasing camera buffers: %zu",
+    app_album_release_jpeg_decoder();
+    ESP_LOGI(TAG, "Free PSRAM after releasing buffers: %zu",
              heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     /* Create encoder — use 480xAuto (proportional) by default */
@@ -293,7 +295,8 @@ cleanup:
     heap_caps_free(jpeg_files);
     free(p);
 
-    /* Restore camera buffers */
+    /* Restore JPEG decoder and camera buffers */
+    app_album_reacquire_jpeg_decoder();
     esp_err_t realloc_ret = app_video_stream_realloc_buffers();
     if (realloc_ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to restore camera buffers: 0x%x", realloc_ret);
@@ -585,25 +588,40 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     }
 
     int src_w = info.width, src_h = info.height;
-    int total_crop = (int)(src_w * strength);
-    int crop_w = src_w - total_crop;
 
-    ESP_LOGI(TAG, "PIMSLO: %dx%d source, %d cameras, parallax=%.2f, crop_w=%d",
-             src_w, src_h, num_cams, strength, crop_w);
+    /* Square center crop with parallax applied within.
+     * Use the shorter dimension as the square size, then apply parallax
+     * as horizontal offset within the square. This keeps the output
+     * buffer under ~7.4MB (fits in PSRAM's largest free block). */
+    int square = (src_w < src_h) ? src_w : src_h;
+    int h_margin = (src_w - square) / 2;  /* Horizontal center offset */
+    int v_margin = (src_h - square) / 2;  /* Vertical center offset */
+    int total_parallax = (int)(square * strength);
+    int crop_w = square - total_parallax;
+
+    ESP_LOGI(TAG, "PIMSLO: %dx%d source → %dx%d square, %d cameras, parallax=%.2f, crop_w=%d",
+             src_w, src_h, square, square, num_cams, strength, crop_w);
 
     /* Calculate parallax crop rects for each position */
     gif_crop_rect_t crops[MAX_PIMSLO_CAMS];
     for (int i = 0; i < num_cams; i++) {
         float crop_ratio = (num_cams > 1) ? (float)i / (num_cams - 1) : 0.0f;
-        crops[i].x = (int)(crop_ratio * total_crop);
-        crops[i].y = 0;
+        int parallax_offset = (int)(crop_ratio * total_parallax);
+        crops[i].x = h_margin + parallax_offset;
+        crops[i].y = v_margin;
         crops[i].w = crop_w;
-        crops[i].h = src_h;
-        ESP_LOGI(TAG, "  Pos %d: crop(%d, 0, %d, %d)", i+1, crops[i].x, crop_w, src_h);
+        crops[i].h = square;
+        ESP_LOGI(TAG, "  Pos %d: crop(%d, %d, %d, %d)",
+                 i+1, crops[i].x, crops[i].y, crop_w, square);
     }
 
     /* Free camera buffers for PSRAM */
     app_video_stream_free_buffers();
+
+    /* Release album's JPEG decoder — ESP32-P4 has only one HW JPEG decoder.
+     * Without this, gif_encoder_create() gets a handle but jpeg_decoder_process()
+     * returns ESP_ERR_INVALID_STATE (0x103) because the HW is owned by the album. */
+    app_album_release_jpeg_decoder();
 
     /* Free the JPEG data buffers — they'll be re-read from SD for each pass */
     for (int i = 0; i < num_cams; i++) {
@@ -611,14 +629,14 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         jpeg_data[i] = NULL;
     }
 
-    /* Create encoder — full resolution, no downscaling */
+    /* Create encoder — square crop at full resolution */
     gif_encoder_config_t cfg = {
         .frame_delay_cs = delay_cs,
         .loop_count = 0,
         .target_width = crop_w,
-        .target_height = src_h,
+        .target_height = square,
     };
-    ESP_LOGI(TAG, "PIMSLO GIF: %dx%d (full resolution)", crop_w, src_h);
+    ESP_LOGI(TAG, "PIMSLO GIF: %dx%d (square crop, full resolution)", crop_w, square);
 
     gif_encoder_t *enc = NULL;
     ret = gif_encoder_create(&cfg, &enc);
@@ -734,6 +752,7 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
 cleanup_enc:
     gif_encoder_destroy(enc);
 cleanup_buffers:
+    app_album_reacquire_jpeg_decoder();
     app_video_stream_realloc_buffers();
 cleanup:
     for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {

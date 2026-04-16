@@ -234,6 +234,9 @@ esp_err_t app_album_delete_current_image(void) {
     return ESP_OK;
 }
 
+void app_album_release_jpeg_decoder(void) {}
+void app_album_reacquire_jpeg_decoder(void) {}
+
 bool app_album_can_store_new_image(void) {
     return s_hw.album_can_store;
 }

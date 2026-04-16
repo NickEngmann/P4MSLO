@@ -10,8 +10,8 @@
 
 #define MOMENT_VERSION          "0.2.0"
 
-// Camera — highest quality JPEG, max resolution per sensor
-#define CAMERA_JPEG_QUALITY     2       // Lowest = best quality (sensor may clamp internally)
+// Camera — JPEG quality (lower number = higher quality, 2-63)
+#define CAMERA_JPEG_QUALITY     4
 
 // SD Card — FAT32 filesystem
 #define SD_MOUNT_POINT          "/sdcard"

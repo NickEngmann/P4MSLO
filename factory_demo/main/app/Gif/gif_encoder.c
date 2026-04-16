@@ -19,6 +19,7 @@
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
 #include "bsp/display.h"
+#include "gif_tjpgd.h"
 
 /* SIMD-accelerated functions (gif_simd.S) */
 extern void gif_simd_distribute_below(int16_t *err_nxt, const int16_t *errors, int count);
@@ -77,6 +78,67 @@ static inline void rgb565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t
     *b = (b5 << 3) | (b5 >> 2);
 }
 
+/* ---- tjpgd software JPEG decoder (fallback for 4:2:2 JPEGs) ---- */
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    uint16_t *out_buf;
+    int out_width;      /* Output buffer stride (pixels) */
+    int crop_x;         /* Crop region (0,0 = no crop) */
+    int crop_y;
+    int crop_w;
+    int crop_h;
+} tjpgd_ctx_t;
+
+static size_t tjpgd_input(JDEC *jd, uint8_t *buff, size_t ndata)
+{
+    tjpgd_ctx_t *ctx = (tjpgd_ctx_t *)jd->device;
+    size_t avail = ctx->size - ctx->pos;
+    if (ndata > avail) ndata = avail;
+    if (buff) memcpy(buff, ctx->data + ctx->pos, ndata);
+    ctx->pos += ndata;
+    return ndata;
+}
+
+static int tjpgd_output(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    tjpgd_ctx_t *ctx = (tjpgd_ctx_t *)jd->device;
+    const uint8_t *src = (const uint8_t *)bitmap;
+    int bw = rect->right - rect->left + 1;
+    int bh = rect->bottom - rect->top + 1;
+
+    for (int y = 0; y < bh; y++) {
+        int src_y = rect->top + y;
+
+        /* Apply crop if active */
+        if (ctx->crop_w > 0) {
+            if (src_y < ctx->crop_y || src_y >= ctx->crop_y + ctx->crop_h) continue;
+            int dst_y = src_y - ctx->crop_y;
+
+            const uint8_t *src_row = &src[y * bw * 3];
+            for (int x = 0; x < bw; x++) {
+                int src_x = rect->left + x;
+                if (src_x < ctx->crop_x || src_x >= ctx->crop_x + ctx->crop_w) continue;
+                int dst_x = src_x - ctx->crop_x;
+                uint8_t r = src_row[x * 3], g = src_row[x * 3 + 1], b = src_row[x * 3 + 2];
+                ctx->out_buf[dst_y * ctx->out_width + dst_x] =
+                    ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            }
+        } else {
+            /* No crop — write directly */
+            uint16_t *dst_row = &ctx->out_buf[src_y * ctx->out_width + rect->left];
+            const uint8_t *src_row = &src[y * bw * 3];
+            for (int x = 0; x < bw; x++) {
+                uint8_t r = src_row[x * 3], g = src_row[x * 3 + 1], b = src_row[x * 3 + 2];
+                dst_row[x] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            }
+        }
+    }
+    return 1;
+}
+
 /* Decode JPEG data in memory, apply optional crop, and scale to target size.
  * Output is in enc->scaled_buf as RGB565.
  * If crop is NULL, uses the full image. */
@@ -84,22 +146,35 @@ static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
                                         const uint8_t *jpeg_data, size_t jpeg_size,
                                         const gif_crop_rect_t *crop)
 {
-    /* Get JPEG dimensions */
-    jpeg_decode_picture_info_t info;
-    esp_err_t ret = jpeg_decoder_get_info(jpeg_data, jpeg_size, &info);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG header parse failed");
-        return ret;
+    esp_err_t ret = ESP_OK;
+
+    /* Use tjpgd for header parsing AND decoding — it handles both 4:2:0
+     * and 4:2:2 subsampling. The ESP32-P4 HW decoder can't handle 4:2:2
+     * JPEGs from the OV3660 cameras. */
+    tjpgd_ctx_t tjctx = {
+        .data = jpeg_data, .size = jpeg_size, .pos = 0,
+    };
+    JDEC jdec;
+    static uint8_t tjwork[32768] __attribute__((aligned(4)));
+
+    JRESULT jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, sizeof(tjwork), &tjctx);
+    if (jres != JDR_OK) {
+        ESP_LOGE(TAG, "JPEG header parse failed: %d", jres);
+        return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "JPEG: %ux%u (%zu bytes)%s", info.width, info.height, jpeg_size,
+    /* Use tjpgd's parsed dimensions */
+    uint32_t img_w = jdec.width, img_h = jdec.height;
+
+    ESP_LOGI(TAG, "JPEG: %ux%u (%zu bytes, msx=%d msy=%d)%s",
+             img_w, img_h, jpeg_size, jdec.msx, jdec.msy,
              crop ? " [cropped]" : "");
 
     /* Determine source region (full or cropped) */
     int src_x = crop ? crop->x : 0;
     int src_y = crop ? crop->y : 0;
-    int src_w = crop ? crop->w : (int)info.width;
-    int src_h = crop ? crop->h : (int)info.height;
+    int src_w = crop ? crop->w : (int)img_w;
+    int src_h = crop ? crop->h : (int)img_h;
 
     /* Set target dimensions from first frame if not specified */
     if (enc->width == 0 || enc->height == 0) {
@@ -113,38 +188,9 @@ static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
         ESP_LOGI(TAG, "GIF dimensions: %dx%d", enc->width, enc->height);
     }
 
-    /* Allocate decode buffer for full JPEG (HW decoder needs full image) */
-    uint32_t aligned_w = (info.width + 15) & ~15;
-    uint32_t aligned_h = (info.height + 15) & ~15;
-    size_t needed = (size_t)aligned_w * aligned_h * 2;
-    if (!enc->decode_buf || enc->decode_buf_size < needed) {
-        if (enc->decode_buf) heap_caps_free(enc->decode_buf);
-        enc->decode_buf = heap_caps_aligned_calloc(enc->cache_line_size, 1,
-                                                    needed, MALLOC_CAP_SPIRAM);
-        if (!enc->decode_buf) {
-            ESP_LOGE(TAG, "Cannot allocate %zu byte decode buffer (free: %zu)",
-                     needed, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            return ESP_ERR_NO_MEM;
-        }
-        enc->decode_buf_size = needed;
-        ESP_LOGI(TAG, "Allocated decode buffer: %zu bytes", needed);
-    }
-
-    /* Decode JPEG to RGB565 */
-    jpeg_decode_cfg_t decode_cfg = {
-        .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
-        .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
-    };
-    uint32_t out_size = 0;
-    ret = jpeg_decoder_process(enc->jpeg_handle, &decode_cfg,
-                               jpeg_data, jpeg_size,
-                               enc->decode_buf, enc->decode_buf_size, &out_size);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG decode failed");
-        return ret;
-    }
-
-    /* Allocate scaled output buffer if needed */
+    /* Allocate the scaled output buffer (crop-sized, not full source).
+     * tjpgd decodes into this directly via the crop-aware output callback,
+     * so we never need a full-source-resolution intermediate buffer. */
     if (!enc->scaled_buf) {
         enc->scaled_buf_size = ALIGN_UP(enc->width * enc->height * 2, enc->cache_line_size);
         enc->scaled_buf = heap_caps_aligned_calloc(enc->cache_line_size, 1,
@@ -153,61 +199,30 @@ static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
             ESP_LOGE(TAG, "Failed to allocate %zu byte scaled buffer", enc->scaled_buf_size);
             return ESP_ERR_NO_MEM;
         }
-        ESP_LOGI(TAG, "Allocated scaled buffer: %zu bytes (%dx%d)",
+        ESP_LOGI(TAG, "Allocated output buffer: %zu bytes (%dx%d)",
                  enc->scaled_buf_size, enc->width, enc->height);
     }
 
-    /* If no scaling/cropping needed and target matches source, direct copy */
-    if (!crop && enc->width == (int)info.width && enc->height == (int)info.height) {
-        size_t row_bytes = enc->width * 2;
-        for (int y = 0; y < enc->height; y++) {
-            memcpy((uint8_t*)enc->scaled_buf + y * row_bytes,
-                   (uint8_t*)enc->decode_buf + y * aligned_w * 2,
-                   row_bytes);
-        }
-    } else {
-        /* Crop + scale using PPA hardware */
-        ppa_srm_oper_config_t srm = {
-            .in.buffer = enc->decode_buf,
-            .in.pic_w = info.width,
-            .in.pic_h = info.height,
-            .in.block_w = src_w,
-            .in.block_h = src_h,
-            .in.block_offset_x = src_x,
-            .in.block_offset_y = src_y,
-            .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+    /* Decode JPEG → RGB565 directly into scaled_buf with crop applied.
+     * tjpgd outputs MCU blocks via callback — the callback applies
+     * the crop and converts to RGB565 in one step. No PPA needed. */
+    tjctx.pos = 0;
+    tjctx.out_buf = enc->scaled_buf;
+    tjctx.out_width = enc->width;
+    tjctx.crop_x = src_x;
+    tjctx.crop_y = src_y;
+    tjctx.crop_w = crop ? src_w : 0;  /* 0 = no crop */
+    tjctx.crop_h = crop ? src_h : 0;
 
-            .out.buffer = enc->scaled_buf,
-            .out.buffer_size = enc->scaled_buf_size,
-            .out.pic_w = enc->width,
-            .out.pic_h = enc->height,
-            .out.block_offset_x = 0,
-            .out.block_offset_y = 0,
-            .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-
-            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-            .scale_x = (float)enc->width / src_w,
-            .scale_y = (float)enc->height / src_h,
-            .rgb_swap = 0,
-            .byte_swap = 0,
-            .mode = PPA_TRANS_MODE_BLOCKING,
-        };
-
-        ret = ppa_do_scale_rotate_mirror(enc->ppa_handle, &srm);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "PPA crop+scale failed (src: %d,%d %dx%d → %dx%d)",
-                     src_x, src_y, src_w, src_h, enc->width, enc->height);
-            return ret;
-        }
+    jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, sizeof(tjwork), &tjctx);
+    if (jres == JDR_OK) {
+        jres = gif_jd_decomp(&jdec, tjpgd_output, 0);
     }
-
-    /* Free decode buffer after PPA to reclaim ~6MB PSRAM for encoding */
-    if (enc->decode_buf) {
-        heap_caps_free(enc->decode_buf);
-        enc->decode_buf = NULL;
-        enc->decode_buf_size = 0;
+    if (jres != JDR_OK) {
+        ESP_LOGE(TAG, "JPEG decode failed: tjpgd error %d", jres);
+        return ESP_FAIL;
     }
-
+    ESP_LOGI(TAG, "Decoded %ux%u → %dx%d RGB565", img_w, img_h, enc->width, enc->height);
     return ESP_OK;
 }
 

@@ -48,8 +48,22 @@ esp_err_t app_album_prev_image(void);
 esp_err_t app_album_refresh(void);
 
 /**
+ * @brief Release the album's JPEG decoder engine
+ *
+ * The ESP32-P4 has a single hardware JPEG decoder. Call this before
+ * creating another decoder engine (e.g., for GIF encoding) to avoid
+ * ESP_ERR_INVALID_STATE conflicts. Also frees the PPA decode buffer.
+ */
+void app_album_release_jpeg_decoder(void);
+
+/**
+ * @brief Reacquire the album's JPEG decoder after GIF encoding completes
+ */
+void app_album_reacquire_jpeg_decoder(void);
+
+/**
  * @brief Clean up album resources
- * 
+ *
  * This function frees all allocated memory and resources.
  * Call this when exiting the album page.
  */

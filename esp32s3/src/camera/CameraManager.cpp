@@ -52,10 +52,10 @@ bool CameraManager::begin() {
     // Start with max resolution — will be adjusted after sensor detection
     config.frame_size = FRAMESIZE_QSXGA;  // 2592x1944 (OV5640 max)
     config.jpeg_quality = CAMERA_JPEG_QUALITY;
-    /* fb_count=2 gives the DMA a slack buffer, preventing NULL returns from
-     * esp_camera_fb_get() when timing jitters (WiFi activity, thermal drift).
-     * Documented fix for esp32-camera issue #620. */
-    config.fb_count = 2;
+    /* fb_count=1 keeps capture deterministic — always returns the most
+     * recently captured frame. fb_count=2 introduces ring-buffer staleness
+     * that's hard to flush reliably when using grab_mode=LATEST. */
+    config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
 
@@ -123,6 +123,35 @@ bool CameraManager::begin() {
     return true;
 }
 
+// OV5640 register 0x3008 = SYS_CTRL0. Bit 6 = software power-down.
+// Value 0x42 puts sensor in low-power idle (drops from ~120mA to ~5mA).
+// Value 0x02 wakes it back up. Ref: OV5640 datasheet.
+void CameraManager::enterStandby() {
+    if (!_initialized) return;
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_reg) return;
+    int ret = s->set_reg(s, 0x3008, 0xFF, 0x42);
+    if (ret != 0) {
+        ESP_LOGW(TAG, "Standby enter failed: %d", ret);
+    } else {
+        ESP_LOGD(TAG, "Sensor → standby");
+    }
+}
+
+void CameraManager::wakeFromStandby() {
+    if (!_initialized) return;
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_reg) return;
+    int ret = s->set_reg(s, 0x3008, 0xFF, 0x02);
+    if (ret != 0) {
+        ESP_LOGW(TAG, "Standby wake failed: %d", ret);
+    } else {
+        ESP_LOGD(TAG, "Sensor → awake");
+    }
+    // Datasheet requires stabilization time after wake
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
 void CameraManager::stop() {
     if (_initialized) {
         releasePhoto();
@@ -137,18 +166,41 @@ bool CameraManager::capturePhoto(uint8_t **outBuf, size_t *outLen) {
     // Release any previously held frame
     releasePhoto();
 
-    uint64_t t0 = esp_timer_get_time();
-    camera_fb_t *fb = esp_camera_fb_get();
-    uint64_t t1 = esp_timer_get_time();
+    // Retry up to 3 times to handle occasional NULL returns or bad JPEGs.
+    camera_fb_t *fb = nullptr;
+    uint64_t t0 = 0, t1 = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        t0 = esp_timer_get_time();
+        fb = esp_camera_fb_get();
+        t1 = esp_timer_get_time();
 
-    if (!fb) {
-        ESP_LOGE(TAG, "Capture failed");
-        return false;
+        if (!fb) {
+            ESP_LOGW(TAG, "Capture attempt %d: NULL fb", attempt + 1);
+            continue;
+        }
+
+        // Validate JPEG header + minimum plausible size
+        if (fb->len < 2 || fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) {
+            ESP_LOGW(TAG, "Attempt %d: Not JPEG data (len=%zu)", attempt + 1, fb->len);
+            esp_camera_fb_return(fb);
+            fb = nullptr;
+            continue;
+        }
+
+        // JPEG at quality 12 QSXGA should be ≥150KB. Smaller = incomplete.
+        if (fb->len < 150000) {
+            ESP_LOGW(TAG, "Attempt %d: JPEG too small (%zu bytes)", attempt + 1, fb->len);
+            esp_camera_fb_return(fb);
+            fb = nullptr;
+            continue;
+        }
+
+        // Good capture
+        break;
     }
 
-    if (fb->len < 2 || fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) {
-        ESP_LOGE(TAG, "Not JPEG data");
-        esp_camera_fb_return(fb);
+    if (!fb) {
+        ESP_LOGE(TAG, "Capture failed after 3 attempts");
         return false;
     }
 

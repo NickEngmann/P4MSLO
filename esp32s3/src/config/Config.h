@@ -11,9 +11,10 @@
 #define MOMENT_VERSION          "0.2.0"
 
 // Camera — JPEG quality (lower number = higher quality, 2-63)
-// Quality 8 balances high quality with reliable capture on OV5640 at QSXGA.
-// Below 5 produces 800KB+ files and causes NULL returns on XIAO Sense (issue #630).
-#define CAMERA_JPEG_QUALITY     8
+// Quality 12 gives strong quality with smaller files (~200-400KB) that transfer
+// faster and are less prone to thermal-induced capture failures on OV5640.
+// Below 12 is not recommended for this pipeline.
+#define CAMERA_JPEG_QUALITY     12
 
 // SD Card — FAT32 filesystem
 #define SD_MOUNT_POINT          "/sdcard"

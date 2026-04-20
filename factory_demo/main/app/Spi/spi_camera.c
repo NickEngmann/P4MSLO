@@ -60,7 +60,7 @@ static spi_device_handle_t get_device(int cam_idx)
         spi_bus_remove_device(s_spi_dev[2]);
         spi_device_interface_config_t cfg = {
             .mode = 0,
-            .clock_speed_hz = 16 * 1000 * 1000,
+            .clock_speed_hz = 10 * 1000 * 1000,
             .spics_io_num = s_cs_pins[cam_idx],
             .queue_size = 1,
         };
@@ -82,7 +82,7 @@ static void restore_dev2(void)
         spi_bus_remove_device(s_spi_dev[2]);
         spi_device_interface_config_t cfg = {
             .mode = 0,
-            .clock_speed_hz = 16 * 1000 * 1000,
+            .clock_speed_hz = 10 * 1000 * 1000,
             .spics_io_num = s_cs_pins[2],
             .queue_size = 1,
         };
@@ -127,7 +127,7 @@ esp_err_t spi_camera_init(void)
     for (int i = 0; i < SPI_MAX_HW_CS; i++) {
         spi_device_interface_config_t dev_cfg = {
             .mode = 0,
-            .clock_speed_hz = 16 * 1000 * 1000,
+            .clock_speed_hz = 10 * 1000 * 1000,
             .spics_io_num = s_cs_pins[i],
             .queue_size = 1,
         };
@@ -149,7 +149,7 @@ esp_err_t spi_camera_init(void)
     gpio_set_level(GPIO_NUM_34, 1);
 
     s_initialized = true;
-    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 16MHz, trigger=GPIO34",
+    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 10MHz, trigger=GPIO34",
              SPI_CAM_COUNT, SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN);
     return ESP_OK;
 }

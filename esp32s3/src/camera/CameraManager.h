@@ -23,8 +23,17 @@ public:
 
     // Capture a high-quality JPEG photo. Returns JPEG data in outBuf/outLen.
     // Caller must call releasePhoto() when done with the data.
+    // Handles waking the OV5640 from standby and putting it back to sleep.
     bool capturePhoto(uint8_t **outBuf, size_t *outLen);
     void releasePhoto();
+
+    // Put the OV5640 into software standby (register 0x3008 = 0x42).
+    // Reduces idle current and thermal buildup between captures.
+    void enterStandby();
+
+    // Wake the OV5640 from standby (register 0x3008 = 0x02).
+    // Safe to call even if already awake.
+    void wakeFromStandby();
 
     bool isInitialized() const { return _initialized; }
     uint16_t getWidth() const { return _width; }

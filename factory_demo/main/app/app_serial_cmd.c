@@ -438,6 +438,35 @@ static void dispatch_command(char *line)
         } else {
             cmd_respond("error spi_capture ret=0x%x", ret);
         }
+    } else if (strcmp(line, "spi_capture_all") == 0) {
+        /* Capture all 4 cameras and save pos{1..4}.jpg — NO GIF encoding.
+         * Used by scripts/test_spi_integrity.py to avoid serial-port flood. */
+        spi_camera_init();
+        trigger_init();
+
+        uint8_t *jpeg_bufs[4] = {NULL};
+        size_t jpeg_sizes[4] = {0};
+        uint32_t capture_ms = 0;
+
+        esp_err_t ret = spi_camera_capture_all(jpeg_bufs, jpeg_sizes, &capture_ms);
+
+        int saved = 0;
+        mkdir("/sdcard/pimslo", 0755);
+        for (int i = 0; i < 4; i++) {
+            if (jpeg_bufs[i] && jpeg_sizes[i] > 0) {
+                char path[64];
+                snprintf(path, sizeof(path), "/sdcard/pimslo/pos%d.jpg", i + 1);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(jpeg_bufs[i], 1, jpeg_sizes[i], f);
+                    fclose(f);
+                    saved++;
+                }
+                free(jpeg_bufs[i]);
+            }
+        }
+        cmd_respond("ok spi_capture_all capture_ms=%lu saved=%d ret=0x%x",
+                    (unsigned long)capture_ms, saved, ret);
     } else if (strcmp(line, "spi_pimslo") == 0) {
         /* Full pipeline: trigger → SPI receive all 4 → save to SD → encode GIF */
         spi_camera_init();

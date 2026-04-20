@@ -26,6 +26,10 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_gpio.h"
+#include "soc/gpio_sig_map.h"
+#include "soc/spi_periph.h"
+#include "hal/gpio_ll.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -38,6 +42,63 @@ static const char *TAG = "spi_slave";
 #define CMD_STATUS      0x01
 #define CMD_GET_SIZE    0x02
 #define CMD_READ_DATA   0x03
+
+/**
+ * CS-gated MISO tri-state ISR.
+ *
+ * On a shared-bus SPI topology, the ESP-IDF SPI slave driver keeps MISO
+ * actively driven even when CS is HIGH (deselected). Four slaves all driving
+ * MISO simultaneously fight over the 330Ω pulldowns → master reads garbage
+ * on any slave that doesn't happen to "win" the voltage divider.
+ *
+ * This ISR watches our CS pin and reconfigures MISO dynamically:
+ *   CS LOW  (selected)   → MISO = OUTPUT, driven by SPI peripheral
+ *   CS HIGH (deselected) → MISO = INPUT,  high-Z, releases the bus
+ *
+ * That way the selected slave is the only one driving at any moment.
+ *
+ * Latency budget: GPIO ISR on S3 ≈ 2–5 µs with IRAM. At 10 MHz SPI each bit
+ * is 100 ns, so the ISR may "miss" a handful of leading clocks. The master
+ * configures cs_ena_pretrans to wait a few cycles after CS↓ before the first
+ * SCLK edge, which covers us.
+ */
+static void IRAM_ATTR cs_edge_isr(void *arg)
+{
+    if (gpio_get_level((gpio_num_t)SPI_SLAVE_CS_PIN) == 0) {
+        /* CS asserted → drive MISO via SPI peripheral */
+        gpio_ll_output_enable(&GPIO, (gpio_num_t)SPI_SLAVE_MISO_PIN);
+    } else {
+        /* CS deasserted → release MISO (input / high-Z) */
+        gpio_ll_output_disable(&GPIO, (gpio_num_t)SPI_SLAVE_MISO_PIN);
+    }
+}
+
+static void install_miso_tristate(void)
+{
+    /* SPI slave driver already owns the CS pin as an input for detecting
+     * master's CS edges. We just need to:
+     *   1. Release MISO now so other slaves can win the bus at boot
+     *   2. Enable CS edge interrupts
+     *   3. Hook our ISR to toggle MISO's output-enable on each edge
+     */
+    gpio_ll_output_disable(&GPIO, (gpio_num_t)SPI_SLAVE_MISO_PIN);
+
+    /* Enable any-edge interrupts on the CS pin (the SPI driver already
+     * configured it as an input with pull-up). */
+    gpio_set_intr_type((gpio_num_t)SPI_SLAVE_CS_PIN, GPIO_INTR_ANYEDGE);
+
+    /* Use IRAM flag so ISR runs from IRAM (low latency). Level-1 is the default
+     * priority and is allocated automatically — explicitly requesting LEVEL1
+     * can fail with "No free interrupt inputs" on some ESP-IDF versions. */
+    esp_err_t isr_ret = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (isr_ret != ESP_OK && isr_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "gpio_install_isr_service: 0x%x", isr_ret);
+    }
+    gpio_isr_handler_add((gpio_num_t)SPI_SLAVE_CS_PIN, cs_edge_isr, nullptr);
+
+    ESP_LOGI(TAG, "MISO tri-state ISR installed on CS=%d, MISO=%d",
+             SPI_SLAVE_CS_PIN, SPI_SLAVE_MISO_PIN);
+}
 
 SPISlave::SPISlave()
     : _jpegData(nullptr), _jpegLen(0), _initialized(false)
@@ -71,6 +132,10 @@ bool SPISlave::begin()
     gpio_set_pull_mode((gpio_num_t)SPI_SLAVE_CLK_PIN, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode((gpio_num_t)SPI_SLAVE_CS_PIN, GPIO_PULLUP_ONLY);
 
+    /* Release MISO to high-Z when CS is HIGH, so idle slaves don't fight
+     * the selected one on the shared bus. */
+    install_miso_tristate();
+
     _initialized = true;
 
     xTaskCreatePinnedToCore(spiTask, "spi_slave", 4096, this, 10, nullptr, 1);
@@ -102,121 +167,131 @@ void SPISlave::clearJpegData()
 }
 
 /**
- * Stream JPEG data using double-buffered queued transactions.
- *
- * The synchronous `spi_slave_transmit()` has a race window between when one
- * transaction completes and the next is set up — if the master clocks during
- * that window it reads stale FIFO contents, corrupting entropy data. Queuing
- * two transactions up front means the HW always has the next chunk pre-loaded
- * in DMA the moment CS re-asserts.
+ * Magic preamble the slave emits right before the JPEG bytes. Master scans
+ * incoming data for DEADBEEF to align past any stale IDLE-header bytes that
+ * leaked in before the slave's first DATA chunk was queued.
  */
-static esp_err_t streamJpegData(const uint8_t *jpeg_data, size_t jpeg_len,
-                                uint8_t *rx_buf_scratch)
+#define PREAMBLE_LEN  12
+static const uint8_t PREAMBLE[PREAMBLE_LEN] = {
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xDE, 0xAD, 0xBE, 0xEF,
+};
+
+/**
+ * Stream JPEG data using double-buffered queued transactions. Buffers are
+ * PRE-ALLOCATED at task startup and passed in — no per-call allocation, so
+ * the window between sync CMD_READ_DATA completing and the first DATA chunk
+ * being queued is as short as possible.
+ */
+static void streamJpegData(const uint8_t *jpeg_data, size_t jpeg_len,
+                           uint8_t *tx_bufs[2], uint8_t *rx_bufs[2])
 {
-    /* Two DMA-capable TX buffers for ping-pong */
-    uint8_t *tx_bufs[2] = {
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
-    };
-    uint8_t *rx_bufs[2] = {
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
-    };
     spi_slave_transaction_t trans[2] = {};
 
-    if (!tx_bufs[0] || !tx_bufs[1] || !rx_bufs[0] || !rx_bufs[1]) {
-        ESP_LOGE(TAG, "OOM in streamJpegData");
-        for (int i = 0; i < 2; i++) {
-            if (tx_bufs[i]) free(tx_bufs[i]);
-            if (rx_bufs[i]) free(rx_bufs[i]);
+    /* Fill a chunk with preamble + JPEG[data_offset..], zero-padded.
+     * Preamble emitted only in the very first chunk. */
+    auto fill_chunk = [&](uint8_t *tx, size_t data_offset) -> size_t {
+        memset(tx, 0, CHUNK_SIZE);
+        size_t pos = 0;
+        if (data_offset == 0) {
+            memcpy(tx, PREAMBLE, PREAMBLE_LEN);
+            pos = PREAMBLE_LEN;
         }
-        return ESP_ERR_NO_MEM;
-    }
+        if (data_offset >= jpeg_len) return 0;
+        size_t remaining = jpeg_len - data_offset;
+        size_t space = CHUNK_SIZE - pos;
+        size_t take = remaining > space ? space : remaining;
+        memcpy(tx + pos, jpeg_data + data_offset, take);
+        return take;
+    };
 
-    size_t offset_next = 0;
+    size_t data_offset = 0;
     int in_flight = 0;
 
-    /* Pre-queue both slots with the first two chunks */
-    for (int i = 0; i < 2 && offset_next < jpeg_len; i++) {
-        size_t remaining = jpeg_len - offset_next;
-        size_t chunk = remaining > CHUNK_SIZE ? CHUNK_SIZE : remaining;
-        memcpy(tx_bufs[i], jpeg_data + offset_next, chunk);
-        if (chunk < CHUNK_SIZE) memset(tx_bufs[i] + chunk, 0, CHUNK_SIZE - chunk);
-        offset_next += chunk;
-
+    /* Pre-queue two chunks up front. */
+    for (int i = 0; i < 2; i++) {
+        size_t consumed = fill_chunk(tx_bufs[i], data_offset);
+        data_offset += consumed;
         trans[i].length = CHUNK_SIZE * 8;
         trans[i].tx_buffer = tx_bufs[i];
         trans[i].rx_buffer = rx_bufs[i];
-        esp_err_t ret = spi_slave_queue_trans(SPI3_HOST, &trans[i], portMAX_DELAY);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "queue_trans failed at init: 0x%x", ret);
-            goto cleanup;
+        if (spi_slave_queue_trans(SPI3_HOST, &trans[i], portMAX_DELAY) != ESP_OK) {
+            ESP_LOGE(TAG, "queue_trans failed in DATA init");
+            return;
         }
         in_flight++;
+        if (data_offset >= jpeg_len && consumed == 0) break;
     }
 
-    /* Drain completed transactions and re-queue with next chunk until done */
+    /* Drain and refill. Keep emitting zero-padded chunks for one extra
+     * iteration past jpeg_len to cover master's over-read. */
+    bool padded_tail = false;
     while (in_flight > 0) {
-        spi_slave_transaction_t *done = NULL;
+        spi_slave_transaction_t *done = nullptr;
         esp_err_t ret = spi_slave_get_trans_result(SPI3_HOST, &done, portMAX_DELAY);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "get_trans_result failed: 0x%x", ret);
-            goto cleanup;
+            return;
         }
         in_flight--;
-
-        /* Identify which ping-pong slot completed so we re-use the right TX buffer */
         int slot = (done == &trans[0]) ? 0 : 1;
 
-        if (offset_next < jpeg_len) {
-            size_t remaining = jpeg_len - offset_next;
-            size_t chunk = remaining > CHUNK_SIZE ? CHUNK_SIZE : remaining;
-            memcpy(tx_bufs[slot], jpeg_data + offset_next, chunk);
-            if (chunk < CHUNK_SIZE) memset(tx_bufs[slot] + chunk, 0, CHUNK_SIZE - chunk);
-            offset_next += chunk;
-
-            ret = spi_slave_queue_trans(SPI3_HOST, &trans[slot], portMAX_DELAY);
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "re-queue failed: 0x%x", ret);
-                goto cleanup;
+        if (data_offset < jpeg_len) {
+            size_t consumed = fill_chunk(tx_bufs[slot], data_offset);
+            data_offset += consumed;
+            if (spi_slave_queue_trans(SPI3_HOST, &trans[slot], portMAX_DELAY) != ESP_OK) {
+                ESP_LOGE(TAG, "re-queue failed");
+                return;
             }
             in_flight++;
+        } else if (!padded_tail) {
+            /* One extra zero-padded chunk so any master over-read gets clean zeros */
+            memset(tx_bufs[slot], 0, CHUNK_SIZE);
+            if (spi_slave_queue_trans(SPI3_HOST, &trans[slot], portMAX_DELAY) == ESP_OK) {
+                in_flight++;
+                padded_tail = true;
+            }
         }
     }
-
-cleanup:
-    for (int i = 0; i < 2; i++) {
-        free(tx_bufs[i]);
-        free(rx_bufs[i]);
-    }
-    return ESP_OK;
 }
 
 /**
  * SPI slave task — two-phase state machine:
  *
- * IDLE (synchronous): slave pre-fills TX with [status, sizeLE[4]].
- *   Handshake commands arrive with ≥50ms spacing from master polling, so the
- *   sync call's inter-transaction gap is harmless here.
+ * IDLE: synchronous spi_slave_transmit with pre-filled header. Handshake
+ *   commands from master come with natural gaps (≥50ms between polls) so
+ *   the sync call's inter-transaction gap is tolerable.
  *
- * DATA (queued double-buffered): entered when master sends CMD_READ_DATA.
- *   See streamJpegData() — keeps one chunk pre-loaded in DMA at all times
- *   to eliminate the race that corrupted entropy data.
+ * DATA: entered on CMD_READ_DATA. Uses double-buffered queued transactions
+ *   with PRE-ALLOCATED DMA buffers (minimizing the setup window) and
+ *   prepends a PREAMBLE+MAGIC that the master scans for to re-align past
+ *   any IDLE leak.
  */
 void SPISlave::spiTask(void *param)
 {
     SPISlave *self = (SPISlave *)param;
 
+    /* IDLE single buffer */
     WORD_ALIGNED_ATTR uint8_t *tx_buf = (uint8_t *)heap_caps_calloc(1, CHUNK_SIZE, MALLOC_CAP_DMA);
     WORD_ALIGNED_ATTR uint8_t *rx_buf = (uint8_t *)heap_caps_calloc(1, CHUNK_SIZE, MALLOC_CAP_DMA);
 
-    if (!tx_buf || !rx_buf) {
+    /* DATA ping-pong buffers — pre-allocated so entering DATA mode is fast */
+    uint8_t *data_tx[2] = {
+        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
+        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
+    };
+    uint8_t *data_rx[2] = {
+        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
+        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
+    };
+
+    if (!tx_buf || !rx_buf || !data_tx[0] || !data_tx[1] || !data_rx[0] || !data_rx[1]) {
         ESP_LOGE(TAG, "Failed to alloc SPI DMA buffers");
         vTaskDelete(nullptr);
         return;
     }
 
-    ESP_LOGI(TAG, "SPI slave task running (queued DATA mode)");
+    ESP_LOGI(TAG, "SPI slave task running (sync IDLE + queued DATA with preamble)");
 
     while (true) {
         /* IDLE: pre-fill header and do one synchronous transaction */
@@ -239,15 +314,11 @@ void SPISlave::spiTask(void *param)
 
         uint8_t cmd = rx_buf[0];
         if (cmd == CMD_READ_DATA && self->_jpegData) {
-            ESP_LOGI(TAG, "Entering DATA mode (%zu bytes)", self->_jpegLen);
-            streamJpegData(self->_jpegData, self->_jpegLen, rx_buf);
+            ESP_LOGI(TAG, "CMD_READ_DATA → DATA (%zu bytes)", self->_jpegLen);
+            streamJpegData(self->_jpegData, self->_jpegLen, data_tx, data_rx);
             ESP_LOGI(TAG, "DATA transfer complete");
         }
     }
-
-    free(tx_buf);
-    free(rx_buf);
-    vTaskDelete(nullptr);
 }
 
 #else

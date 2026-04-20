@@ -59,6 +59,13 @@
 // Set to 1 to enable SPI slave mode (disables SD card)
 #define ENABLE_SPI_SLAVE        1
 
+// Set to 1 to skip WiFi + HTTP server startup entirely. Used for isolated
+// SPI-slave testing: without WiFi, the S3 has no radio ISR traffic, no
+// connection churn, and full CPU/RAM available for the SPI slave task.
+// (Caveat: when this is 1, the only way to reprogram the device is USB —
+// OTA requires WiFi.)
+#define DISABLE_WIFI            1
+
 // NVS
 #define NVS_NAMESPACE           "moment"
 #define NVS_KEY_CAMERA_POS      "cam_pos"   // Camera position 1-4 (0 = unset)

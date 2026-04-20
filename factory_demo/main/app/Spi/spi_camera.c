@@ -31,72 +31,60 @@ static const char *TAG = "spi_cam";
 /* Maximum retries per camera for corrupted transfers */
 #define SPI_MAX_RETRIES   2
 
-/* SPI3 on ESP32-P4 supports max 3 hardware CS pins.
- * We register 3 devices for cameras 0-2, and for camera 3 we
- * remove device 2 temporarily and re-add with camera 3's CS pin. */
-#define SPI_MAX_HW_CS  3
+/* Slave prepends this preamble to every JPEG stream so the master can skip
+ * any stale IDLE-header bytes that leaked in before the slave processed
+ * CMD_READ_DATA. Keep synchronized with esp32s3/src/spi/SPISlave.cpp. */
+#define PREAMBLE_LEN      12
+static const uint8_t SPI_PREAMBLE[PREAMBLE_LEN] = {
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xDE, 0xAD, 0xBE, 0xEF,
+};
 
-static spi_device_handle_t s_spi_dev[SPI_MAX_HW_CS];
+/* Extra bytes to read past (preamble + jpeg_len) to tolerate up to
+ * SAFETY_STALE_BYTES of stale IDLE bytes leaking in before the magic. */
+#define SAFETY_STALE_BYTES  256
+
+/* One shared SPI device with NO hardware CS — we drive all 4 CS pins by
+ * hand via gpio_set_level. This removes the dynamic CS-swap that SPI3's
+ * 3-HW-CS limit forced on us, and gives deterministic CS timing so each
+ * CS pin is unambiguously asserted regardless of driver quirks. */
+static spi_device_handle_t s_spi_dev = NULL;
 static bool s_initialized = false;
 
 static const int s_cs_pins[SPI_CAM_COUNT] = {
     SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN
 };
 
-/* For camera 3 (index 3), we need to swap device 2's CS pin */
-static int s_dev2_current_cs = -1;
+/* Drive the specified camera's CS pin LOW (assert). */
+static inline void cs_assert(int cam_idx)
+{
+    gpio_set_level((gpio_num_t)s_cs_pins[cam_idx], 0);
+    /* CS setup time — lets the slave's GPIO edge ISR re-enable MISO output
+     * before the first SCLK edge. ~5 µs covers worst-case ISR latency. */
+    esp_rom_delay_us(5);
+}
+
+/* Drive the specified camera's CS pin HIGH (deassert). */
+static inline void cs_deassert(int cam_idx)
+{
+    esp_rom_delay_us(1);    /* minimal hold */
+    gpio_set_level((gpio_num_t)s_cs_pins[cam_idx], 1);
+}
 
 static spi_device_handle_t get_device(int cam_idx)
 {
-    if (cam_idx < SPI_MAX_HW_CS) {
-        return s_spi_dev[cam_idx];
-    }
-
-    /* Camera 3 (index 3): SPI3 only has 3 HW CS slots.
-     * Temporarily swap slot 2 to camera 3's CS pin. */
-    if (s_dev2_current_cs != s_cs_pins[cam_idx]) {
-        ESP_LOGI(TAG, "Swapping CS slot 2: GPIO%d → GPIO%d for camera %d",
-                 s_dev2_current_cs, s_cs_pins[cam_idx], cam_idx + 1);
-        spi_bus_remove_device(s_spi_dev[2]);
-        spi_device_interface_config_t cfg = {
-            .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
-            .spics_io_num = s_cs_pins[cam_idx],
-            .queue_size = 1,
-        };
-        esp_err_t ret = spi_bus_add_device(SPI3_HOST, &cfg, &s_spi_dev[2]);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to swap CS for camera %d: 0x%x", cam_idx + 1, ret);
-            s_dev2_current_cs = -1;
-            return NULL;
-        }
-        s_dev2_current_cs = s_cs_pins[cam_idx];
-    }
-    return s_spi_dev[2];
+    (void)cam_idx;   /* all cameras share one SPI device — CS is software */
+    return s_spi_dev;
 }
 
-/* Restore slot 2 to camera #3 (index 2) after using it for camera #4 */
-static void restore_dev2(void)
-{
-    if (s_dev2_current_cs != s_cs_pins[2] && s_dev2_current_cs >= 0) {
-        spi_bus_remove_device(s_spi_dev[2]);
-        spi_device_interface_config_t cfg = {
-            .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
-            .spics_io_num = s_cs_pins[2],
-            .queue_size = 1,
-        };
-        spi_bus_add_device(SPI3_HOST, &cfg, &s_spi_dev[2]);
-        s_dev2_current_cs = s_cs_pins[2];
-    }
-}
+static void restore_dev2(void) { /* no-op: no CS swap */ }
 
 esp_err_t spi_camera_init(void)
 {
     if (s_initialized) return ESP_OK;
 
-    /* Pre-drive ALL CS pins HIGH before any SPI init to prevent
-     * bus contention from cameras with floating CS lines */
+    /* Configure every CS pin as a GPIO output driven HIGH (deasserted).
+     * With software CS we own these pins for the whole lifetime. */
     for (int i = 0; i < SPI_CAM_COUNT; i++) {
         gpio_config_t cs_cfg = {
             .pin_bit_mask = (1ULL << s_cs_pins[i]),
@@ -123,21 +111,19 @@ esp_err_t spi_camera_init(void)
         return ret;
     }
 
-    /* Register 3 devices (SPI3 max HW CS) for cameras 0-2 */
-    for (int i = 0; i < SPI_MAX_HW_CS; i++) {
-        spi_device_interface_config_t dev_cfg = {
-            .mode = 0,
-            .clock_speed_hz = 10 * 1000 * 1000,
-            .spics_io_num = s_cs_pins[i],
-            .queue_size = 1,
-        };
-        ret = spi_bus_add_device(SPI3_HOST, &dev_cfg, &s_spi_dev[i]);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "SPI device %d (CS=%d) failed: 0x%x", i, s_cs_pins[i], ret);
-            return ret;
-        }
+    /* Register ONE device with software CS — we wrap each transaction in
+     * cs_assert/cs_deassert to pick which slave we're talking to. */
+    spi_device_interface_config_t dev_cfg = {
+        .mode = 0,
+        .clock_speed_hz = 10 * 1000 * 1000,
+        .spics_io_num = -1,     /* software-managed CS */
+        .queue_size = 1,
+    };
+    ret = spi_bus_add_device(SPI3_HOST, &dev_cfg, &s_spi_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI device add failed: 0x%x", ret);
+        return ret;
     }
-    s_dev2_current_cs = s_cs_pins[2];
 
     /* Configure GPIO34 as trigger output (shared by all S3 cameras) */
     gpio_config_t trig_cfg = {
@@ -149,20 +135,23 @@ esp_err_t spi_camera_init(void)
     gpio_set_level(GPIO_NUM_34, 1);
 
     s_initialized = true;
-    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 10MHz, trigger=GPIO34",
+    ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 10MHz, software-CS, trigger=GPIO34",
              SPI_CAM_COUNT, SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN);
     return ESP_OK;
 }
 
-/* Send a command and receive response in one full-duplex transaction */
-static esp_err_t spi_xfer_dev(spi_device_handle_t dev, const uint8_t *tx, uint8_t *rx, size_t len)
+/* Full-duplex SPI transaction wrapped in software-CS for camera cam_idx. */
+static esp_err_t spi_xfer_cam(int cam_idx, const uint8_t *tx, uint8_t *rx, size_t len)
 {
+    cs_assert(cam_idx);
     spi_transaction_t trans = {
         .length = len * 8,
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    return spi_device_transmit(dev, &trans);
+    esp_err_t ret = spi_device_transmit(s_spi_dev, &trans);
+    cs_deassert(cam_idx);
+    return ret;
 }
 
 /**
@@ -171,7 +160,7 @@ static esp_err_t spi_xfer_dev(spi_device_handle_t dev, const uint8_t *tx, uint8_
  * alongside sending a dummy/status command. Because of the 1-transaction
  * lag, we do TWO transactions: first primes the slave, second gets the response.
  */
-static esp_err_t poll_and_get_size(spi_device_handle_t dev, int timeout_ms, uint32_t *out_size)
+static esp_err_t poll_and_get_size(int cam_idx, int timeout_ms, uint32_t *out_size)
 {
     WORD_ALIGNED_ATTR uint8_t tx[8] = {CMD_STATUS, 0, 0, 0, 0, 0, 0, 0};
     WORD_ALIGNED_ATTR uint8_t rx[8] = {0};
@@ -179,13 +168,13 @@ static esp_err_t poll_and_get_size(spi_device_handle_t dev, int timeout_ms, uint
 
     while (elapsed < timeout_ms) {
         /* Transaction 1: send status query, get PREVIOUS response (stale on first call) */
-        esp_err_t ret = spi_xfer_dev(dev, tx, rx, 8);
+        esp_err_t ret = spi_xfer_cam(cam_idx, tx, rx, 8);
         if (ret != ESP_OK) return ret;
 
         /* Transaction 2: send dummy, get the ACTUAL response from transaction 1 */
         WORD_ALIGNED_ATTR uint8_t tx2[8] = {0};
         WORD_ALIGNED_ATTR uint8_t rx2[8] = {0};
-        ret = spi_xfer_dev(dev, tx2, rx2, 8);
+        ret = spi_xfer_cam(cam_idx, tx2, rx2, 8);
         if (ret != ESP_OK) return ret;
 
         uint8_t status = rx2[0];
@@ -256,35 +245,37 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
     *jpeg_size = 0;
     *transfer_ms = 0;
 
-    /* Get the SPI device handle for this camera */
-    spi_device_handle_t dev = get_device(camera_idx);
-    if (!dev) return ESP_ERR_NOT_SUPPORTED;
+    if (!s_spi_dev) return ESP_ERR_NOT_SUPPORTED;
 
     /* Poll for JPEG ready and get size in one step */
-    uint32_t size = 0;
-    esp_err_t ret = poll_and_get_size(dev, 2000, &size);
+    uint32_t jpeg_size_reported = 0;
+    esp_err_t ret = poll_and_get_size(camera_idx, 2000, &jpeg_size_reported);
     if (ret != ESP_OK) return ret;
 
-    /* Allocate PSRAM buffer for the JPEG */
-    uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        ESP_LOGE(TAG, "OOM for JPEG buffer (%lu bytes)", (unsigned long)size);
+    /* We over-read by (PREAMBLE_LEN + SAFETY_STALE_BYTES) bytes so any stale
+     * IDLE-header bytes the slave leaked before processing CMD_READ_DATA get
+     * tolerated — we scan for the magic preamble and align to it. */
+    size_t read_total = jpeg_size_reported + PREAMBLE_LEN + SAFETY_STALE_BYTES;
+
+    /* Allocate PSRAM scratch for the raw transfer (with preamble+padding) */
+    uint8_t *raw = heap_caps_malloc(read_total, MALLOC_CAP_SPIRAM);
+    if (!raw) {
+        ESP_LOGE(TAG, "OOM for raw transfer buffer (%zu bytes)", read_total);
         return ESP_ERR_NO_MEM;
     }
 
     /* Send READ_DATA command */
     WORD_ALIGNED_ATTR uint8_t cmd_tx[4] = {CMD_READ_DATA, 0, 0, 0};
     WORD_ALIGNED_ATTR uint8_t cmd_rx[4] = {0};
-    ret = spi_xfer_dev(dev, cmd_tx, cmd_rx, 4);
+    ret = spi_xfer_cam(camera_idx, cmd_tx, cmd_rx, 4);
     if (ret != ESP_OK) {
-        free(buf);
+        free(raw);
         return ret;
     }
 
-    /* Give slave time to enter data transmit loop */
+    /* Give slave time to transition into DATA mode */
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* Read JPEG data in chunks with inter-chunk delays for bus settling */
     uint32_t t_start = esp_log_timestamp();
 
     WORD_ALIGNED_ATTR uint8_t *chunk_tx = heap_caps_calloc(1, SPI_CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -292,31 +283,29 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
 
     if (!chunk_tx || !chunk_rx) {
         ESP_LOGE(TAG, "OOM for SPI chunk buffers");
-        free(buf);
+        free(raw);
         if (chunk_tx) free(chunk_tx);
         if (chunk_rx) free(chunk_rx);
         return ESP_ERR_NO_MEM;
     }
 
     size_t offset = 0;
-    size_t remaining = size;
+    size_t remaining = read_total;
 
+    /* Toggle CS per chunk — the slave's double-buffered DATA streaming
+     * relies on CS-edge transitions to advance through its queued
+     * transactions. Holding CS asserted across chunks makes the slave
+     * DMA finish after the first chunk and feed zeros for the rest. */
     while (remaining > 0) {
         size_t chunk = remaining > SPI_CHUNK_SIZE ? SPI_CHUNK_SIZE : remaining;
 
-        spi_transaction_t trans = {
-            .length = chunk * 8,
-            .tx_buffer = chunk_tx,
-            .rx_buffer = chunk_rx,
-        };
-
-        ret = spi_device_transmit(dev, &trans);
+        ret = spi_xfer_cam(camera_idx, chunk_tx, chunk_rx, chunk);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "SPI read failed at offset %zu", offset);
             break;
         }
 
-        memcpy(buf + offset, chunk_rx, chunk);
+        memcpy(raw + offset, chunk_rx, chunk);
         offset += chunk;
         remaining -= chunk;
     }
@@ -327,29 +316,74 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
     uint32_t elapsed = esp_log_timestamp() - t_start;
 
     if (ret != ESP_OK) {
-        free(buf);
+        free(raw);
         return ret;
     }
 
-    /* Validate JPEG integrity */
-    bool valid = validate_jpeg_integrity(buf, size);
-    if (valid) {
-        ESP_LOGI(TAG, "JPEG verified: %lu bytes in %lums (%.1f KB/s)",
-                 (unsigned long)size, (unsigned long)elapsed,
-                 elapsed > 0 ? (float)size / elapsed : 0);
-    } else {
-        ESP_LOGW(TAG, "JPEG transfer corrupt: %lu bytes (header: 0x%02X 0x%02X, tail: 0x%02X 0x%02X)",
-                 (unsigned long)size, buf[0], buf[1],
-                 size >= 2 ? buf[size-2] : 0, size >= 1 ? buf[size-1] : 0);
-        free(buf);
+    /* Scan the first (PREAMBLE_LEN + SAFETY_STALE_BYTES) bytes for the magic
+     * 0xDE 0xAD 0xBE 0xEF marker that immediately precedes the JPEG. */
+    size_t scan_limit = PREAMBLE_LEN + SAFETY_STALE_BYTES;
+    if (scan_limit > read_total - 4) scan_limit = read_total - 4;
+    /* We look for the 4-byte magic (last 4 bytes of PREAMBLE). The leading
+     * 8 0xAA bytes are just padding so master has clear non-zero/non-header
+     * bytes preceding the magic — match the magic directly. */
+    const uint8_t *MAGIC = &SPI_PREAMBLE[8];
+    ssize_t magic_offset = -1;
+    for (size_t i = 0; i + 4 <= scan_limit; i++) {
+        if (memcmp(raw + i, MAGIC, 4) == 0) {
+            magic_offset = (ssize_t)i;
+            break;
+        }
+    }
+
+    if (magic_offset < 0) {
+        ESP_LOGW(TAG, "Preamble magic not found in first %zu bytes (hdr: %02X %02X %02X %02X)",
+                 scan_limit, raw[0], raw[1], raw[2], raw[3]);
+        free(raw);
         *jpeg_buf = NULL;
         *jpeg_size = 0;
         *transfer_ms = elapsed;
         return ESP_ERR_INVALID_CRC;
     }
 
-    *jpeg_buf = buf;
-    *jpeg_size = size;
+    size_t jpeg_start = (size_t)magic_offset + 4;
+    if (jpeg_start + jpeg_size_reported > read_total) {
+        ESP_LOGW(TAG, "JPEG truncated: magic@%zd jpeg_start=%zu jpeg_size=%lu read=%zu",
+                 magic_offset, jpeg_start, (unsigned long)jpeg_size_reported, read_total);
+        free(raw);
+        *jpeg_buf = NULL;
+        *jpeg_size = 0;
+        *transfer_ms = elapsed;
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    /* Copy the JPEG payload to its own PSRAM buffer and release the raw scratch */
+    uint8_t *jpeg = heap_caps_malloc(jpeg_size_reported, MALLOC_CAP_SPIRAM);
+    if (!jpeg) {
+        ESP_LOGE(TAG, "OOM for final JPEG buffer");
+        free(raw);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(jpeg, raw + jpeg_start, jpeg_size_reported);
+    free(raw);
+
+    if (!validate_jpeg_integrity(jpeg, jpeg_size_reported)) {
+        ESP_LOGW(TAG, "JPEG aligned via magic but still invalid (magic@%zd hdr=%02X %02X tail=%02X %02X)",
+                 magic_offset, jpeg[0], jpeg[1],
+                 jpeg[jpeg_size_reported - 2], jpeg[jpeg_size_reported - 1]);
+        free(jpeg);
+        *jpeg_buf = NULL;
+        *jpeg_size = 0;
+        *transfer_ms = elapsed;
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    ESP_LOGI(TAG, "JPEG verified: %lu bytes in %lums (magic@%zd, %.1f KB/s)",
+             (unsigned long)jpeg_size_reported, (unsigned long)elapsed, magic_offset,
+             elapsed > 0 ? (float)read_total / elapsed : 0);
+
+    *jpeg_buf = jpeg;
+    *jpeg_size = jpeg_size_reported;
     *transfer_ms = elapsed;
     return ESP_OK;
 }
@@ -409,8 +443,11 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
                 ESP_LOGW(TAG, "Camera %d: FAILED (0x%x)", i + 1, ret);
             }
 
-            /* Brief yield between cameras */
-            vTaskDelay(1);
+            /* Inter-camera settle delay: gives shared MISO bus time to
+             * return to steady state and the next camera's slave task time
+             * to pre-queue its response. Without this, back-to-back selects
+             * of adjacent cameras can see residual driven MISO state. */
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
 
         if (success_count >= 2) break;  /* Good enough for PIMSLO (needs 2+) */

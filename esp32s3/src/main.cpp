@@ -246,6 +246,10 @@ extern "C" void app_main(void) {
     }
 #endif
 
+#if DISABLE_WIFI
+    ESP_LOGI(TAG, "[5/6] WiFi: SKIPPED (DISABLE_WIFI=1 for isolated SPI test)");
+    ESP_LOGI(TAG, "[6/6] HTTP: SKIPPED");
+#else
     // ─── WiFi (dual-SSID) ───────────────────────────────
     ESP_LOGI(TAG, "[5/6] WiFi...");
     statusLED.setState(LEDState::WIFI_CONNECTING);
@@ -262,6 +266,7 @@ extern "C" void app_main(void) {
         captureRequested = true;
     });
     ESP_LOGI(TAG, "[6/6] HTTP: OK, OTA: OK");
+#endif
 
     // ─── RTOS Tasks ─────────────────────────────────────
     ESP_LOGI(TAG, "");

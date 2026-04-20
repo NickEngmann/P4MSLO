@@ -132,7 +132,14 @@
    │  GPIO 38 ├─────────────────┼────────┤ GPIO 9 (MOSI)       │
    │          │                 │        │                      │
    │          │         MISO    │ 330Ω   │                      │
-   │  GPIO 50 ├─────────────────┼─┤/\/├──┤ GPIO 8 (MISO)       │
+   │  GPIO 50 ├──┬──────────────┼─┤/\/├──┤ GPIO 8 (MISO)       │
+   │          │  │              │        │                      │
+   │          │ ┌┴┐             │        │                      │
+   │          │ │ │10KΩ         │        │                      │
+   │          │ └┬┘             │        │                      │
+   │          │  │              │        │                      │
+   │          │ GND  (pulldown at master: anchors MISO          │
+   │          │       when all slaves are tri-stated)           │
    │          │                 │        │                      │
    │          │         CS0     │  10KΩ  │                      │
    │  GPIO 51 ├─────────────────┼──┤/\/├─┤─GPIO 2 (CS)         │
@@ -257,6 +264,58 @@
 
 ---
 
+## Master-Side CLK / MOSI Source Termination (recommended, not yet fitted)
+
+```
+   P4 CLK (GPIO 37) ──┤/\/\/├──── shared CLK bus to all 4 S3 slaves ──→
+                        22–33Ω
+                        (series resistor AT THE P4, close to the pin)
+
+   P4 MOSI (GPIO 38) ──┤/\/\/├──── shared MOSI bus to all 4 S3 slaves ──→
+                         22–33Ω
+```
+
+**Why:** CLK and MOSI each have one driver (P4) and four receivers (S3s) in parallel. The combined input capacitance (≈40–60pF total) forms a low-impedance load at the driver's output, which causes overshoot and ringing on every edge. A small series resistor at the source damps that ringing before it reflects back into the shared bus. This is standard practice for any point-to-multipoint CMOS bus.
+
+**Why 22–33Ω specifically:** at 10MHz SPI the bit period is 100ns. With a 50Ω source impedance and 60pF load, rise time ≈ 3ns — comfortably under 5% of the bit period. 100Ω would push rise time to ~13ns (13% of the period) and is borderline. Anything under 20Ω gives too little damping to matter.
+
+**Status:** not yet fitted in the current prototype. The 10kΩ MISO pull-down + shortened wires got the system to 100% 10/10 GIF success with 4 cameras, so source termination is filed as a v2 PCB improvement rather than a rework-now fix. If future testing shows a regression in first-try success rate, these are the next resistors to add.
+
+---
+
+## Master-Side MISO Pull-Down
+
+```
+   P4 MISO (GPIO 50) ──┬──── shared MISO bus to all 4 S3 slaves ──→
+                       │
+                     ┌─┴─┐
+                     │10K│Ω
+                     │   │
+                     └─┬─┘
+                       │
+                      GND
+                       ↑
+               Anchors MISO at a defined LOW state when
+               all slaves are tri-stated (between slave
+               selects, or when the slave's CS-edge ISR
+               is briefly re-enabling its MISO driver).
+
+               Prevents mid-stream bit ambiguity when the
+               line would otherwise float near V_threshold
+               during tri-state transitions — which was
+               the dominant failure mode for camera 3's
+               CORRUPT transfers with 4 slaves on the bus.
+
+               10KΩ is weak enough that a slave driving
+               HIGH through its 330Ω series resistor still
+               reads ~3.19V (solid logic 1), while strong
+               enough to pull the line LOW when genuinely
+               floating (I = 330µA sink, τ ≈ 200ns at 20pF
+               bus capacitance).
+```
+
+---
+
 ## XIAO ESP32-S3 Sense Internal Wiring
 
 ```
@@ -375,7 +434,9 @@
 
 ---
 
-## Component Bill of Materials (per camera)
+## Component Bill of Materials
+
+### Per-Camera Components (×4)
 
 | Component | Value | Package | Qty | Placement |
 |-----------|-------|---------|-----|-----------|
@@ -383,6 +444,16 @@
 | Capacitor | 100pF | Ceramic, C0G/NP0, 50V | 1 | CLK to GND at S3 end |
 | Resistor | 10KΩ | 1/4W axial or 0805 | 1 | CS to 3.3V pull-up at S3 end |
 
-**Total for 4 cameras**: 4x 330Ω + 4x 100pF + 4x 10KΩ = **12 components**
+### Master-Side (ESP32-P4) Components
+
+| Component | Value | Package | Qty | Placement | Status |
+|-----------|-------|---------|-----|-----------|--------|
+| Resistor | 10KΩ | 1/4W axial or 0805 | 1 | MISO (P4 GPIO 50) to GND — pulldown | **fitted** |
+| Resistor | 22–33Ω | 1/4W axial or 0805 | 1 | CLK (P4 GPIO 37) series termination at source | v2 PCB — not yet fitted |
+| Resistor | 22–33Ω | 1/4W axial or 0805 | 1 | MOSI (P4 GPIO 38) series termination at source | v2 PCB — not yet fitted |
+
+**Currently fitted**: 4× 330Ω + 4× 100pF + 4× 10KΩ (slave CS pullups) + 1× 10KΩ (master MISO pulldown) = **13 components**
+
+**v2 additions**: + 2× 22–33Ω (master CLK/MOSI source termination) = **15 components total**
 
 Plus shared wiring: CLK, MOSI, MISO, TRIGGER bus wires + 4 individual CS wires + GND = **9 wires minimum**

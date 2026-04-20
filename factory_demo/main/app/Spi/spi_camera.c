@@ -29,7 +29,7 @@ static const char *TAG = "spi_cam";
 #define SPI_CHUNK_SIZE    4096
 
 /* Maximum retries per camera for corrupted transfers */
-#define SPI_MAX_RETRIES   2
+#define SPI_MAX_RETRIES   4
 
 /* Slave prepends this preamble to every JPEG stream so the master can skip
  * any stale IDLE-header bytes that leaked in before the slave processed
@@ -450,7 +450,7 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
             vTaskDelay(pdMS_TO_TICKS(50));
         }
 
-        if (success_count >= 2) break;  /* Good enough for PIMSLO (needs 2+) */
+        if (success_count >= SPI_CAM_COUNT) break;  /* All 4 got clean transfers */
         ESP_LOGW(TAG, "Got %d/%d cameras — %s", success_count, SPI_CAM_COUNT,
                  attempt < SPI_MAX_RETRIES ? "retrying..." : "giving up");
     }

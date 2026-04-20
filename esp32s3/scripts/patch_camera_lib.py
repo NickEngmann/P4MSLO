@@ -232,50 +232,19 @@ def patch_now():
                     f.write(ov_content)
                 print("*** Patched ov5640.c: clamp framesize to 5MP (PR #810) ***")
 
-            # --- Patch 5: ov5640.c — increase JPEG PLL for higher FPS ---
-            # Two changes:
-            # a) pclk_div 4->2: doubles PCLK for all resolutions
-            # b) sys_mul: use 200 for all resolutions (stock uses 180 for VGA,
-            #    making VGA slower than 720p which is backwards)
+            # --- Patch 5 REVERTED: keep stock ov5640.c PLL settings ---
+            # Previous versions modified the PLL to double PCLK for higher
+            # streaming FPS, but for still-image point-and-shoot captures
+            # the stock PLL is stable at all temperatures.
+            # The custom PLL pushed the VCO into a marginal region where
+            # the phase-lock range shrank as the chip heated up, causing
+            # intermittent capture failures (NULL returns from
+            # esp_camera_fb_get()). Reverting to stock for thermal stability.
             #
-            # This must be done in the source so the PLL is correct during
-            # esp_camera_init() when the LCD_CAM peripheral configures timing.
+            # If a future change needs higher FPS streaming, prefer
+            # increasing XCLK from 20→40MHz over PLL tweaks.
 
-            # Patch 5a: Force sys_mul=200 for all JPEG resolutions
-            # (remove the if/else that sets 160/180 for smaller frames)
-            old_mul = (
-                '        uint8_t sys_mul = 200;\n'
-                '        if(framesize < FRAMESIZE_QVGA || sensor->xclk_freq_hz == 16000000){\n'
-                '            sys_mul = 160;\n'
-                '        } else if(framesize < FRAMESIZE_XGA){\n'
-                '            sys_mul = 180;\n'
-                '        }'
-            )
-            new_mul = (
-                '        uint8_t sys_mul = 200; // Moment patch: use 200 for all resolutions\n'
-                '        if(sensor->xclk_freq_hz == 16000000){\n'
-                '            sys_mul = 160; // 16MHz XCLK needs lower multiplier\n'
-                '        }'
-            )
-            if old_mul in ov_content:
-                ov_content = ov_content.replace(old_mul, new_mul)
-                print("*** Patched ov5640.c: JPEG PLL multiplier=200 for all resolutions ***")
-
-            # Patch 5b: pclk_div 4->2
-            old_pll = (
-                '        ret = set_pll(sensor, false, sys_mul, 4, 2, false, 2, true, 4);\n'
-                '        //Set PLL: bypass: 0, multiplier: sys_mul, sys_div: 4, pre_div: 2, '
-                'root_2x: 0, pclk_root_div: 2, pclk_manual: 1, pclk_div: 4'
-            )
-            new_pll = (
-                '        ret = set_pll(sensor, false, sys_mul, 3, 2, false, 2, true, 2);\n'
-                '        //Set PLL: sys_div 4->3, pclk_div 4->2 for ~33MHz PCLK (Moment patch)'
-            )
-            if old_pll in ov_content:
-                ov_content = ov_content.replace(old_pll, new_pll)
-                print("*** Patched ov5640.c: JPEG PLL pclk_div 4->2 for higher FPS ***")
-
-            # Write patched file (both 5a and 5b may have modified ov_content)
+            # Write any other changes made to ov5640.c (none currently)
             with open(ov5640_c, "w") as f:
                 f.write(ov_content)
 

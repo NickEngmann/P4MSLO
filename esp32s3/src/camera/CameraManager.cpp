@@ -14,6 +14,8 @@
 #include "esp_camera.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "camera";
 
@@ -50,9 +52,16 @@ bool CameraManager::begin() {
     // Start with max resolution — will be adjusted after sensor detection
     config.frame_size = FRAMESIZE_QSXGA;  // 2592x1944 (OV5640 max)
     config.jpeg_quality = CAMERA_JPEG_QUALITY;
-    config.fb_count = 1;
+    /* fb_count=2 gives the DMA a slack buffer, preventing NULL returns from
+     * esp_camera_fb_get() when timing jitters (WiFi activity, thermal drift).
+     * Documented fix for esp32-camera issue #620. */
+    config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
+
+    /* OV5640 datasheet requires ≥20ms after VDD stable before SCCB is reliable.
+     * Without pwdn/reset pins on the XIAO Sense, we rely on this delay alone. */
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_LOGI(TAG, "Initializing camera...");
     esp_err_t err = esp_camera_init(&config);
@@ -94,9 +103,9 @@ bool CameraManager::begin() {
             _sensorName = "Unknown";
             ESP_LOGW(TAG, "Unknown sensor PID: 0x%04x", pid);
         }
-
-        // Set highest quality
-        sensor->set_quality(sensor, CAMERA_JPEG_QUALITY);
+        /* Note: jpeg_quality is already set via config.jpeg_quality in
+         * esp_camera_init() — don't re-apply via sensor->set_quality(),
+         * which can leave the sensor in a transient state under thermal stress. */
     }
 
     // Test capture to get actual dimensions

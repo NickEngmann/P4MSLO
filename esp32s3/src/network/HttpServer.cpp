@@ -107,6 +107,7 @@ bool HttpServer::registerRoutes() {
         { "/api/v1/factory-reset",HTTP_POST, handleFactoryReset, this },
         { "/api/v1/config/position", HTTP_POST, handleSetPosition, this },
         { "/api/v1/latest-photo",    HTTP_GET,  handleGetLatestPhoto, this },
+        { "/api/v1/reboot",       HTTP_POST, handleReboot,       this },
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
@@ -497,6 +498,21 @@ esp_err_t HttpServer::handleGetLatestPhoto(httpd_req_t *req) {
     free(buf);
     fclose(f);
     return ESP_OK;
+}
+
+// ─── POST /api/v1/reboot ───────────────────────────────
+// Reboots the ESP32-S3 after a brief delay
+esp_err_t HttpServer::handleReboot(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status", "rebooting");
+
+    esp_err_t rc = send_json(req, root);
+
+    // Give the HTTP response time to be sent before rebooting
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+
+    return rc;
 }
 
 #else  // NATIVE_BUILD

@@ -54,5 +54,6 @@ private:
     static esp_err_t handleFactoryReset(httpd_req_t *req);
     static esp_err_t handleSetPosition(httpd_req_t *req);
     static esp_err_t handleGetLatestPhoto(httpd_req_t *req);
+    static esp_err_t handleReboot(httpd_req_t *req);
 #endif
 };

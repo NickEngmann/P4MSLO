@@ -1,4 +1,18 @@
-# WiFi + SPI Coexistence — Analysis & Options
+# WiFi + SPI Coexistence — Analysis & Resolution
+
+## Status (resolved)
+
+This problem is now **solved**. The fix was 33Ω source-termination resistors on the P4 master's CLK and MOSI lines (see [circuit-diagram.md](circuit-diagram.md)). With clean CLK edges, WiFi-related ISR bursts no longer tip marginal SPI transactions over the edge — and the master's control commands over SPI now land cleanly at the slaves (`cam_wifi_on all` reliably brings all 4 cameras onto WiFi, `cam_wifi_off all` takes them back down).
+
+The architecture shipped is:
+- WiFi off by default at boot (`DISABLE_WIFI=1`)
+- P4 master toggles WiFi per-camera or broadcast via SPI control commands (CMD_WIFI_ON=0x04, CMD_WIFI_OFF=0x05, CMD_REBOOT=0x06, CMD_IDENTIFY=0x07)
+- When WiFi is on, HTTP + OTA work as before; when off, SPI bus runs clean
+- Captures are ~95% first-try 4/4 with source termination in place
+
+The analysis below is preserved as historical context for the debugging journey.
+
+---
 
 ## Background
 

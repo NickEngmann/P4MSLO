@@ -388,6 +388,68 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
     return ESP_OK;
 }
 
+esp_err_t spi_camera_send_control(int camera_idx, uint8_t cmd)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (camera_idx < 0 || camera_idx >= SPI_CAM_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!s_spi_dev) return ESP_ERR_NOT_SUPPORTED;
+
+    /* The byte-value / position / timing combinations that survive master→
+     * slave transmission reliably are the ones the poll protocol already
+     * uses: short 8-byte transactions, repeated many times, with command
+     * byte at position 0. Single-shot control transactions got mangled in
+     * various ways (0x04→0x02, 0x10→0x00, 0x41→0x02, byte-4 dropped). So
+     * we brute-force it: send the command as a burst of up-to-10 identical
+     * 8-byte transactions spaced 20ms apart, mimicking poll_and_get_size's
+     * repeat pattern. The slave's scan picks up the command from whichever
+     * transaction landed cleanly. */
+    uint8_t *tx = heap_caps_calloc(1, 8, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint8_t *rx = heap_caps_calloc(1, 8, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!tx || !rx) {
+        if (tx) free(tx);
+        if (rx) free(rx);
+        return ESP_ERR_NO_MEM;
+    }
+    tx[0] = cmd;
+
+    esp_err_t ret = ESP_OK;
+    for (int i = 0; i < 10; i++) {
+        ret = spi_xfer_cam(camera_idx, tx, rx, 8);
+        if (ret != ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    free(tx);
+    free(rx);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Camera %d: sent control cmd 0x%02X", camera_idx + 1, cmd);
+    }
+    return ret;
+}
+
+esp_err_t spi_camera_query_status(int camera_idx, uint8_t *status_byte)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (camera_idx < 0 || camera_idx >= SPI_CAM_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!status_byte) return ESP_ERR_INVALID_ARG;
+    if (!s_spi_dev) return ESP_ERR_NOT_SUPPORTED;
+
+    /* Two 8-byte transactions, same as poll_and_get_size but we just want the
+     * status byte — the slave always pre-fills its IDLE header with current
+     * JPEG/WiFi flags. */
+    WORD_ALIGNED_ATTR uint8_t tx[8] = {CMD_STATUS, 0, 0, 0, 0, 0, 0, 0};
+    WORD_ALIGNED_ATTR uint8_t rx[8] = {0};
+    esp_err_t ret = spi_xfer_cam(camera_idx, tx, rx, 8);
+    if (ret != ESP_OK) return ret;
+
+    WORD_ALIGNED_ATTR uint8_t tx2[8] = {0};
+    WORD_ALIGNED_ATTR uint8_t rx2[8] = {0};
+    ret = spi_xfer_cam(camera_idx, tx2, rx2, 8);
+    if (ret != ESP_OK) return ret;
+
+    *status_byte = rx2[0];
+    return ESP_OK;
+}
+
 esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
                                   uint32_t *total_ms)
 {

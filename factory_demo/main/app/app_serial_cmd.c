@@ -567,6 +567,60 @@ static void dispatch_command(char *line)
         }
     } else if (strcmp(line, "gpio_read") == 0) {
         cmd_gpio_read(arg);
+    } else if (strcmp(line, "cam_wifi_on") == 0 ||
+               strcmp(line, "cam_wifi_off") == 0 ||
+               strcmp(line, "cam_reboot") == 0 ||
+               strcmp(line, "cam_identify") == 0) {
+        /* cam_wifi_on N | cam_wifi_off N | cam_reboot N | cam_identify N
+         * N = 1-4 (camera index 0-3 + 1), or "all" for broadcast */
+        uint8_t cmd_byte = 0;
+        if      (strcmp(line, "cam_wifi_on")  == 0) cmd_byte = SPI_CAM_CMD_WIFI_ON;
+        else if (strcmp(line, "cam_wifi_off") == 0) cmd_byte = SPI_CAM_CMD_WIFI_OFF;
+        else if (strcmp(line, "cam_reboot")   == 0) cmd_byte = SPI_CAM_CMD_REBOOT;
+        else                                         cmd_byte = SPI_CAM_CMD_IDENTIFY;
+
+        spi_camera_init();
+        if (arg && strcmp(arg, "all") == 0) {
+            int ok = 0;
+            for (int i = 0; i < SPI_CAM_COUNT; i++) {
+                if (spi_camera_send_control(i, cmd_byte) == ESP_OK) ok++;
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            cmd_respond("ok %s all (%d/%d sent)", line, ok, SPI_CAM_COUNT);
+        } else {
+            int n = arg ? atoi(arg) : 0;
+            if (n < 1 || n > SPI_CAM_COUNT) {
+                cmd_respond("error %s: usage N (1-%d) | all", line, SPI_CAM_COUNT);
+            } else {
+                esp_err_t ret = spi_camera_send_control(n - 1, cmd_byte);
+                cmd_respond("%s %s cam=%d cmd=0x%02X ret=0x%x",
+                            ret == ESP_OK ? "ok" : "error",
+                            line, n, cmd_byte, ret);
+            }
+        }
+    } else if (strcmp(line, "cam_status") == 0) {
+        /* cam_status [N]  → query one camera, or all if no arg */
+        spi_camera_init();
+        int start = 0, end = SPI_CAM_COUNT;
+        if (arg && *arg) {
+            int n = atoi(arg);
+            if (n >= 1 && n <= SPI_CAM_COUNT) { start = n - 1; end = n; }
+        }
+        for (int i = start; i < end; i++) {
+            uint8_t s = 0;
+            esp_err_t r = spi_camera_query_status(i, &s);
+            if (r == ESP_OK) {
+                cmd_respond("cam %d: 0x%02X jpeg=%d wifi=%d connected=%d",
+                            i + 1, s,
+                            (s & SPI_CAM_STATUS_JPEG_READY)    ? 1 : 0,
+                            (s & SPI_CAM_STATUS_WIFI_ACTIVE)   ? 1 : 0,
+                            (s & SPI_CAM_STATUS_WIFI_CONNECTED) ? 1 : 0);
+            } else {
+                cmd_respond("cam %d: no response (0x%x)", i + 1, r);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        cmd_respond("ok cam_status");
     } else if (strcmp(line, "status") == 0) {
         cmd_status();
     } else if (strcmp(line, "menu_goto") == 0) {

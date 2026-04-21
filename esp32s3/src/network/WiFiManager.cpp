@@ -71,17 +71,22 @@ bool WiFiManager::connect(const char *ssid, const char *password) {
     _reconnectAttempts = 0;
     s_instance = this;
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    /* netif + driver init only happens once per boot — idempotent restart */
+    if (!_driverInitialized) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        esp_netif_create_default_wifi_sta();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(
+            WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(
+            IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+        _driverInitialized = true;
+    }
 
     wifi_config_t wifi_config = {};
     strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
@@ -96,6 +101,17 @@ bool WiFiManager::connect(const char *ssid, const char *password) {
     return true;
 }
 
+void WiFiManager::stop() {
+    if (!_driverInitialized) return;
+    if (_state == WiFiState::CONNECTED || _state == WiFiState::CONNECTING) {
+        esp_wifi_disconnect();
+    }
+    esp_wifi_stop();
+    _state = WiFiState::DISCONNECTED;
+    _ipAddress.clear();
+    ESP_LOGI(TAG, "WiFi stopped");
+}
+
 #else  // NATIVE_BUILD
 
 WiFiManager::WiFiManager()
@@ -107,6 +123,7 @@ bool WiFiManager::beginWithFallback(const char*, const char*, const char*, const
     _ipAddress = "192.168.1.100";
     return true;
 }
+void WiFiManager::stop() { _state = WiFiState::DISCONNECTED; _ipAddress.clear(); }
 bool WiFiManager::connect(const char*, const char*) { return true; }
 
 #endif

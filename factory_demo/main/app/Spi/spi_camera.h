@@ -57,6 +57,39 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
 esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
                                   uint32_t *total_ms);
 
+/** Control commands matching esp32s3/src/spi/SPISlave.h. Values chosen to be
+ *  adjacent to CMD_READ_DATA (0x03) since low-byte wire patterns transmit
+ *  reliably from P4 master to S3 slave; higher-bit values get mangled. */
+#define SPI_CAM_CMD_WIFI_ON    0x04
+#define SPI_CAM_CMD_WIFI_OFF   0x05
+#define SPI_CAM_CMD_REBOOT     0x06
+#define SPI_CAM_CMD_IDENTIFY   0x07
+
+/** Status byte flag bits in the IDLE poll response */
+#define SPI_CAM_STATUS_JPEG_READY       0x01
+#define SPI_CAM_STATUS_WIFI_ACTIVE      0x02
+#define SPI_CAM_STATUS_WIFI_CONNECTED   0x04
+
+/**
+ * @brief Send a one-byte control command to a single camera.
+ *
+ * Use this to ask a slave to start/stop WiFi, reboot, or blink for
+ * identification. The slave executes the command asynchronously; this call
+ * returns as soon as the SPI transaction completes.
+ *
+ * @param camera_idx  Camera index (0–3)
+ * @param cmd         One of SPI_CAM_CMD_*
+ */
+esp_err_t spi_camera_send_control(int camera_idx, uint8_t cmd);
+
+/**
+ * @brief Poll one camera and return its status byte (JPEG/WiFi flags).
+ *
+ * @param camera_idx  Camera index (0–3)
+ * @param[out] status_byte  Status flag bits (see SPI_CAM_STATUS_* above)
+ */
+esp_err_t spi_camera_query_status(int camera_idx, uint8_t *status_byte);
+
 #ifdef __cplusplus
 }
 #endif

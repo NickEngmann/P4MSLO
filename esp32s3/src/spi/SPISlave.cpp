@@ -38,10 +38,15 @@ static const char *TAG = "spi_slave";
 
 #define CHUNK_SIZE    4096
 
-/* Commands from master */
-#define CMD_STATUS      0x01
-#define CMD_GET_SIZE    0x02
-#define CMD_READ_DATA   0x03
+/* Commands from master — kept as macros for readability inside this file.
+ * Public values live in SPISlave.h as SPI_CMD_* constexprs. */
+#define CMD_STATUS      SPI_CMD_STATUS
+#define CMD_GET_SIZE    SPI_CMD_GET_SIZE
+#define CMD_READ_DATA   SPI_CMD_READ_DATA
+#define CMD_WIFI_ON     SPI_CMD_WIFI_ON
+#define CMD_WIFI_OFF    SPI_CMD_WIFI_OFF
+#define CMD_REBOOT      SPI_CMD_REBOOT
+#define CMD_IDENTIFY    SPI_CMD_IDENTIFY
 
 /**
  * CS-gated MISO tri-state ISR.
@@ -101,8 +106,16 @@ static void install_miso_tristate(void)
 }
 
 SPISlave::SPISlave()
-    : _jpegData(nullptr), _jpegLen(0), _initialized(false)
+    : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0), _controlCb(nullptr)
 {
+}
+
+void SPISlave::setWifiStatus(bool active, bool connected)
+{
+    uint8_t flags = 0;
+    if (active)    flags |= SPI_STATUS_WIFI_ACTIVE;
+    if (connected) flags |= SPI_STATUS_WIFI_CONNECTED;
+    _statusFlags = flags;
 }
 
 bool SPISlave::begin()
@@ -296,7 +309,8 @@ void SPISlave::spiTask(void *param)
     while (true) {
         /* IDLE: pre-fill header and do one synchronous transaction */
         memset(tx_buf, 0, CHUNK_SIZE);
-        uint8_t status = self->_jpegData ? 0x01 : 0x00;
+        uint8_t status = self->_statusFlags;
+        if (self->_jpegData) status |= SPI_STATUS_JPEG_READY;
         uint32_t size = (uint32_t)self->_jpegLen;
         tx_buf[0] = status;
         tx_buf[1] = (size >> 0) & 0xFF;
@@ -313,20 +327,36 @@ void SPISlave::spiTask(void *param)
         if (ret != ESP_OK) continue;
 
         uint8_t cmd = rx_buf[0];
+        /* Scan the first 8 bytes of rx for control command values —
+         * master embeds them at offset 4 to dodge first-byte transmission
+         * issues (see spi_camera_send_control on the P4). */
+        for (int i = 0; i < 8; i++) {
+            uint8_t b = rx_buf[i];
+            if (b == CMD_WIFI_ON || b == CMD_WIFI_OFF ||
+                b == CMD_REBOOT  || b == CMD_IDENTIFY) {
+                cmd = b;
+                break;
+            }
+        }
         if (cmd == CMD_READ_DATA && self->_jpegData) {
             ESP_LOGI(TAG, "CMD_READ_DATA → DATA (%zu bytes)", self->_jpegLen);
             streamJpegData(self->_jpegData, self->_jpegLen, data_tx, data_rx);
             ESP_LOGI(TAG, "DATA transfer complete");
+        } else if (cmd == CMD_WIFI_ON || cmd == CMD_WIFI_OFF ||
+                   cmd == CMD_REBOOT  || cmd == CMD_IDENTIFY) {
+            ESP_LOGI(TAG, "Control cmd 0x%02X", cmd);
+            if (self->_controlCb) self->_controlCb(cmd);
         }
     }
 }
 
 #else
 
-SPISlave::SPISlave() : _jpegData(nullptr), _jpegLen(0), _initialized(false) {}
+SPISlave::SPISlave() : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0), _controlCb(nullptr) {}
 bool SPISlave::begin() { return false; }
 void SPISlave::stop() {}
 void SPISlave::setJpegData(const uint8_t *, size_t) {}
 void SPISlave::clearJpegData() {}
+void SPISlave::setWifiStatus(bool, bool) {}
 
 #endif

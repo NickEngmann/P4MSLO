@@ -59,12 +59,14 @@
 // Set to 1 to enable SPI slave mode (disables SD card)
 #define ENABLE_SPI_SLAVE        1
 
-// Set to 1 to skip WiFi + HTTP server startup entirely. Used for isolated
-// SPI-slave testing: without WiFi, the S3 has no radio ISR traffic, no
-// connection churn, and full CPU/RAM available for the SPI slave task.
-// (Caveat: when this is 1, the only way to reprogram the device is USB —
-// OTA requires WiFi.)
+// Set to 1 to skip WiFi + HTTP server startup entirely (USB-only firmware
+// updates). Set to 0 for normal "WiFi always on" mode.
 #define DISABLE_WIFI            1
+
+// WiFi stays OFF at boot. The P4 master is the sole controller of when
+// WiFi comes up, via SPI CMD_WIFI_ON/OFF. Boot is silent, SPI is reliable
+// from t=0. (SPI control command byte corruption is being debugged with a
+// scope — no fallback boot window.)
 
 // NVS
 #define NVS_NAMESPACE           "moment"

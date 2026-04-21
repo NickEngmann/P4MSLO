@@ -27,9 +27,14 @@ public:
     WiFiManager();
     ~WiFiManager();
 
-    // Connect with primary SSID, fall back to backup if primary fails
+    // Connect with primary SSID, fall back to backup if primary fails.
+    // Idempotent — safe to call again after stop() to re-enable WiFi.
     bool beginWithFallback(const char *ssid1, const char *pass1,
                            const char *ssid2, const char *pass2);
+
+    // Disconnect and stop the WiFi radio. Keeps the WiFi driver initialized
+    // so beginWithFallback() can restart quickly without re-doing netif init.
+    void stop();
 
     WiFiState getState() const { return _state; }
     std::string getIPAddress() const { return _ipAddress; }
@@ -50,4 +55,5 @@ private:
     bool connect(const char *ssid, const char *password);
     std::string _ssid;
     std::string _password;
+    bool _driverInitialized = false;   // netif + esp_wifi_init done once per boot
 };

@@ -264,22 +264,28 @@
 
 ---
 
-## Master-Side CLK / MOSI Source Termination (recommended, not yet fitted)
+## Master-Side CLK / MOSI Source Termination (fitted)
 
 ```
    P4 CLK (GPIO 37) ──┤/\/\/├──── shared CLK bus to all 4 S3 slaves ──→
-                        22–33Ω
+                        33Ω
                         (series resistor AT THE P4, close to the pin)
 
    P4 MOSI (GPIO 38) ──┤/\/\/├──── shared MOSI bus to all 4 S3 slaves ──→
-                         22–33Ω
+                         33Ω
 ```
 
 **Why:** CLK and MOSI each have one driver (P4) and four receivers (S3s) in parallel. The combined input capacitance (≈40–60pF total) forms a low-impedance load at the driver's output, which causes overshoot and ringing on every edge. A small series resistor at the source damps that ringing before it reflects back into the shared bus. This is standard practice for any point-to-multipoint CMOS bus.
 
-**Why 22–33Ω specifically:** at 10MHz SPI the bit period is 100ns. With a 50Ω source impedance and 60pF load, rise time ≈ 3ns — comfortably under 5% of the bit period. 100Ω would push rise time to ~13ns (13% of the period) and is borderline. Anything under 20Ω gives too little damping to matter.
+**Why 33Ω specifically:** at 10 MHz SPI the bit period is 100 ns. With ~40–50Ω effective source impedance (P4 output + 33Ω) and 60pF load, rise time ≈ 3 ns — comfortably under 5% of the bit period. 22Ω is also a valid pick; 100Ω would push rise time to ~13 ns (13% of the period) and is borderline.
 
-**Status:** not yet fitted in the current prototype. The 10kΩ MISO pull-down + shortened wires got the system to 100% 10/10 GIF success with 4 cameras, so source termination is filed as a v2 PCB improvement rather than a rework-now fix. If future testing shows a regression in first-try success rate, these are the next resistors to add.
+**What this fixed (empirically observed):**
+
+1. **Capture reliability jumped from ~40% first-try success to ~95%.** Before source termination: cameras 1 and 4 (on the "ends" of the physical bus) would fail 60–100% of transfers. After: 5/5 runs saving 4/4 cameras with 19/20 first-try success.
+
+2. **SPI control-command byte corruption was fixed.** Previously, short single-shot transactions from master to slave would sometimes have their first byte mangled (e.g., 0x04 arriving as 0x02 — a one-bit-position shift consistent with the slave sampling on the wrong clock edge because of slow CLK rise). With clean edges, `cam_wifi_on all` now correctly wakes all 4 cameras, `cam_wifi_off all` shuts them down, etc.
+
+Turns out both problems were signal integrity on the CLK/MOSI rails, cured by the same two resistors. USB-powering the cameras is also fine now (previously it caused additional noise that degraded 3 of 4 cameras).
 
 ---
 
@@ -449,11 +455,16 @@
 | Component | Value | Package | Qty | Placement | Status |
 |-----------|-------|---------|-----|-----------|--------|
 | Resistor | 10KΩ | 1/4W axial or 0805 | 1 | MISO (P4 GPIO 50) to GND — pulldown | **fitted** |
-| Resistor | 22–33Ω | 1/4W axial or 0805 | 1 | CLK (P4 GPIO 37) series termination at source | v2 PCB — not yet fitted |
-| Resistor | 22–33Ω | 1/4W axial or 0805 | 1 | MOSI (P4 GPIO 38) series termination at source | v2 PCB — not yet fitted |
+| Resistor | 33Ω | 1/4W axial or 0805 | 1 | CLK (P4 GPIO 37) series termination at source | **fitted** |
+| Resistor | 33Ω | 1/4W axial or 0805 | 1 | MOSI (P4 GPIO 38) series termination at source | **fitted** |
 
-**Currently fitted**: 4× 330Ω + 4× 100pF + 4× 10KΩ (slave CS pullups) + 1× 10KΩ (master MISO pulldown) = **13 components**
+**All fitted**: 4× 330Ω + 4× 100pF + 4× 10KΩ (slave CS pullups) + 1× 10KΩ (master MISO pulldown) + 2× 33Ω (master CLK/MOSI source termination) = **15 components total**
 
-**v2 additions**: + 2× 22–33Ω (master CLK/MOSI source termination) = **15 components total**
+### Planned for v2 PCB (not yet built)
+
+| Component | Value | Package | Qty | Placement |
+|-----------|-------|---------|-----|-----------|
+| SN74HC125N | — | DIP-14 or SOIC-14 | 1 | Quad tri-state buffer on MISO lines — one gate per camera, each gate's OE tied to that camera's CS. Permanently eliminates the ESP-IDF SPI-slave MISO contention ([#8638](https://github.com/espressif/esp-idf/issues/8638)). See [SN74AHCT125N-circuit.md](SN74AHCT125N-circuit.md) for detail. |
+| Ceramic cap | 100nF X7R | 0603 | 1 | Decoupling for the '125 |
 
 Plus shared wiring: CLK, MOSI, MISO, TRIGGER bus wires + 4 individual CS wires + GND = **9 wires minimum**

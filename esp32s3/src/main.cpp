@@ -12,7 +12,9 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
@@ -70,6 +72,99 @@ static void savePhotoCounter() {
         nvs_close(handle);
     }
 }
+
+/* ─────────── SPI-controlled WiFi / control-command subsystem ─────────────
+ *
+ * With DISABLE_WIFI=1 WiFi does not start at boot. The P4 master can send
+ * one of four SPI control commands to toggle WiFi, reboot, or blink the LED:
+ *
+ *   CMD_WIFI_ON  — start WiFi + HTTP server (for OTA or debugging)
+ *   CMD_WIFI_OFF — stop HTTP + WiFi (returns to silent low-power state)
+ *   CMD_REBOOT   — esp_restart() after a short delay
+ *   CMD_IDENTIFY — blink NeoPixel for a few seconds so user can physically
+ *                  spot which camera responded (useful when 4 look the same)
+ *
+ * The SPI task cannot call esp_wifi_start directly (it would block the
+ * master-facing transaction loop and WiFi init touches esp_netif which isn't
+ * thread-safe from that context). So SPI enqueues a command and a dedicated
+ * control task dequeues and executes. */
+static QueueHandle_t s_controlQueue = nullptr;
+static bool          s_wifiStarted  = false;
+
+static void wifi_start_subsystem() {
+    if (s_wifiStarted) {
+        spiSlave.setWifiStatus(true, wifiManager.isConnected());
+        return;
+    }
+    ESP_LOGI(TAG, "[SPI control] WiFi → ON");
+    statusLED.setState(LEDState::WIFI_CONNECTING);
+    wifiManager.beginWithFallback(
+        WIFI_SSID_PRIMARY, WIFI_PASS_PRIMARY,
+        WIFI_SSID_BACKUP,  WIFI_PASS_BACKUP
+    );
+    otaManager.markValid();
+    httpServer.begin(&cameraManager, &sdCardManager, &otaManager);
+    httpServer.onCaptureRequest([]() { captureRequested = true; });
+    s_wifiStarted = true;
+    spiSlave.setWifiStatus(true, wifiManager.isConnected());
+}
+
+static void wifi_stop_subsystem() {
+    if (!s_wifiStarted) {
+        spiSlave.setWifiStatus(false, false);
+        return;
+    }
+    ESP_LOGI(TAG, "[SPI control] WiFi → OFF");
+    httpServer.stop();
+    wifiManager.stop();
+    s_wifiStarted = false;
+    spiSlave.setWifiStatus(false, false);
+    statusLED.setState(LEDState::READY);
+}
+
+static void do_identify_blink() {
+    ESP_LOGI(TAG, "[SPI control] IDENTIFY — blinking for physical identification");
+    for (int i = 0; i < 10; i++) {
+        statusLED.setState(LEDState::CAPTURING);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        statusLED.setState(LEDState::READY);
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+}
+
+static void task_control(void *arg) {
+    uint8_t cmd;
+    while (xQueueReceive(s_controlQueue, &cmd, portMAX_DELAY) == pdPASS) {
+        switch (cmd) {
+            case SPI_CMD_WIFI_ON:  wifi_start_subsystem(); break;
+            case SPI_CMD_WIFI_OFF: wifi_stop_subsystem();  break;
+            case SPI_CMD_IDENTIFY: do_identify_blink();     break;
+            case SPI_CMD_REBOOT:
+                ESP_LOGW(TAG, "[SPI control] REBOOT requested — restarting in 100ms");
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_restart();
+                break;
+            default:
+                ESP_LOGW(TAG, "[SPI control] unknown cmd 0x%02X", cmd);
+                break;
+        }
+    }
+}
+
+/* Periodically syncs the WiFi-connected flag in the SPI status byte (master
+ * polls this to learn when WiFi finished associating). */
+static void task_wifi_status_sync(void *arg) {
+    bool lastConnected = false;
+    while (true) {
+        bool c = s_wifiStarted && wifiManager.isConnected();
+        if (c != lastConnected) {
+            spiSlave.setWifiStatus(s_wifiStarted, c);
+            lastConnected = c;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 
 static void doCapture() {
 #if ENABLE_SPI_SLAVE
@@ -231,6 +326,18 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "[4/6] SPI Slave...");
     if (spiSlave.begin()) {
         ESP_LOGI(TAG, "[4/6] SPI Slave: OK (SD card disabled)");
+
+        // Control-command plumbing: SPI task enqueues, control task executes
+        s_controlQueue = xQueueCreate(4, sizeof(uint8_t));
+        spiSlave.setControlCallback([](uint8_t cmd) {
+            if (s_controlQueue) {
+                xQueueSend(s_controlQueue, &cmd, 0);
+            }
+        });
+        xTaskCreatePinnedToCore(task_control, "SpiCtrl",
+                                8192, nullptr, 5, nullptr, 0);
+        xTaskCreatePinnedToCore(task_wifi_status_sync, "WiFiSync",
+                                2048, nullptr, 2, nullptr, 0);
     } else {
         ESP_LOGE(TAG, "[4/6] SPI Slave: FAILED");
     }
@@ -247,8 +354,8 @@ extern "C" void app_main(void) {
 #endif
 
 #if DISABLE_WIFI
-    ESP_LOGI(TAG, "[5/6] WiFi: SKIPPED (DISABLE_WIFI=1 for isolated SPI test)");
-    ESP_LOGI(TAG, "[6/6] HTTP: SKIPPED");
+    ESP_LOGI(TAG, "[5/6] WiFi: OFF by default — send SPI CMD_WIFI_ON to enable");
+    ESP_LOGI(TAG, "[6/6] HTTP: not started (starts when WiFi does)");
 #else
     // ─── WiFi (dual-SSID) ───────────────────────────────
     ESP_LOGI(TAG, "[5/6] WiFi...");

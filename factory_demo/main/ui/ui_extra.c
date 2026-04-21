@@ -924,6 +924,10 @@ static void ui_extra_leaving_main(void)
     if (ui_PanelHomeBackground) {
         lv_obj_add_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_HIDDEN);
     }
+    /* If the previous page was GIFS, its ~7 MB decode+canvas buffers are
+     * still allocated — stop playback so subsequent camera pages can
+     * actually reallocate their viewfinder. Idempotent. */
+    app_gifs_stop();
 }
 
 /**
@@ -932,6 +936,10 @@ static void ui_extra_leaving_main(void)
 static void ui_extra_redirect_to_main_page(void)
 {
     current_page = UI_PAGE_MAIN;
+
+    /* Stop GIF playback if we're coming from the gallery. Matches what
+     * leaving_main() does for non-MAIN destinations. */
+    app_gifs_stop();
 
     ui_extra_clear_page();
 

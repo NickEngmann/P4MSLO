@@ -1693,6 +1693,10 @@ void ui_extra_btn_up(void)
 
         case UI_PAGE_GIFS:
             app_gifs_prev();
+            /* Auto-play the just-selected entry (GIF or JPEG preview).
+             * No "press to play" step — navigation is preview-as-you-go,
+             * like scrubbing through videos in a gallery. */
+            if (app_gifs_get_count() > 0) app_gifs_play_current();
             break;
 
         default:
@@ -1778,6 +1782,8 @@ void ui_extra_btn_down(void)
 
         case UI_PAGE_GIFS:
             app_gifs_next();
+            /* Auto-play the just-selected entry — see btn_up comment. */
+            if (app_gifs_get_count() > 0) app_gifs_play_current();
             break;
 
         default:

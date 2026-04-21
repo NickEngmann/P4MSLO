@@ -32,13 +32,26 @@ int gif_decoder_get_width(gif_decoder_t *dec);
 int gif_decoder_get_height(gif_decoder_t *dec);
 
 /**
- * @brief Decode the next frame into an RGB565 buffer
- * @param dec       Decoder context
- * @param rgb565    Output buffer (must be width*height*2 bytes)
- * @param[out] delay_cs  Frame delay in centiseconds
- * @return ESP_OK on success, ESP_ERR_NOT_FOUND when all frames decoded
+ * @brief Decode the next frame directly into a scaled RGB565 buffer.
+ *
+ * The decoder feeds its LZW output into a 1-row-wide scanline scratch
+ * owned by the decoder (~src_w bytes), then nearest-neighbor scales each
+ * source row that maps to a new output row into `target_rgb565`. It never
+ * materializes the full-resolution RGB565 intermediate, so peak memory
+ * is bounded regardless of GIF dimensions.
+ *
+ * @param dec             Decoder context.
+ * @param target_rgb565   Output buffer (`target_w * target_h * 2` bytes).
+ *                        Typically this is the LCD canvas (240×240×2).
+ * @param target_w        Target (output) width in pixels.
+ * @param target_h        Target (output) height in pixels.
+ * @param[out] delay_cs   Frame delay in centiseconds.
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND when all frames decoded.
  */
-esp_err_t gif_decoder_next_frame(gif_decoder_t *dec, uint16_t *rgb565, int *delay_cs);
+esp_err_t gif_decoder_next_frame(gif_decoder_t *dec,
+                                  uint16_t *target_rgb565,
+                                  int target_w, int target_h,
+                                  int *delay_cs);
 
 /**
  * @brief Reset to the first frame (seek to beginning)

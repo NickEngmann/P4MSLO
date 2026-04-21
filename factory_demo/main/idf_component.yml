@@ -21,3 +21,19 @@ dependencies:
   espressif/esp_h264:
     version: "==1.0.3"
     public: true
+
+  # Phase 5: WiFi + OTA via ESP32-C6 coprocessor.
+  # esp_wifi_remote routes esp_wifi_* calls through a "host" side interface to
+  # the C6 which runs the radio firmware (esp_hosted-slave). The P4-EYE has a
+  # C6 on-board with a single enable pin (BSP_C6_EN_PIN = GPIO9) defined in
+  # the BSP. The remaining SDIO / UART comms pins for esp_hosted are NOT
+  # defined in the current BSP — they need verification against the P4-EYE
+  # schematic before this integration can actually transfer data. See
+  # docs/phase-plan.md Phase 5 for the unblock path.
+  espressif/esp_wifi_remote:
+    version: "*"
+    rules:
+      - if: "target == esp32p4"
+
+  espressif/mdns:
+    version: "^1.4.0"

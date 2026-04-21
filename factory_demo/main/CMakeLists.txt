@@ -20,6 +20,9 @@ file(GLOB APP_SPI_C_SOURCES ${APP_DIR}/Spi/*.c)
 # Collect PIMSLO pipeline source files
 file(GLOB APP_PIMSLO_C_SOURCES ${APP_DIR}/Pimslo/*.c)
 
+# Collect P4 network (WiFi via C6 + HTTP + OTA) source files
+file(GLOB APP_NET_C_SOURCES ${APP_DIR}/Net/*.c)
+
 # Combine all app source files
 set(APP_ALL_SOURCES
     ${APP_CORE_C_SOURCES}
@@ -30,14 +33,16 @@ set(APP_ALL_SOURCES
     ${APP_GIF_ASM_SOURCES}
     ${APP_SPI_C_SOURCES}
     ${APP_PIMSLO_C_SOURCES}
+    ${APP_NET_C_SOURCES}
 )
 
 set(LV_UI_DIR ui)
 file(GLOB_RECURSE LV_UI_SOURCES ${LV_UI_DIR}/*.c)
 
 idf_component_register(SRCS "main.c" ${LV_UI_SOURCES} ${APP_ALL_SOURCES}
-                    INCLUDE_DIRS "." ${LV_UI_DIR} ${APP_DIR} ${APP_DIR}/AI ${APP_DIR}/Video ${APP_DIR}/Gif ${APP_DIR}/Spi ${APP_DIR}/Pimslo
-                    REQUIRES esp_driver_ppa esp_driver_spi nvs_flash human_face_detect pedestrian_detect coco_detect esp_painter)
+                    INCLUDE_DIRS "." ${LV_UI_DIR} ${APP_DIR} ${APP_DIR}/AI ${APP_DIR}/Video ${APP_DIR}/Gif ${APP_DIR}/Spi ${APP_DIR}/Pimslo ${APP_DIR}/Net
+                    REQUIRES esp_driver_ppa esp_driver_spi nvs_flash human_face_detect pedestrian_detect coco_detect esp_painter
+                             esp_wifi esp_netif esp_http_server app_update esp_https_ota lwip)
 
 # Optimize GIF encoder and LZW at -O2 for maximum performance (rest of project uses -Og)
 set_source_files_properties(

@@ -28,6 +28,7 @@
 #include "ui_extra.h"
 #include "app_gifs.h"
 #include "app_pimslo.h"
+#include "app_p4_net.h"
 #include "spi_camera.h"
 
 static const char *TAG = "serial_cmd";
@@ -654,6 +655,21 @@ static void dispatch_command(char *line)
         spi_camera_init();
         esp_err_t r = spi_camera_autofocus_all(2000);
         cmd_respond("%s cam_af", r == ESP_OK ? "ok" : "error");
+    } else if (strcmp(line, "wifi_start") == 0) {
+        esp_err_t r = app_p4_net_start();
+        char ip[16] = {0};
+        app_p4_net_get_ip(ip, sizeof(ip));
+        cmd_respond("%s wifi_start connected=%d ip=%s",
+                    r == ESP_OK ? "ok" : "error",
+                    app_p4_net_is_connected() ? 1 : 0, ip);
+    } else if (strcmp(line, "wifi_stop") == 0) {
+        esp_err_t r = app_p4_net_stop();
+        cmd_respond("%s wifi_stop", r == ESP_OK ? "ok" : "error");
+    } else if (strcmp(line, "wifi_status") == 0) {
+        char ip[16] = {0};
+        app_p4_net_get_ip(ip, sizeof(ip));
+        cmd_respond("wifi connected=%d ip=%s",
+                    app_p4_net_is_connected() ? 1 : 0, ip);
     } else if (strcmp(line, "cam_status") == 0) {
         /* cam_status [N]  → query one camera, or all if no arg */
         spi_camera_init();

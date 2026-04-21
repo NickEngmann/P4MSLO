@@ -244,7 +244,36 @@ Settings toggle (per user):
 
 ---
 
-## Phase 5 — P4 OTA via ESP32-C6 (MVP)
+## Phase 5 — P4 OTA via ESP32-C6 (MVP) 🟨 PARTIAL (code shipped, on-device WiFi unverified)
+
+**Shipped:**
+- ~~`espressif/esp_wifi_remote` + auto-resolved `esp_hosted` + `wifi_remote_over_eppp` managed components added (target=esp32p4)~~ ✓
+- ~~`espressif/mdns` managed component added~~ ✓
+- ~~`factory_demo/main/wifi_config.h` with hardcoded creds matching the PIMSLO cameras' "The Garden" SSID~~ ✓
+- ~~`factory_demo/main/app/Net/app_p4_net.[ch]` — C6 enable via BSP_C6_EN_PIN, WiFi STA init, event-driven DHCP, mDNS (`pimslo-p4.local`), and HTTP server~~ ✓
+- ~~HTTP endpoints: `GET /api/v1/status` (fw version, uptime, free heap, IP) and `POST /api/v1/ota/upload` (accepts firmware.bin, writes to OTA partition, reboots)~~ ✓
+- ~~Serial commands: `wifi_start`, `wifi_stop`, `wifi_status`~~ ✓
+- ~~WiFi is OFF by default at boot — zero regression risk to the SPI capture flow until user explicitly runs `wifi_start` (same opt-in pattern we use on the S3 cameras with `DISABLE_WIFI=1`)~~ ✓
+
+**Deferred — on-device WiFi connection hasn't been verified**
+The CMake build resolves cleanly, but actually *associating to WiFi* requires the esp_hosted transport (SPI or SDIO) between the P4 and the onboard C6 to be configured for the right pins. The current `esp32_p4_eye` BSP defines ONLY `BSP_C6_EN_PIN` (GPIO9) — the SDIO/SPI data pins for coprocessor comms are not exposed by the BSP and likely need verification against the P4-EYE schematic.
+
+Unblock path once someone can look at the schematic or run the test board:
+1. Flash the committed firmware and run `wifi_start` via serial.
+2. Watch for `[p4_net] got IP: 192.168.x.y` in the log. If yes — we're done.
+3. If `esp_wifi_init` fails or connection times out, look at `sdkconfig` → "Wi-Fi Remote over EPPP" → transport type (UART vs SPI vs SDIO) and pin numbers, and match them to the P4-EYE schematic. Likely candidates for SPI transport: MOSI/MISO/SCLK/CS/INTR on pins currently used by ESP-HOSTED defaults (MOSI=23/MISO=19/SCLK=18/CS=5/INTR=17 per `wifi_remote_over_eppp/Kconfig`).
+4. Separately verify that the C6 has `esp_hosted-slave` firmware on it. Fresh dev boards often ship with a placeholder C6 image — if WiFi init works but scan returns nothing, the C6 side needs its own slave firmware flash.
+5. After WiFi works, re-run the 4-camera SPI capture test to confirm WiFi doesn't destabilize the shared bus. If it does, revisit the mitigation plan in the original Phase 5 notes (TX power, power-save disable, or button-gated activation).
+
+**Deferred — "live log streaming" and "remote shell"** endpoints as per original MVP scope decision.
+
+### Verified (what CI-equivalent checks caught)
+- P4 ESP-IDF build: compiles clean, factory_demo.bin 2.94 MB (72% partition free, +180 KB for WiFi/HTTP/OTA/mDNS)
+- 60/60 host tests pass
+- No project-local warnings introduced (only pre-existing `compute_box_stats defined but not used` in gif_quantize.c)
+- Runtime WiFi connection: UNVERIFIED (requires hardware + schematic confirmation)
+
+### ~~Original plan~~
 
 **Goal**: OTA-update the P4 firmware without plugging in USB.
 

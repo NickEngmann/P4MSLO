@@ -709,20 +709,16 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
             // Reset photo flag and take a photo
             camera_state.flags.is_take_photo = false;
 
-            /* Snapshot the PIMSLO capture number that the upcoming SPI burst
-             * will use, so we can save a matching P4 preview JPEG. */
-            uint16_t preview_num = 0;
-            if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
-                preview_num = app_pimslo_peek_next_num();
-            }
-
             take_and_save_photo(camera_buf, camera_buf_hes, camera_buf_ves);
 
-            // Also trigger PIMSLO SPI capture in background (non-blocking)
+            /* Trigger PIMSLO SPI capture in the background (non-blocking).
+             * The pimslo capture task is also responsible for copying the
+             * just-saved P4 photo into PIMSLO_PREVIEW_DIR so the gallery
+             * has a placeholder while the GIF encodes — it's done there
+             * instead of here because this frame callback runs on the
+             * 4 KB video-stream task stack, and the preview copy uses a
+             * large file-I/O buffer that would overflow it. */
             if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
-                /* Save P4 preview BEFORE requesting the SPI capture — the
-                 * capture thread will start encoding on its own timeline. */
-                app_pimslo_save_preview_from_latest_photo(preview_num);
                 app_pimslo_request_capture();
             }
         }

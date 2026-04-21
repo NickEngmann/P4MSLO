@@ -10,6 +10,7 @@
 #include "app_pimslo.h"
 #include "spi_camera.h"
 #include "app_gifs.h"
+#include "app_video_stream.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
@@ -130,6 +131,13 @@ static void pimslo_capture_task(void *param)
         uint16_t num = s_next_capture_num++;
         save_capture_counter();
 
+        /* Save the P4 photo we just took as the gallery preview for this
+         * capture number. Safe to do here (instead of in the video-stream
+         * frame callback) because the photo's `take_and_save_photo` call
+         * already flushed to SD before the caller gave us this semaphore,
+         * and this task has an 8KB stack for the file-copy buffer. */
+        app_pimslo_save_preview_from_latest_photo(num);
+
         /* Create capture directory */
         char dir_path[64];
         mkdir(PIMSLO_BASE_DIR, 0755);
@@ -140,6 +148,14 @@ static void pimslo_capture_task(void *param)
 
         /* Initialize SPI (idempotent) and capture from all cameras */
         spi_camera_init();
+
+        /* Free the viewfinder / photo buffers so the ~4×600KB SPI JPEG
+         * transfer buffers have room to allocate. On the CAMERA page the
+         * viewfinder holds ~7 MB of PSRAM and without this the transfers
+         * OOM. The GIF-encode task also frees+reallocs separately (it needs
+         * a 7MB scaled_buf) — those calls are idempotent against this one.
+         * Viewfinder freezes for the duration of the SPI capture (~3s). */
+        app_video_stream_free_buffers();
 
         /* Phase 4 pre-capture image-quality pass. Skipped in fast mode.
          * AF is currently a no-op stub on the S3 side (firmware blob not
@@ -181,7 +197,15 @@ static void pimslo_capture_task(void *param)
         ESP_LOGI(TAG, "Capture %03d: %d/4 cameras in %lums",
                  num, saved, (unsigned long)capture_ms);
 
-        /* Enqueue GIF encode job if we got enough cameras */
+        /* Enqueue GIF encode job if we got enough cameras. Critical detail:
+         * if we're handing off to the GIF task we DO NOT realloc viewfinder
+         * buffers here. The GIF task needs to load 4×~600KB JPEGs before it
+         * can free the viewfinder itself — but on CAMERA page there isn't
+         * enough PSRAM to hold both simultaneously, so reallocating here
+         * would starve the GIF task. The GIF task's own free/realloc pair
+         * closes the cycle: buffers stay freed through capture + encode,
+         * then come back once the GIF is done. */
+        bool handed_off_to_gif = false;
         if (saved >= 2) {
             pimslo_gif_job_t job = { .capture_num = num };
             if (xQueueSend(s_gif_queue, &job, 0) != pdTRUE) {
@@ -189,9 +213,17 @@ static void pimslo_capture_task(void *param)
             } else {
                 ESP_LOGI(TAG, "Queued GIF encode for P4M%04d (queue: %d)",
                          num, (int)uxQueueMessagesWaiting(s_gif_queue));
+                handed_off_to_gif = true;
             }
         } else {
             ESP_LOGW(TAG, "Capture %03d: only %d cameras — skipping GIF", num, saved);
+        }
+
+        /* Restore viewfinder ONLY if we aren't passing PSRAM responsibility
+         * to the GIF task. Keeps the viewfinder frozen end-to-end through a
+         * successful PIMSLO cycle, but unfreezes it on a capture failure. */
+        if (!handed_off_to_gif) {
+            app_video_stream_realloc_buffers();
         }
     }
 }
@@ -296,11 +328,6 @@ bool app_pimslo_is_encoding(void)
     return s_encoding;
 }
 
-uint16_t app_pimslo_peek_next_num(void)
-{
-    return s_next_capture_num;
-}
-
 #define P4_PHOTO_DIR "/sdcard/esp32_p4_pic_save"
 
 esp_err_t app_pimslo_save_preview_from_latest_photo(uint16_t num)
@@ -337,18 +364,27 @@ esp_err_t app_pimslo_save_preview_from_latest_photo(uint16_t num)
     FILE *out = fopen(dst, "wb");
     if (!out) { fclose(in); return ESP_FAIL; }
 
-    uint8_t buf[2048];
+    /* Heap-allocated copy buffer so this function is safe to call from any
+     * task regardless of its stack size. A 2 KB stack buffer previously
+     * blew out the 4 KB video-stream task stack (caught by stack protection
+     * fault after the P4 photo saved successfully). */
+    const size_t COPY_BUF_SIZE = 2048;
+    uint8_t *buf = heap_caps_malloc(COPY_BUF_SIZE, MALLOC_CAP_DEFAULT);
+    if (!buf) { fclose(in); fclose(out); return ESP_ERR_NO_MEM; }
+
     size_t total = 0;
     size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) {
-            fclose(in); fclose(out); return ESP_FAIL;
-        }
+    esp_err_t rc = ESP_OK;
+    while ((n = fread(buf, 1, COPY_BUF_SIZE, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { rc = ESP_FAIL; break; }
         total += n;
     }
+    heap_caps_free(buf);
     fclose(in);
     fclose(out);
 
-    ESP_LOGI(TAG, "Saved P4 preview: %s → %s (%zu bytes)", src, dst, total);
-    return ESP_OK;
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "Saved P4 preview: %s → %s (%zu bytes)", src, dst, total);
+    }
+    return rc;
 }

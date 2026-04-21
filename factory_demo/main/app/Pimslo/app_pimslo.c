@@ -30,6 +30,8 @@ static const char *TAG = "pimslo";
 #define PIMSLO_BASE_DIR      "/sdcard/p4mslo"
 #define NVS_NAMESPACE        "storage"
 #define NVS_KEY_CAPTURE_NUM  "pimslo_num"
+#define NVS_KEY_FAST_MODE    "pimslo_fast"
+#define PIMSLO_EXPOSURE_REF_CAM   1  /* camera #2 = most reliable in testing */
 
 /* GIF encode job — just the capture number */
 typedef struct {
@@ -83,6 +85,38 @@ static void save_capture_counter(void)
     }
 }
 
+/* ---- Fast-capture mode (Phase 4) ---- */
+
+static void load_fast_mode(void)
+{
+    uint8_t v = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, NVS_KEY_FAST_MODE, &v);
+        nvs_close(h);
+    }
+    spi_camera_set_fast_mode(v != 0);
+    ESP_LOGI(TAG, "Fast capture mode: %s", v ? "ON" : "off");
+}
+
+bool app_pimslo_get_fast_mode(void)
+{
+    return spi_camera_get_fast_mode();
+}
+
+esp_err_t app_pimslo_set_fast_mode(bool enabled)
+{
+    spi_camera_set_fast_mode(enabled);
+    nvs_handle_t h;
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (ret != ESP_OK) return ret;
+    nvs_set_u8(h, NVS_KEY_FAST_MODE, enabled ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "Fast capture mode → %s (persisted)", enabled ? "ON" : "off");
+    return ESP_OK;
+}
+
 /* ---- SPI Capture Task (Core 0, persistent) ---- */
 
 static void pimslo_capture_task(void *param)
@@ -106,6 +140,20 @@ static void pimslo_capture_task(void *param)
 
         /* Initialize SPI (idempotent) and capture from all cameras */
         spi_camera_init();
+
+        /* Phase 4 pre-capture image-quality pass. Skipped in fast mode.
+         * AF is currently a no-op stub on the S3 side (firmware blob not
+         * loaded), but the SPI plumbing is exercised so we can swap in a
+         * real AF implementation without touching this file. Exposure sync
+         * is functional: the reference camera's current AE values are
+         * broadcast to the others to reduce cross-camera brightness drift. */
+        if (!spi_camera_get_fast_mode()) {
+            uint32_t t_ae = esp_log_timestamp();
+            spi_camera_autofocus_all(1500);
+            spi_camera_sync_exposure(PIMSLO_EXPOSURE_REF_CAM);
+            ESP_LOGI(TAG, "Pre-capture AF+AE sync: %lums",
+                     (unsigned long)(esp_log_timestamp() - t_ae));
+        }
 
         uint8_t *jpeg_bufs[4] = {NULL};
         size_t jpeg_sizes[4] = {0};
@@ -207,6 +255,7 @@ esp_err_t app_pimslo_init(void)
     if (s_initialized) return ESP_OK;
 
     load_capture_counter();
+    load_fast_mode();
 
     s_capture_sem = xSemaphoreCreateBinary();
     if (!s_capture_sem) return ESP_ERR_NO_MEM;

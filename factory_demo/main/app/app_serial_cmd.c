@@ -603,6 +603,57 @@ static void dispatch_command(char *line)
                             line, n, cmd_byte, ret);
             }
         }
+    } else if (strcmp(line, "fast_capture") == 0) {
+        /* fast_capture [on|off|status]
+         * Toggles the Phase 4 fast-capture mode. Without args, prints state. */
+        if (!arg || !*arg || strcmp(arg, "status") == 0) {
+            cmd_respond("fast_capture=%s", app_pimslo_get_fast_mode() ? "on" : "off");
+        } else if (strcmp(arg, "on") == 0 || strcmp(arg, "1") == 0) {
+            esp_err_t r = app_pimslo_set_fast_mode(true);
+            cmd_respond("%s fast_capture=on", r == ESP_OK ? "ok" : "error");
+        } else if (strcmp(arg, "off") == 0 || strcmp(arg, "0") == 0) {
+            esp_err_t r = app_pimslo_set_fast_mode(false);
+            cmd_respond("%s fast_capture=off", r == ESP_OK ? "ok" : "error");
+        } else {
+            cmd_respond("error fast_capture: usage on|off|status");
+        }
+    } else if (strcmp(line, "cam_ae") == 0) {
+        /* cam_ae [N]  → read AE gain + exposure from one camera or all */
+        spi_camera_init();
+        int start = 0, end = SPI_CAM_COUNT;
+        if (arg && *arg) {
+            int n = atoi(arg);
+            if (n >= 1 && n <= SPI_CAM_COUNT) { start = n - 1; end = n; }
+        }
+        for (int i = start; i < end; i++) {
+            uint16_t g = 0;
+            uint32_t e = 0;
+            esp_err_t r = spi_camera_read_exposure(i, &g, &e);
+            if (r == ESP_OK) {
+                cmd_respond("cam %d ae: gain=%u exposure=%lu",
+                            i + 1, (unsigned)g, (unsigned long)e);
+            } else {
+                cmd_respond("cam %d ae: read failed (0x%x)", i + 1, r);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        cmd_respond("ok cam_ae");
+    } else if (strcmp(line, "cam_sync_ae") == 0) {
+        /* cam_sync_ae [ref]  → read ref camera AE and broadcast to the rest.
+         * Default ref = 2 (our most-reliable cam). */
+        spi_camera_init();
+        int ref = arg && *arg ? atoi(arg) : 2;
+        if (ref < 1 || ref > SPI_CAM_COUNT) {
+            cmd_respond("error cam_sync_ae: ref must be 1-%d", SPI_CAM_COUNT);
+        } else {
+            esp_err_t r = spi_camera_sync_exposure(ref - 1);
+            cmd_respond("%s cam_sync_ae ref=%d", r == ESP_OK ? "ok" : "error", ref);
+        }
+    } else if (strcmp(line, "cam_af") == 0) {
+        /* cam_af  → broadcast AUTOFOCUS to all and poll for AF_LOCKED */
+        spi_camera_init();
+        esp_err_t r = spi_camera_autofocus_all(2000);
+        cmd_respond("%s cam_af", r == ESP_OK ? "ok" : "error");
     } else if (strcmp(line, "cam_status") == 0) {
         /* cam_status [N]  → query one camera, or all if no arg */
         spi_camera_init();
@@ -615,11 +666,12 @@ static void dispatch_command(char *line)
             uint8_t s = 0;
             esp_err_t r = spi_camera_query_status(i, &s);
             if (r == ESP_OK) {
-                cmd_respond("cam %d: 0x%02X jpeg=%d wifi=%d connected=%d",
+                cmd_respond("cam %d: 0x%02X jpeg=%d wifi=%d connected=%d af=%d",
                             i + 1, s,
                             (s & SPI_CAM_STATUS_JPEG_READY)    ? 1 : 0,
                             (s & SPI_CAM_STATUS_WIFI_ACTIVE)   ? 1 : 0,
-                            (s & SPI_CAM_STATUS_WIFI_CONNECTED) ? 1 : 0);
+                            (s & SPI_CAM_STATUS_WIFI_CONNECTED) ? 1 : 0,
+                            (s & SPI_CAM_STATUS_AF_LOCKED)     ? 1 : 0);
             } else {
                 cmd_respond("cam %d: no response (0x%x)", i + 1, r);
             }

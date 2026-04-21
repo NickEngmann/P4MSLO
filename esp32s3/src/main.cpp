@@ -92,6 +92,13 @@ static void savePhotoCounter() {
  * master-facing transaction loop and WiFi init touches esp_netif which isn't
  * thread-safe from that context). So SPI enqueues a command and a dedicated
  * control task dequeues and executes. */
+/* Control-queue message: cmd byte plus up to 8 bytes of optional payload.
+ * SET_EXPOSURE carries 5 bytes (gain + exposure); the rest ignore payload. */
+struct SpiControlMsg {
+    uint8_t cmd;
+    uint8_t payload_len;
+    uint8_t payload[8];
+};
 static QueueHandle_t s_controlQueue = nullptr;
 static bool          s_wifiStarted  = false;
 
@@ -136,20 +143,52 @@ static void do_identify_blink() {
     }
 }
 
+static void refresh_exposure_header() {
+    uint16_t g = 0;
+    uint32_t e = 0;
+    if (cameraManager.getExposure(&g, &e)) {
+        spiSlave.setExposureHeader(g, e);
+    }
+}
+
+static void do_autofocus() {
+    ESP_LOGI(TAG, "[SPI control] AUTOFOCUS");
+    spiSlave.setAfLocked(false);
+    bool ok = cameraManager.autofocus(2000);
+    spiSlave.setAfLocked(ok);
+}
+
+static void do_set_exposure(const uint8_t *payload, size_t len) {
+    if (len < SPI_SET_EXPOSURE_PAYLOAD_LEN) {
+        ESP_LOGW(TAG, "[SPI control] SET_EXPOSURE: short payload (%zu)", len);
+        return;
+    }
+    uint16_t gain     = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    uint32_t exposure = (uint32_t)payload[2] |
+                        ((uint32_t)payload[3] << 8) |
+                        ((uint32_t)payload[4] << 16);
+    ESP_LOGI(TAG, "[SPI control] SET_EXPOSURE gain=%u exposure=%lu",
+             (unsigned)gain, (unsigned long)exposure);
+    cameraManager.setExposure(gain, exposure);
+    spiSlave.setExposureHeader(gain, exposure);
+}
+
 static void task_control(void *arg) {
-    uint8_t cmd;
-    while (xQueueReceive(s_controlQueue, &cmd, portMAX_DELAY) == pdPASS) {
-        switch (cmd) {
-            case SPI_CMD_WIFI_ON:  wifi_start_subsystem(); break;
-            case SPI_CMD_WIFI_OFF: wifi_stop_subsystem();  break;
-            case SPI_CMD_IDENTIFY: do_identify_blink();     break;
+    SpiControlMsg msg;
+    while (xQueueReceive(s_controlQueue, &msg, portMAX_DELAY) == pdPASS) {
+        switch (msg.cmd) {
+            case SPI_CMD_WIFI_ON:      wifi_start_subsystem(); break;
+            case SPI_CMD_WIFI_OFF:     wifi_stop_subsystem();  break;
+            case SPI_CMD_IDENTIFY:     do_identify_blink();    break;
+            case SPI_CMD_AUTOFOCUS:    do_autofocus();         break;
+            case SPI_CMD_SET_EXPOSURE: do_set_exposure(msg.payload, msg.payload_len); break;
             case SPI_CMD_REBOOT:
                 ESP_LOGW(TAG, "[SPI control] REBOOT requested — restarting in 100ms");
                 vTaskDelay(pdMS_TO_TICKS(100));
                 esp_restart();
                 break;
             default:
-                ESP_LOGW(TAG, "[SPI control] unknown cmd 0x%02X", cmd);
+                ESP_LOGW(TAG, "[SPI control] unknown cmd 0x%02X", msg.cmd);
                 break;
         }
     }
@@ -197,6 +236,9 @@ static void doCapture() {
         spiSlave.setJpegData(jpegBuf, jpegLen);
         photoCounter++;
         savePhotoCounter();
+        /* Snapshot the freshly-settled AE state into the IDLE header so a
+         * PIMSLO master can read this camera's exposure via status poll. */
+        refresh_exposure_header();
         ESP_LOGI(TAG, "Photo captured: %zu bytes (available via SPI)", jpegLen);
         /* NOTE: camera fb is NOT released here — it stays valid until
          * the SPI master reads the data, then we release on next capture */
@@ -332,11 +374,14 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "[4/6] SPI Slave: OK (SD card disabled)");
 
         // Control-command plumbing: SPI task enqueues, control task executes
-        s_controlQueue = xQueueCreate(4, sizeof(uint8_t));
-        spiSlave.setControlCallback([](uint8_t cmd) {
-            if (s_controlQueue) {
-                xQueueSend(s_controlQueue, &cmd, 0);
-            }
+        s_controlQueue = xQueueCreate(4, sizeof(SpiControlMsg));
+        spiSlave.setControlCallback([](uint8_t cmd, const uint8_t *payload, size_t payload_len) {
+            if (!s_controlQueue) return;
+            SpiControlMsg msg = {};
+            msg.cmd = cmd;
+            msg.payload_len = (uint8_t)(payload_len > sizeof(msg.payload) ? sizeof(msg.payload) : payload_len);
+            if (payload && msg.payload_len) memcpy(msg.payload, payload, msg.payload_len);
+            xQueueSend(s_controlQueue, &msg, 0);
         });
         xTaskCreatePinnedToCore(task_control, "SpiCtrl",
                                 8192, nullptr, 5, nullptr, 0);

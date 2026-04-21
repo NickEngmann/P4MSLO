@@ -71,6 +71,16 @@ esp_err_t app_pimslo_save_preview_from_latest_photo(uint16_t num);
  */
 #define PIMSLO_PREVIEW_DIR "/sdcard/p4mslo_previews"
 
+/**
+ * @brief Get/set the PIMSLO "fast capture" mode (persisted in NVS).
+ *
+ * When enabled, the pre-capture AF + exposure-sync pass is skipped and the
+ * SPI settle delays inside spi_camera_capture_all are reduced. Trades image
+ * quality for ~2 seconds of capture latency.
+ */
+bool app_pimslo_get_fast_mode(void);
+esp_err_t app_pimslo_set_fast_mode(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

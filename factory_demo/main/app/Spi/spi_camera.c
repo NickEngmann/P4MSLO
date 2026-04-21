@@ -50,6 +50,7 @@ static const uint8_t SPI_PREAMBLE[PREAMBLE_LEN] = {
  * CS pin is unambiguously asserted regardless of driver quirks. */
 static spi_device_handle_t s_spi_dev = NULL;
 static bool s_initialized = false;
+static bool s_fast_mode = false;
 
 static const int s_cs_pins[SPI_CAM_COUNT] = {
     SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN
@@ -480,7 +481,10 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
         vTaskDelay(pdMS_TO_TICKS(100));
         gpio_set_level(GPIO_NUM_34, 1);
         ESP_LOGI(TAG, "Trigger sent (attempt %d), waiting for captures...", attempt + 1);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        /* Fast mode shaves the post-trigger wait. 300ms is enough for OV5640
+         * capture completion; the default 500ms included a comfortable margin
+         * that we trade away in fast mode for ~200ms quicker bursts. */
+        vTaskDelay(pdMS_TO_TICKS(s_fast_mode ? 300 : 500));
 
         /* Receive from each camera sequentially, one at a time.
          * Add delay between cameras to let the bus fully settle. */
@@ -509,7 +513,7 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
              * return to steady state and the next camera's slave task time
              * to pre-queue its response. Without this, back-to-back selects
              * of adjacent cameras can see residual driven MISO state. */
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(s_fast_mode ? 30 : 50));
         }
 
         if (success_count >= SPI_CAM_COUNT) break;  /* All 4 got clean transfers */
@@ -525,4 +529,165 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
              success_count, SPI_CAM_COUNT, (unsigned long)*total_ms);
 
     return (success_count >= 2) ? ESP_OK : ESP_FAIL;
+}
+
+/* ---- Phase 4: exposure sync + autofocus ---- */
+
+void spi_camera_set_fast_mode(bool enabled) { s_fast_mode = enabled; }
+bool spi_camera_get_fast_mode(void)         { return s_fast_mode; }
+
+/* Read the full 16-byte IDLE header from a single camera. Uses the same
+ * 2-transaction pattern as spi_camera_query_status (command, then response),
+ * but captures the extended header bytes added in Phase 4. */
+static esp_err_t read_idle_header(int camera_idx, uint8_t header_out[16])
+{
+    if (!s_initialized || !s_spi_dev) return ESP_ERR_INVALID_STATE;
+    if (camera_idx < 0 || camera_idx >= SPI_CAM_COUNT) return ESP_ERR_INVALID_ARG;
+
+    WORD_ALIGNED_ATTR uint8_t tx1[16] = {CMD_STATUS};
+    WORD_ALIGNED_ATTR uint8_t rx1[16] = {0};
+    esp_err_t ret = spi_xfer_cam(camera_idx, tx1, rx1, 16);
+    if (ret != ESP_OK) return ret;
+
+    WORD_ALIGNED_ATTR uint8_t tx2[16] = {0};
+    WORD_ALIGNED_ATTR uint8_t rx2[16] = {0};
+    ret = spi_xfer_cam(camera_idx, tx2, rx2, 16);
+    if (ret != ESP_OK) return ret;
+
+    memcpy(header_out, rx2, 16);
+    return ESP_OK;
+}
+
+esp_err_t spi_camera_read_exposure(int camera_idx,
+                                    uint16_t *ae_gain, uint32_t *ae_exposure)
+{
+    uint8_t hdr[16] = {0};
+    esp_err_t ret = read_idle_header(camera_idx, hdr);
+    if (ret != ESP_OK) return ret;
+
+    uint16_t g = (uint16_t)hdr[SPI_CAM_HEADER_AE_GAIN_OFFSET] |
+                 ((uint16_t)hdr[SPI_CAM_HEADER_AE_GAIN_OFFSET + 1] << 8);
+    uint32_t e = (uint32_t)hdr[SPI_CAM_HEADER_AE_EXPOSURE_OFFSET] |
+                 ((uint32_t)hdr[SPI_CAM_HEADER_AE_EXPOSURE_OFFSET + 1] << 8) |
+                 ((uint32_t)hdr[SPI_CAM_HEADER_AE_EXPOSURE_OFFSET + 2] << 16);
+
+    if (ae_gain)     *ae_gain     = g;
+    if (ae_exposure) *ae_exposure = e;
+    ESP_LOGI(TAG, "Camera %d AE: gain=%u exposure=%lu",
+             camera_idx + 1, (unsigned)g, (unsigned long)e);
+    return ESP_OK;
+}
+
+esp_err_t spi_camera_set_exposure(int camera_idx,
+                                   uint16_t ae_gain, uint32_t ae_exposure)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (camera_idx < 0 || camera_idx >= SPI_CAM_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!s_spi_dev) return ESP_ERR_NOT_SUPPORTED;
+
+    /* 10× burst with cmd at [0] and payload at [1..5]. The slave scans for
+     * the cmd byte in rx[0..7] and, on match, reads payload from rx[cmd_offset+1..]. */
+    uint8_t *tx = heap_caps_calloc(1, 8, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint8_t *rx = heap_caps_calloc(1, 8, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!tx || !rx) {
+        if (tx) free(tx);
+        if (rx) free(rx);
+        return ESP_ERR_NO_MEM;
+    }
+    tx[0] = SPI_CAM_CMD_SET_EXPOSURE;
+    tx[1] = ae_gain & 0xFF;
+    tx[2] = (ae_gain >> 8) & 0xFF;
+    tx[3] = ae_exposure & 0xFF;
+    tx[4] = (ae_exposure >> 8) & 0xFF;
+    tx[5] = (ae_exposure >> 16) & 0xFF;
+
+    esp_err_t ret = ESP_OK;
+    for (int i = 0; i < 10; i++) {
+        ret = spi_xfer_cam(camera_idx, tx, rx, 8);
+        if (ret != ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    free(tx);
+    free(rx);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Camera %d: SET_EXPOSURE gain=%u exposure=%lu",
+                 camera_idx + 1, (unsigned)ae_gain, (unsigned long)ae_exposure);
+    }
+    return ret;
+}
+
+esp_err_t spi_camera_sync_exposure(int ref_idx)
+{
+    if (!s_initialized) {
+        esp_err_t ret = spi_camera_init();
+        if (ret != ESP_OK) return ret;
+    }
+    if (ref_idx < 0 || ref_idx >= SPI_CAM_COUNT) return ESP_ERR_INVALID_ARG;
+
+    uint16_t ref_gain = 0;
+    uint32_t ref_exp  = 0;
+    esp_err_t ret = spi_camera_read_exposure(ref_idx, &ref_gain, &ref_exp);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Exposure sync: ref camera %d read failed (0x%x)",
+                 ref_idx + 1, ret);
+        return ret;
+    }
+    if (ref_gain == 0 && ref_exp == 0) {
+        /* Reference camera is still in auto-AE and hasn't captured yet, or
+         * it's running older firmware without the extended header. */
+        ESP_LOGW(TAG, "Exposure sync: ref camera %d reports zero AE — skipping",
+                 ref_idx + 1);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int ok = 0;
+    for (int i = 0; i < SPI_CAM_COUNT; i++) {
+        if (i == ref_idx) { ok++; continue; }
+        if (spi_camera_set_exposure(i, ref_gain, ref_exp) == ESP_OK) ok++;
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    ESP_LOGI(TAG, "Exposure sync from cam %d (gain=%u exp=%lu): %d/%d set",
+             ref_idx + 1, (unsigned)ref_gain, (unsigned long)ref_exp,
+             ok, SPI_CAM_COUNT);
+    return (ok == SPI_CAM_COUNT) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t spi_camera_autofocus_all(uint32_t timeout_ms)
+{
+    if (!s_initialized) {
+        esp_err_t ret = spi_camera_init();
+        if (ret != ESP_OK) return ret;
+    }
+
+    int sent = 0;
+    for (int i = 0; i < SPI_CAM_COUNT; i++) {
+        if (spi_camera_send_control(i, SPI_CAM_CMD_AUTOFOCUS) == ESP_OK) sent++;
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+
+    uint32_t t0 = esp_log_timestamp();
+    int locked_mask = 0;
+    const int all_mask = (1 << SPI_CAM_COUNT) - 1;
+    while ((locked_mask & all_mask) != all_mask &&
+           (esp_log_timestamp() - t0) < timeout_ms) {
+        for (int i = 0; i < SPI_CAM_COUNT; i++) {
+            if (locked_mask & (1 << i)) continue;
+            uint8_t status = 0;
+            if (spi_camera_query_status(i, &status) == ESP_OK &&
+                (status & SPI_CAM_STATUS_AF_LOCKED)) {
+                locked_mask |= (1 << i);
+            }
+        }
+        if ((locked_mask & all_mask) != all_mask) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    int locked_count = __builtin_popcount(locked_mask);
+    ESP_LOGI(TAG, "AF: sent=%d locked=%d/%d in %lums (timeout=%lums)",
+             sent, locked_count, SPI_CAM_COUNT,
+             (unsigned long)(esp_log_timestamp() - t0),
+             (unsigned long)timeout_ms);
+    return (locked_count >= SPI_CAM_COUNT / 2) ? ESP_OK : ESP_FAIL;
 }

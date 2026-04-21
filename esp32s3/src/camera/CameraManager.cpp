@@ -220,6 +220,75 @@ void CameraManager::releasePhoto() {
     }
 }
 
+/* ---- Phase 4: exposure sync + autofocus ---- */
+
+bool CameraManager::getExposure(uint16_t *gain_out, uint32_t *exposure_out) {
+    if (!_initialized) return false;
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->get_reg) return false;
+
+    int g_hi = s->get_reg(s, 0x350A, 0x03);   // bits [9:8]
+    int g_lo = s->get_reg(s, 0x350B, 0xFF);   // bits [7:0]
+    if (g_hi < 0 || g_lo < 0) return false;
+
+    int e_hi  = s->get_reg(s, 0x3500, 0x0F);  // bits [19:16]
+    int e_mid = s->get_reg(s, 0x3501, 0xFF);  // bits [15:8]
+    int e_lo  = s->get_reg(s, 0x3502, 0xFF);  // bits [7:0] (LSB is fractional)
+    if (e_hi < 0 || e_mid < 0 || e_lo < 0) return false;
+
+    if (gain_out)     *gain_out     = (uint16_t)((g_hi << 8) | g_lo);
+    if (exposure_out) *exposure_out = ((uint32_t)e_hi << 16) |
+                                      ((uint32_t)e_mid << 8) |
+                                      (uint32_t)e_lo;
+    return true;
+}
+
+bool CameraManager::setExposure(uint16_t gain, uint32_t exposure) {
+    if (!_initialized) return false;
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_reg) return false;
+
+    /* Switch to manual AEC/AGC so the values we write don't get re-overridden
+     * by the internal AE loop on the next frame. Bits [1:0] of 0x3503:
+     *   bit 0 = AGC manual (1 = manual gain)
+     *   bit 1 = AEC manual (1 = manual exposure) */
+    if (s->set_reg(s, 0x3503, 0x03, 0x03) != 0) return false;
+
+    if (s->set_reg(s, 0x350A, 0x03, (gain >> 8) & 0x03) != 0) return false;
+    if (s->set_reg(s, 0x350B, 0xFF, gain & 0xFF)         != 0) return false;
+
+    if (s->set_reg(s, 0x3500, 0x0F, (exposure >> 16) & 0x0F) != 0) return false;
+    if (s->set_reg(s, 0x3501, 0xFF, (exposure >> 8)  & 0xFF) != 0) return false;
+    if (s->set_reg(s, 0x3502, 0xFF, exposure & 0xFF)         != 0) return false;
+
+    ESP_LOGI(TAG, "AE manual: gain=%u exposure=%lu",
+             (unsigned)gain, (unsigned long)exposure);
+    return true;
+}
+
+bool CameraManager::setAutoExposure(bool enabled) {
+    if (!_initialized) return false;
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_reg) return false;
+    /* 0x3503 bits [1:0]: 00 = auto AEC+AGC, 11 = manual both */
+    uint8_t val = enabled ? 0x00 : 0x03;
+    if (s->set_reg(s, 0x3503, 0x03, val) != 0) return false;
+    ESP_LOGI(TAG, "AE %s", enabled ? "auto" : "manual");
+    return true;
+}
+
+bool CameraManager::autofocus(uint32_t timeout_ms) {
+    /* OV5640 AF requires a proprietary firmware blob (~4KB) loaded into the
+     * sensor at register 0x8000 via SCCB. esp32-camera v2.0.4 does NOT bundle
+     * this blob. Without it, the AF command register (0x3022) either has no
+     * effect or leaves the lens hunting. Rather than fake a result or block
+     * the pipeline, we log the limitation and return true immediately so the
+     * caller's "wait for AF lock" logic doesn't hang. */
+    (void)timeout_ms;
+    ESP_LOGW(TAG, "autofocus(): stub — OV5640 AF firmware blob not loaded");
+    return true;
+}
+
 #else  // NATIVE_BUILD
 
 CameraManager::CameraManager() : _initialized(false), _width(0), _height(0) {}
@@ -228,5 +297,11 @@ bool CameraManager::begin() { return false; }
 void CameraManager::stop() {}
 bool CameraManager::capturePhoto(uint8_t**, size_t*) { return false; }
 void CameraManager::releasePhoto() {}
+void CameraManager::enterStandby() {}
+void CameraManager::wakeFromStandby() {}
+bool CameraManager::getExposure(uint16_t*, uint32_t*) { return false; }
+bool CameraManager::setExposure(uint16_t, uint32_t) { return false; }
+bool CameraManager::setAutoExposure(bool) { return false; }
+bool CameraManager::autofocus(uint32_t) { return false; }
 
 #endif

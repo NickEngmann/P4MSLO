@@ -154,7 +154,39 @@ Peak PSRAM usage goes from 1× 7MB RGB buffer to 2× 7MB = 14MB. This is feasibl
 
 ---
 
-## Phase 4 — Image quality: exposure sync + autofocus
+## Phase 4 — Image quality: exposure sync + autofocus 🟨 PARTIAL (AF stubbed)
+
+**Shipped:**
+- ~~SPI command space extended (0x08 AUTOFOCUS, 0x09 SET_EXPOSURE) + 0x08 AF_LOCKED status bit~~ ✓
+- ~~Extended IDLE header with AE gain (bytes 5-6) + exposure (bytes 7-9) — sent on every status poll~~ ✓
+- ~~`CameraManager::getExposure`/`setExposure`/`setAutoExposure` via OV5640 regs 0x350A/B and 0x3500-0x3502~~ ✓
+- ~~`CameraManager::autofocus()` stub (returns true immediately — real AF deferred; see below)~~ ✓
+- ~~Master helpers: `spi_camera_read_exposure`, `spi_camera_set_exposure`, `spi_camera_sync_exposure`, `spi_camera_autofocus_all`~~ ✓
+- ~~`app_pimslo` capture task calls AF + exposure-sync pre-trigger (skipped in fast mode)~~ ✓
+- ~~NVS-backed "fast capture mode" + `fast_capture on|off|status` serial command~~ ✓
+- ~~Serial commands: `cam_ae [N]`, `cam_sync_ae [ref]`, `cam_af`, extended `cam_status` with AF bit~~ ✓
+- ~~SPI control callback extended to carry payload bytes (needed for SET_EXPOSURE)~~ ✓
+
+**Deferred — OV5640 autofocus firmware blob**
+OV5640 AF needs a ~4KB firmware blob loaded to sensor register 0x8000 via SCCB before AF commands work. esp32-camera v2.0.4 does NOT bundle this blob — the sensor driver has register access but no AF FSM.
+
+To unstub `CameraManager::autofocus()`:
+1. Source the OV5640 AF firmware (commonly distributed as `OV5640_AF.bin`, ~4KB — e.g. search in ArduCAM/Seeed projects).
+2. Embed as C array in `esp32s3/src/camera/ov5640_af_fw.h`.
+3. On `CameraManager::begin()`, if PID==0x5640: write the blob via `sensor->set_reg`/SCCB write-multi starting at 0x8000, then set 0x3022=0x08 to start firmware, poll 0x3029 until == 0x70 (idle).
+4. In `autofocus()`: write 0x3022=0x03 (single AF trigger), poll 0x3029 for focus state, return true when `0x3029 == 0x10`.
+
+This is a focused ~100-line addition once the blob is obtained. SPI wire protocol + master-side polling + AF_LOCKED status bit are already in place, so only the CameraManager body changes.
+
+**Deferred — UI Settings toggle for fast capture mode**
+SquareLine Studio generates the settings panel; adding a toggle there means either regenerating from the SquareLine project file or synthesizing a custom LVGL switch in `ui_extra.c` and splicing it into the existing rotate list. Currently toggleable only via serial `fast_capture on|off`. UI follow-up.
+
+### Verified
+- P4 ESP-IDF build: compiles clean, factory_demo.bin 2.45MB (77% partition free)
+- S3 PlatformIO build: compiles clean, 51.9% flash used
+- 60/60 host tests pass
+
+### ~~Original plan~~
 
 **Goal**: improve PIMSLO output quality by making the 4 cameras agree on exposure and focus before firing.
 

@@ -40,13 +40,15 @@ static const char *TAG = "spi_slave";
 
 /* Commands from master — kept as macros for readability inside this file.
  * Public values live in SPISlave.h as SPI_CMD_* constexprs. */
-#define CMD_STATUS      SPI_CMD_STATUS
-#define CMD_GET_SIZE    SPI_CMD_GET_SIZE
-#define CMD_READ_DATA   SPI_CMD_READ_DATA
-#define CMD_WIFI_ON     SPI_CMD_WIFI_ON
-#define CMD_WIFI_OFF    SPI_CMD_WIFI_OFF
-#define CMD_REBOOT      SPI_CMD_REBOOT
-#define CMD_IDENTIFY    SPI_CMD_IDENTIFY
+#define CMD_STATUS         SPI_CMD_STATUS
+#define CMD_GET_SIZE       SPI_CMD_GET_SIZE
+#define CMD_READ_DATA      SPI_CMD_READ_DATA
+#define CMD_WIFI_ON        SPI_CMD_WIFI_ON
+#define CMD_WIFI_OFF       SPI_CMD_WIFI_OFF
+#define CMD_REBOOT         SPI_CMD_REBOOT
+#define CMD_IDENTIFY       SPI_CMD_IDENTIFY
+#define CMD_AUTOFOCUS      SPI_CMD_AUTOFOCUS
+#define CMD_SET_EXPOSURE   SPI_CMD_SET_EXPOSURE
 
 /**
  * CS-gated MISO tri-state ISR.
@@ -106,16 +108,29 @@ static void install_miso_tristate(void)
 }
 
 SPISlave::SPISlave()
-    : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0), _controlCb(nullptr)
+    : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0),
+      _aeGain(0), _aeExposure(0), _controlCb(nullptr)
 {
 }
 
 void SPISlave::setWifiStatus(bool active, bool connected)
 {
-    uint8_t flags = 0;
+    uint8_t flags = _statusFlags & SPI_STATUS_AF_LOCKED;  // preserve AF bit
     if (active)    flags |= SPI_STATUS_WIFI_ACTIVE;
     if (connected) flags |= SPI_STATUS_WIFI_CONNECTED;
     _statusFlags = flags;
+}
+
+void SPISlave::setAfLocked(bool locked)
+{
+    if (locked) _statusFlags |= SPI_STATUS_AF_LOCKED;
+    else        _statusFlags &= ~SPI_STATUS_AF_LOCKED;
+}
+
+void SPISlave::setExposureHeader(uint16_t ae_gain, uint32_t ae_exposure)
+{
+    _aeGain = ae_gain;
+    _aeExposure = ae_exposure & 0x00FFFFFF;  // 24-bit
 }
 
 bool SPISlave::begin()
@@ -317,6 +332,15 @@ void SPISlave::spiTask(void *param)
         tx_buf[2] = (size >> 8) & 0xFF;
         tx_buf[3] = (size >> 16) & 0xFF;
         tx_buf[4] = (size >> 24) & 0xFF;
+        /* Extended header (Phase 4): current AE gain + exposure so the master
+         * can snapshot any camera's exposure from a single IDLE poll. */
+        uint16_t ae_gain = self->_aeGain;
+        uint32_t ae_exp  = self->_aeExposure;
+        tx_buf[SPI_IDLE_HEADER_AE_GAIN_OFFSET    ] = (uint8_t)(ae_gain       & 0xFF);
+        tx_buf[SPI_IDLE_HEADER_AE_GAIN_OFFSET + 1] = (uint8_t)((ae_gain >> 8) & 0xFF);
+        tx_buf[SPI_IDLE_HEADER_AE_EXPOSURE_OFFSET    ] = (uint8_t)(ae_exp        & 0xFF);
+        tx_buf[SPI_IDLE_HEADER_AE_EXPOSURE_OFFSET + 1] = (uint8_t)((ae_exp >>  8) & 0xFF);
+        tx_buf[SPI_IDLE_HEADER_AE_EXPOSURE_OFFSET + 2] = (uint8_t)((ae_exp >> 16) & 0xFF);
 
         spi_slave_transaction_t trans = {};
         trans.length = CHUNK_SIZE * 8;
@@ -327,14 +351,17 @@ void SPISlave::spiTask(void *param)
         if (ret != ESP_OK) continue;
 
         uint8_t cmd = rx_buf[0];
+        int cmd_offset = 0;  // where the matching cmd byte lives in rx_buf
         /* Scan the first 8 bytes of rx for control command values —
-         * master embeds them at offset 4 to dodge first-byte transmission
-         * issues (see spi_camera_send_control on the P4). */
+         * master's 10× burst pattern means at least one transaction lands
+         * with the cmd byte intact; we accept a match anywhere in rx[0..7]. */
         for (int i = 0; i < 8; i++) {
             uint8_t b = rx_buf[i];
             if (b == CMD_WIFI_ON || b == CMD_WIFI_OFF ||
-                b == CMD_REBOOT  || b == CMD_IDENTIFY) {
+                b == CMD_REBOOT  || b == CMD_IDENTIFY ||
+                b == CMD_AUTOFOCUS || b == CMD_SET_EXPOSURE) {
                 cmd = b;
+                cmd_offset = i;
                 break;
             }
         }
@@ -343,20 +370,36 @@ void SPISlave::spiTask(void *param)
             streamJpegData(self->_jpegData, self->_jpegLen, data_tx, data_rx);
             ESP_LOGI(TAG, "DATA transfer complete");
         } else if (cmd == CMD_WIFI_ON || cmd == CMD_WIFI_OFF ||
-                   cmd == CMD_REBOOT  || cmd == CMD_IDENTIFY) {
+                   cmd == CMD_REBOOT  || cmd == CMD_IDENTIFY ||
+                   cmd == CMD_AUTOFOCUS) {
             ESP_LOGI(TAG, "Control cmd 0x%02X", cmd);
-            if (self->_controlCb) self->_controlCb(cmd);
+            if (self->_controlCb) self->_controlCb(cmd, nullptr, 0);
+        } else if (cmd == CMD_SET_EXPOSURE) {
+            /* Payload lives at SPI_SET_EXPOSURE_PAYLOAD_OFFSET bytes past
+             * where we found the cmd byte. If the burst landed with cmd at
+             * rx[0] the payload is at rx[1..5]; worst case (cmd at rx[4])
+             * we still have 3 payload bytes, enough for the exposure value. */
+            int po = cmd_offset + SPI_SET_EXPOSURE_PAYLOAD_OFFSET;
+            if (po + SPI_SET_EXPOSURE_PAYLOAD_LEN <= 8) {
+                ESP_LOGI(TAG, "CMD_SET_EXPOSURE payload@%d", po);
+                if (self->_controlCb) self->_controlCb(cmd, &rx_buf[po], SPI_SET_EXPOSURE_PAYLOAD_LEN);
+            } else {
+                ESP_LOGW(TAG, "CMD_SET_EXPOSURE: cmd at offset %d, payload truncated", cmd_offset);
+            }
         }
     }
 }
 
 #else
 
-SPISlave::SPISlave() : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0), _controlCb(nullptr) {}
+SPISlave::SPISlave() : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0),
+                       _aeGain(0), _aeExposure(0), _controlCb(nullptr) {}
 bool SPISlave::begin() { return false; }
 void SPISlave::stop() {}
 void SPISlave::setJpegData(const uint8_t *, size_t) {}
 void SPISlave::clearJpegData() {}
 void SPISlave::setWifiStatus(bool, bool) {}
+void SPISlave::setAfLocked(bool) {}
+void SPISlave::setExposureHeader(uint16_t, uint32_t) {}
 
 #endif

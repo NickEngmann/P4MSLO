@@ -57,6 +57,12 @@ static bool is_camera_settings_panel_active = false;
 
 static bool is_ui_init = false;
 
+/* Opaque white panel that covers the camera canvas on the MAIN page.
+ * Paired with app_video_stream_free_buffers() to reclaim ~7 MB of PSRAM
+ * while the user is on the home screen — that headroom is what lets the
+ * GIF encoder run without competing with the viewfinder. */
+static lv_obj_t *ui_PanelHomeBackground = NULL;
+
 // AI Detection Mode variables
 static ai_detect_mode_t current_ai_detect_mode = AI_DETECT_PEDESTRIAN;
 static lv_obj_t *ai_mode_label = NULL;
@@ -902,6 +908,20 @@ static void ui_extra_clear_popup_window(void)
 }
 
 /**
+ * @brief Called before every non-MAIN redirect. Hides the white home overlay
+ * and brings the video-stream buffers back so camera pages have what they
+ * need. Safe to call even when the buffers are already allocated — the
+ * realloc is a no-op in that case.
+ */
+static void ui_extra_leaving_main(void)
+{
+    if (ui_PanelHomeBackground) {
+        lv_obj_add_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_HIDDEN);
+    }
+    app_video_stream_realloc_buffers();
+}
+
+/**
  * @brief Redirect to main page
  */
 static void ui_extra_redirect_to_main_page(void)
@@ -917,7 +937,18 @@ static void ui_extra_redirect_to_main_page(void)
     lv_obj_clear_flag(ui_ImageCanvasDown, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(ui_PanelCanvasMaskLarge, LV_OBJ_FLAG_HIDDEN);
 
+    /* Show the white home background; its move_background at init makes sure
+     * it sits behind all the scroll/info UI elements. */
+    if (ui_PanelHomeBackground) {
+        lv_obj_clear_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_HIDDEN);
+    }
+
     _ui_screen_change(&ui_ScreenCamera, LV_SCR_LOAD_ANIM_NONE, 0, 0, ui_ScreenCamera_screen_init);
+
+    /* Free the viewfinder PSRAM so GIF encoding has room to work. The
+     * video_stream frame callback has a buffers_freed guard so this is
+     * safe to call while frames are still in flight. */
+    app_video_stream_free_buffers();
 }
 
 /**
@@ -925,6 +956,7 @@ static void ui_extra_redirect_to_main_page(void)
  */
 static void ui_extra_redirect_to_camera_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_CAMERA;
 
     ui_extra_clear_page();
@@ -940,6 +972,7 @@ static void ui_extra_redirect_to_camera_page(void)
  */
 static void ui_extra_redirect_to_interval_camera_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_INTERVAL_CAM;
 
     ui_extra_clear_page();
@@ -955,10 +988,11 @@ static void ui_extra_redirect_to_interval_camera_page(void)
  */
 static void ui_extra_redirect_to_video_mode_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_VIDEO_MODE;
 
     ui_extra_clear_page();
-    
+
     lv_obj_clear_flag(ui_PanelCanvasPopupVideoMode, LV_OBJ_FLAG_HIDDEN);
     if(!lv_popup_timer){
         lv_popup_timer = lv_timer_create(pop_up_timer_callback, 5000, ui_PanelCanvasPopupVideoMode);
@@ -970,10 +1004,11 @@ static void ui_extra_redirect_to_video_mode_page(void)
  */
 static void ui_extra_redirect_to_album_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_ALBUM;
 
     ui_extra_clear_page();
-    
+
     _ui_screen_change(&ui_ScreenAlbum, LV_SCR_LOAD_ANIM_NONE, 0, 0, ui_ScreenAlbum_screen_init);
 
     if(is_sd_card_mounted) {
@@ -984,12 +1019,15 @@ static void ui_extra_redirect_to_album_page(void)
 }
 
 /**
- * @brief Redirect to GIFs page
+ * @brief Redirect to GIFs page.
+ * Auto-scans the SD card for GIFs and starts playback of the newest one
+ * immediately on entry. Feature F1 — no more "press play to start" step.
  */
 static bool gifs_initialized = false;
 
 static void ui_extra_redirect_to_gifs_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_GIFS;
 
     ui_extra_clear_page();
@@ -1002,6 +1040,12 @@ static void ui_extra_redirect_to_gifs_page(void)
             app_gifs_init(ui_ImageScreenGifs);
             gifs_initialized = true;
         }
+        /* Refresh the gallery's file list (picks up new GIFs + preview jpgs
+         * since last visit) and start playing the newest one immediately. */
+        app_gifs_scan();
+        if (app_gifs_get_count() > 0) {
+            app_gifs_play_current();
+        }
     } else {
         lv_obj_clear_flag(ui_PanelGifsPopupSDWarning, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1012,6 +1056,7 @@ static void ui_extra_redirect_to_gifs_page(void)
  */
 static void ui_extra_redirect_to_usb_disk_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_USB_DISK;
 
     ui_extra_clear_page();
@@ -1040,6 +1085,7 @@ static void ui_extra_redirect_to_usb_disk_page(void)
  */
 static void ui_extra_redirect_to_settings_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_SETTINGS;
 
     ui_extra_clear_page();
@@ -1072,6 +1118,7 @@ static void ui_extra_redirect_to_settings_page(void)
  */
 static void ui_extra_redirect_to_ai_detect_page(void)
 {
+    ui_extra_leaving_main();
     current_page = UI_PAGE_AI_DETECT;
 
     ui_extra_clear_page();
@@ -2113,6 +2160,25 @@ void ui_extra_init(void)
     init_settings_options();
 
     lv_scroll_create();
+
+    /* Create the opaque white home-screen overlay. Sized to cover the entire
+     * 240x240 camera canvas. Children (scroll/info/arrows) stay on top since
+     * they're siblings under ui_ScreenCamera and were registered first. */
+    ui_PanelHomeBackground = lv_obj_create(ui_ScreenCamera);
+    lv_obj_set_size(ui_PanelHomeBackground, 240, 240);
+    lv_obj_set_align(ui_PanelHomeBackground, LV_ALIGN_CENTER);
+    lv_obj_clear_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(ui_PanelHomeBackground, lv_color_hex(0xFFFFFF),
+                              LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(ui_PanelHomeBackground, LV_OPA_COVER,
+                            LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_opa(ui_PanelHomeBackground, 0,
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(ui_PanelHomeBackground, 0,
+                            LV_PART_MAIN | LV_STATE_DEFAULT);
+    /* Pull it to the back so the scroll UI (created above) floats on top */
+    lv_obj_move_background(ui_PanelHomeBackground);
+    lv_obj_add_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_HIDDEN);
 
     // reset flag
     is_camera_settings_panel_active = false;

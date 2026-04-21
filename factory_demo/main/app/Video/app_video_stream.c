@@ -704,13 +704,25 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
     // Handle photo request
     if (camera_state.flags.is_initialized) {
         // Handle photo request
-        if (camera_state.flags.is_take_photo && 
+        if (camera_state.flags.is_take_photo &&
             (ui_extra_get_current_page() == UI_PAGE_CAMERA || ui_extra_get_current_page() == UI_PAGE_INTERVAL_CAM)) {
             // Reset photo flag and take a photo
             camera_state.flags.is_take_photo = false;
+
+            /* Snapshot the PIMSLO capture number that the upcoming SPI burst
+             * will use, so we can save a matching P4 preview JPEG. */
+            uint16_t preview_num = 0;
+            if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
+                preview_num = app_pimslo_peek_next_num();
+            }
+
             take_and_save_photo(camera_buf, camera_buf_hes, camera_buf_ves);
+
             // Also trigger PIMSLO SPI capture in background (non-blocking)
             if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
+                /* Save P4 preview BEFORE requesting the SPI capture — the
+                 * capture thread will start encoding on its own timeline. */
+                app_pimslo_save_preview_from_latest_photo(preview_num);
                 app_pimslo_request_capture();
             }
         }

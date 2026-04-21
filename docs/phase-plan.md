@@ -43,11 +43,11 @@ Design decisions (settled):
 
 ---
 
-## Phase 2 — Home-screen & gallery UX
+## ~~Phase 2 — Home-screen & gallery UX~~ ✅ DONE (with follow-up noted)
 
 **Goal**: free PSRAM by killing the home-screen viewfinder, and make the gallery show something meaningful immediately after a capture.
 
-### F2 — Home screen becomes white, viewfinder disabled
+### ~~F2 — Home screen becomes white, viewfinder disabled~~ ✅
 
 The current home (`UI_PAGE_MAIN`) is running the P4 camera feed behind the LVGL UI. That eats PSRAM and CPU. We want the home screen to be a plain white LVGL background when the P4 is idle.
 

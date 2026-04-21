@@ -45,6 +45,32 @@ int app_pimslo_get_queue_depth(void);
  */
 bool app_pimslo_is_encoding(void);
 
+/**
+ * @brief Peek the capture number that will be assigned to the next SPI burst.
+ *
+ * Returns without incrementing. Used by the photo-save path to name the
+ * P4 preview JPEG with the same index the upcoming PIMSLO directory will
+ * use, so the gallery can link them up.
+ */
+uint16_t app_pimslo_peek_next_num(void);
+
+/**
+ * @brief Copy the most recent P4 photo into the preview directory, renaming
+ * it to P4M<num>.jpg so the gallery can use it as a placeholder while the
+ * matching GIF is still encoding.
+ *
+ * Called from the video-stream frame callback right after a P4 photo is
+ * saved via take_and_save_photo(), in combination with app_pimslo_peek_next_num().
+ * Non-blocking-ish (just streams the file in chunks); runs on the caller's task.
+ */
+esp_err_t app_pimslo_save_preview_from_latest_photo(uint16_t num);
+
+/**
+ * @brief Directory where P4 preview JPEGs are stored while their GIF is
+ * being encoded. Format: <dir>/P4M0001.jpg
+ */
+#define PIMSLO_PREVIEW_DIR "/sdcard/p4mslo_previews"
+
 #ifdef __cplusplus
 }
 #endif

@@ -246,3 +246,60 @@ bool app_pimslo_is_encoding(void)
 {
     return s_encoding;
 }
+
+uint16_t app_pimslo_peek_next_num(void)
+{
+    return s_next_capture_num;
+}
+
+#define P4_PHOTO_DIR "/sdcard/esp32_p4_pic_save"
+
+esp_err_t app_pimslo_save_preview_from_latest_photo(uint16_t num)
+{
+    /* Scan the P4 photo directory for the highest-numbered pic_NNNN.jpg. */
+    DIR *dir = opendir(P4_PHOTO_DIR);
+    if (!dir) return ESP_ERR_NOT_FOUND;
+
+    uint32_t best_num = 0;
+    char best_name[32] = {0};
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t n = 0;
+        if (sscanf(entry->d_name, "pic_%lu.jpg", &n) == 1 && n > best_num) {
+            best_num = n;
+            strncpy(best_name, entry->d_name, sizeof(best_name) - 1);
+        }
+    }
+    closedir(dir);
+
+    if (best_num == 0) {
+        ESP_LOGW(TAG, "No P4 photo found to copy as preview");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    mkdir(PIMSLO_PREVIEW_DIR, 0755);
+
+    char src[80], dst[80];
+    snprintf(src, sizeof(src), "%s/%s", P4_PHOTO_DIR, best_name);
+    snprintf(dst, sizeof(dst), "%s/P4M%04u.jpg", PIMSLO_PREVIEW_DIR, num);
+
+    FILE *in = fopen(src, "rb");
+    if (!in) return ESP_ERR_NOT_FOUND;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return ESP_FAIL; }
+
+    uint8_t buf[2048];
+    size_t total = 0;
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in); fclose(out); return ESP_FAIL;
+        }
+        total += n;
+    }
+    fclose(in);
+    fclose(out);
+
+    ESP_LOGI(TAG, "Saved P4 preview: %s → %s (%zu bytes)", src, dst, total);
+    return ESP_OK;
+}

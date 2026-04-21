@@ -24,8 +24,8 @@ struct gif_decoder {
     gif_palette_t palette;
     long first_frame_offset;  /* File offset after header/GCT for reset */
 
-    /* Per-frame state */
-    uint8_t *pixel_indices;   /* width * height */
+    /* Per-frame state. LZW output lands in the first pixel_count bytes of
+     * the caller-owned rgb565 buffer (see gif_decoder_next_frame). */
     int pixel_count;
 };
 
@@ -124,13 +124,12 @@ esp_err_t gif_decoder_open(const char *path, gif_decoder_t **out)
         return ret;
     }
 
-    /* Allocate pixel index buffer */
+    /* No separate pixel-index buffer: gif_decoder_next_frame now decodes
+     * LZW output (1 byte / pixel) directly into the first pixel_count bytes
+     * of the caller's rgb565 output buffer, then converts in place backwards.
+     * Saves 3.3 MB of PSRAM per open decoder for 1824×1920 GIFs, which is
+     * what let full-res PIMSLO GIFs actually play on hardware. */
     dec->pixel_count = dec->width * dec->height;
-    dec->pixel_indices = heap_caps_malloc(dec->pixel_count, MALLOC_CAP_SPIRAM);
-    if (!dec->pixel_indices) {
-        gif_decoder_close(dec);
-        return ESP_ERR_NO_MEM;
-    }
 
     ESP_LOGI(TAG, "Opened GIF: %dx%d, %d palette colors", dec->width, dec->height, dec->palette.count);
 
@@ -213,9 +212,13 @@ esp_err_t gif_decoder_next_frame(gif_decoder_t *dec, uint16_t *rgb565, int *dela
             esp_err_t ret = gif_lzw_dec_create(min_code_size, &lzw);
             if (ret != ESP_OK) return ret;
 
-            /* Decode LZW sub-blocks */
+            /* Decode LZW sub-blocks directly into the caller's rgb565 buffer,
+             * treating it as a byte array for now (1 byte per palette index).
+             * The caller allocated pixel_count * 2 bytes — we use the first
+             * pixel_count bytes as the LZW scratch, then convert in place. */
+            uint8_t *indices = (uint8_t *)rgb565;
             int decoded_pixels = 0;
-            memset(dec->pixel_indices, 0, dec->pixel_count);
+            memset(indices, 0, dec->pixel_count);
 
             while (1) {
                 uint8_t sub_block_size;
@@ -227,7 +230,7 @@ esp_err_t gif_decoder_next_frame(gif_decoder_t *dec, uint16_t *rgb565, int *dela
 
                 int out_len = 0;
                 gif_lzw_dec_feed(lzw, sub_block, sub_block_size,
-                                 dec->pixel_indices + decoded_pixels,
+                                 indices + decoded_pixels,
                                  dec->pixel_count - decoded_pixels,
                                  &out_len);
                 decoded_pixels += out_len;
@@ -235,9 +238,18 @@ esp_err_t gif_decoder_next_frame(gif_decoder_t *dec, uint16_t *rgb565, int *dela
 
             gif_lzw_dec_destroy(lzw);
 
-            /* Convert palette indices to RGB565 */
-            for (int i = 0; i < dec->pixel_count; i++) {
-                uint8_t idx = dec->pixel_indices[i];
+            /* In-place palette → RGB565 conversion, processing BACKWARDS so
+             * the 2-byte write at position i doesn't clobber indices we
+             * haven't read yet at positions 0..i-1.
+             *
+             * Correctness: at iteration i we read indices[i] (1 byte at
+             * offset i) and write rgb565[i] (2 bytes at offsets 2i, 2i+1).
+             * For any i ≥ 1, 2i > i, so the write sits strictly past the
+             * current read position; future reads at i-1, i-2, ..., 0 all
+             * happen at offsets < 2i, untouched. At i = 0 we've already
+             * consumed indices[0] before overwriting bytes 0 and 1. */
+            for (int i = dec->pixel_count - 1; i >= 0; i--) {
+                uint8_t idx = indices[i];
                 gif_color_t *c = &dec->palette.entries[idx];
                 rgb565[i] = rgb888_to_rgb565(c->r, c->g, c->b);
             }
@@ -262,6 +274,7 @@ void gif_decoder_close(gif_decoder_t *dec)
     if (!dec) return;
     if (dec->fp) fclose(dec->fp);
     if (dec->path) free(dec->path);
-    if (dec->pixel_indices) heap_caps_free(dec->pixel_indices);
+    /* (pixel_indices no longer owned here — it lives in the caller's
+     *  rgb565 buffer, re-used via in-place backwards conversion.) */
     free(dec);
 }

@@ -248,6 +248,15 @@ void camera_dectect_task(void)
 
 esp_err_t app_coco_od_detect(uint16_t *data, int width, int height)
 {
+    /* AI detection is off by default (main.c disables init to save ~10MB
+     * PSRAM at boot). Callers like the Album page still invoke this
+     * unconditionally, so guard here — without this the album crashed on
+     * `detect->run(img)` with a NULL-this load-fault. */
+    if (coco_od_detect == NULL) {
+        ESP_LOGD(TAG, "COCO detect skipped — AI subsystem not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(TAG, "Detecting COCO objects");
     detect_results = app_coco_detect(data, width, height);
     if (detect_results.size() > 0) {

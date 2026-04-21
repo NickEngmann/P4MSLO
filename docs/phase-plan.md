@@ -58,14 +58,14 @@ Tasks:
 - Measure PSRAM before/after: expect ≥7MB freed (the camera framebuffer)
 - Document the PSRAM win — it's what unlocks Phase 3
 
-### F1 — Gallery auto-plays on entry
+### ~~F1 — Gallery auto-plays on entry~~ ✅
 
 User reports the forward/back/menu nav works correctly; only the auto-play-on-entry is missing. Task:
 - Inspect `ui_extra_redirect_to_gifs_page()` → verify entry state
 - If the page enters in a paused state, trigger play immediately after load
 - If it already auto-plays (user thinks it might), confirm and note as no-op
 
-### F3 — P4 photo = GIF preview placeholder
+### ~~F3 — P4 photo = GIF preview placeholder~~ ✅ (gallery JPG-display path DEFERRED)
 
 When the photo button is pressed, the P4 already takes its own photo via its camera pipeline AND triggers the SPI cameras AND queues a GIF encode. The user wants the P4 photo to appear in the gallery as the preview for that pending GIF until the encode finishes.
 
@@ -99,7 +99,17 @@ Tasks:
 
 ---
 
-## Phase 3 — Parallel GIF encoding
+## Phase 3 — Parallel GIF encoding 🟡 DEFERRED (see note)
+
+**Deferral rationale (2026-04-19):** After landing Phase 2, the measured MAIN-page PSRAM state is 8.3 MB free, which is also the largest-contiguous-block ceiling (per CLAUDE.md "Known Issues" — 32 MB total, ~8.26 MB max contiguous after boot). The planned double-buffered inter-frame pipeline needs 2× 7.0 MB RGB565 scaled buffers = 14 MB peak — physically infeasible without freeing substantially more PSRAM than what Phase 2 unlocked.
+
+Alternative considered: **intra-frame dither||LZW pipelining** (split the pass-2 hot loop across cores using a row-level ring buffer, no extra large PSRAM). Theoretical gain ~20–25% of encode time, but requires a deep refactor of a tightly-tuned inner loop with per-row cross-core synchronization. Not worth the risk right now.
+
+Also, the remaining user-visible pain is the **capture** latency (~3.4 s) not the **encode** latency (~50 s in the background) — Phase 4's autofocus + exposure-sync improves every frame's image quality, a more visible win per unit of effort.
+
+Revisit Phase 3 if/when: (a) the LCD/LVGL framebuffer is relocated or shrunk, (b) the bottleneck shifts to encoding (e.g. video recording), or (c) profiling shows the dither+LZW split would actually beat its sync overhead.
+
+### ~~Original plan~~
 
 **Goal**: cut GIF encode time roughly in half by pipelining decode + encode.
 

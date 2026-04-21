@@ -95,6 +95,17 @@ typedef struct {
      * will replace it once encoding finishes. Hidden for GIF entries. */
     lv_obj_t *processing_label;
 
+    /* Centered "loading..." overlay shown during a GIF's first loop,
+     * while the decoder is populating the frame-offset map + canvas
+     * cache. Once the decoder's first loop completes and subsequent
+     * frames come from the fast path at native framerate, this hides.
+     * A 500 ms LVGL timer cycles the dots so the user can see the
+     * device is making progress during the ~5-10 s first-loop wait. */
+    lv_obj_t *loading_label;
+    lv_timer_t *loading_timer;
+    int loading_step;
+    bool first_loop_complete;
+
     /* Per-GIF frame counter used only for throttled hash/hit/miss diag
      * logging (first 20 frames of each play_current). Reset per play. */
     int diag_frame_no;
@@ -125,6 +136,50 @@ static inline uint16_t rgb888_to_rgb565_swapped(uint8_t r, uint8_t g, uint8_t b)
 {
     uint16_t px = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
     return (px >> 8) | (px << 8);  /* Byte swap for LV_COLOR_16_SWAP */
+}
+
+/* Cycle the "loading..." overlay's trailing dots so the user sees
+ * visible progress while the decoder's first loop is still populating
+ * the frame cache. Pattern bounces 0 → 1 → 2 → 3 → 2 → 1 → 0... */
+static void loading_anim_cb(lv_timer_t *timer)
+{
+    static const char *patterns[6] = {
+        "loading", "loading.", "loading..", "loading...",
+        "loading..", "loading.",
+    };
+    if (!s_ctx.loading_label) return;
+    bsp_display_lock(0);
+    lv_label_set_text(s_ctx.loading_label, patterns[s_ctx.loading_step]);
+    bsp_display_unlock();
+    s_ctx.loading_step = (s_ctx.loading_step + 1) % 6;
+}
+
+static void show_loading_overlay(void)
+{
+    if (!s_ctx.loading_label) return;
+    s_ctx.loading_step = 0;
+    s_ctx.first_loop_complete = false;
+    bsp_display_lock(0);
+    lv_label_set_text(s_ctx.loading_label, "loading");
+    lv_obj_clear_flag(s_ctx.loading_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ctx.loading_label);
+    bsp_display_unlock();
+    if (!s_ctx.loading_timer) {
+        s_ctx.loading_timer = lv_timer_create(loading_anim_cb, 500, NULL);
+    }
+}
+
+static void hide_loading_overlay(void)
+{
+    if (s_ctx.loading_timer) {
+        lv_timer_del(s_ctx.loading_timer);
+        s_ctx.loading_timer = NULL;
+    }
+    if (s_ctx.loading_label) {
+        bsp_display_lock(0);
+        lv_obj_add_flag(s_ctx.loading_label, LV_OBJ_FLAG_HIDDEN);
+        bsp_display_unlock();
+    }
 }
 
 /* Pull the display filename out of a full path. Keeps the extension so
@@ -160,7 +215,14 @@ static void playback_timer_cb(lv_timer_t *timer)
     uint32_t hash = 0;
     esp_err_t ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
     if (ret == ESP_ERR_NOT_FOUND) {
-        /* Loop: reset to first frame and try again. */
+        /* End of file — loop back to the first frame. This is also the
+         * cue that we've completed one full pass: the frame-offset map
+         * and canvas cache are now populated, so subsequent frames will
+         * fast-path at native framerate. Hide the "loading..." overlay. */
+        if (!s_ctx.first_loop_complete) {
+            s_ctx.first_loop_complete = true;
+            hide_loading_overlay();
+        }
         gif_decoder_reset(s_ctx.decoder);
         ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
         if (ret != ESP_OK) { app_gifs_stop(); return; }
@@ -461,6 +523,20 @@ esp_err_t app_gifs_init(lv_obj_t *canvas)
     lv_label_set_text(s_ctx.processing_label, "PROCESSING");
     lv_obj_add_flag(s_ctx.processing_label, LV_OBJ_FLAG_HIDDEN);
 
+    /* Center "loading..." badge, styled like the PROCESSING one but
+     * smaller and dimmer since it's a transient state. Shown only
+     * during a GIF's first loop. */
+    s_ctx.loading_label = lv_label_create(ui_ScreenGifs);
+    lv_obj_set_style_bg_color(s_ctx.loading_label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_ctx.loading_label, LV_OPA_50, 0);
+    lv_obj_set_style_text_color(s_ctx.loading_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_ctx.loading_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_pad_all(s_ctx.loading_label, 6, 0);
+    lv_obj_set_style_radius(s_ctx.loading_label, 4, 0);
+    lv_obj_align(s_ctx.loading_label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(s_ctx.loading_label, "loading");
+    lv_obj_add_flag(s_ctx.loading_label, LV_OBJ_FLAG_HIDDEN);
+
     return ESP_OK;
 }
 
@@ -742,6 +818,11 @@ esp_err_t app_gifs_play_current(void)
              s_ctx.decode_width, s_ctx.decode_height,
              s_ctx.canvas_width, s_ctx.canvas_height);
 
+    /* Show the "loading..." overlay during first-loop decoding; it self-
+     * hides the moment the decoder wraps back to frame 0 in the playback
+     * timer callback (meaning all frames are now cached). */
+    show_loading_overlay();
+
     s_ctx.is_playing = true;
     s_ctx.play_timer = lv_timer_create(playback_timer_cb, 100, NULL);
     if (!s_ctx.play_timer) {
@@ -760,6 +841,9 @@ void app_gifs_stop(void)
         lv_timer_del(s_ctx.play_timer);
         s_ctx.play_timer = NULL;
     }
+    /* Hide the loading overlay + cancel its animation timer. Safe no-op
+     * if it wasn't shown (e.g. we stopped mid-JPEG preview). */
+    hide_loading_overlay();
 
     if (s_ctx.decoder) {
         gif_decoder_close(s_ctx.decoder);

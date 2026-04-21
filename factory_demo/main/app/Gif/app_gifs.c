@@ -44,18 +44,53 @@ typedef enum {
     GALLERY_ENTRY_JPEG,   /* still preview (encode not yet done) */
 } gallery_entry_type_t;
 
+/* A gallery entry represents one PIMSLO capture. It carries EITHER:
+ *   - gif_path set, jpeg_path maybe-set : primary is an animated GIF;
+ *     the JPEG preview (if present) is shown as an instant-flash still
+ *     while the GIF's first-loop decode is running.
+ *   - gif_path NULL, jpeg_path set       : capture still encoding, show
+ *     the still with the center "PROCESSING" badge.
+ *
+ * Scan merges /sdcard/p4mslo_gifs and /sdcard/p4mslo_previews so every
+ * capture is represented exactly once. */
 typedef struct {
-    char *path;
-    gallery_entry_type_t type;
+    char *gif_path;    /* animated PIMSLO GIF, or NULL if not yet encoded */
+    char *jpeg_path;   /* P4 camera still preview, or NULL if none */
+    gallery_entry_type_t type;  /* GIF if gif_path != NULL, else JPEG */
 } gallery_entry_t;
 
-/* Frame cache entry — maps a hash of a frame's LZW bytes to its
- * already-decoded 240×240 canvas. */
+/* Per-frame cache entry inside a cached GIF — maps a hash of the frame's
+ * LZW bytes to its already-decoded 240×240 canvas. */
 typedef struct {
     uint32_t hash;
     uint16_t *canvas;  /* canvas_width * canvas_height * 2 bytes, PSRAM */
+    int delay_cs;      /* GIF's per-frame delay for timing replay */
     bool used;
 } frame_cache_t;
+
+/* Persistent across-GIF decoded cache. Each slot holds all frames for
+ * one GIF keyed by its path. LRU-evicted when capacity is exceeded.
+ * Lets the user scroll up and down through recently-viewed GIFs and
+ * see them replay instantly from memory instead of re-opening the
+ * file + re-decoding every LZW frame. */
+#define MAX_CACHED_GIFS   5   /* ~5 × 700 KB worst case = ~3.5 MB of PSRAM */
+#define MAX_FRAMES_PER_GIF 12
+
+typedef struct {
+    uint16_t *canvas;    /* 115 KB PSRAM buffer, NULL if empty */
+    int      delay_cs;   /* per-frame GIF delay */
+    uint32_t hash;       /* LZW hash (for dedup when populating) */
+} cached_frame_t;
+
+typedef struct {
+    char *gif_path;                              /* NULL if slot empty */
+    cached_frame_t frames[MAX_FRAMES_PER_GIF];
+    int total_frames;                            /* set on first-loop complete */
+    bool complete;                               /* true once wrap-around seen */
+    int64_t last_used_us;
+} gif_cache_slot_t;
+
+static gif_cache_slot_t g_gif_cache[MAX_CACHED_GIFS];
 
 typedef struct {
     lv_obj_t *canvas;
@@ -544,11 +579,18 @@ static void free_entries(void)
 {
     if (!s_ctx.entries) return;
     for (int i = 0; i < s_ctx.count; i++) {
-        if (s_ctx.entries[i].path) free(s_ctx.entries[i].path);
+        if (s_ctx.entries[i].gif_path) free(s_ctx.entries[i].gif_path);
+        if (s_ctx.entries[i].jpeg_path) free(s_ctx.entries[i].jpeg_path);
     }
     free(s_ctx.entries);
     s_ctx.entries = NULL;
     s_ctx.count = 0;
+}
+
+/* Return the path that identifies this entry (prefers GIF if available). */
+static const char *entry_primary_path(const gallery_entry_t *e)
+{
+    return e->gif_path ? e->gif_path : e->jpeg_path;
 }
 
 void app_gifs_deinit(void)
@@ -575,44 +617,71 @@ static bool extract_pimslo_stem(const char *name, char *stem_out, size_t stem_ca
     return true;
 }
 
+/* Look up an entry by its PIMSLO stem (e.g. "P4M0007"), returning
+ * the index, or -1 if none. Used by the scan's Pass 2 to merge a
+ * discovered JPEG preview into the already-created entry for the
+ * matching GIF, rather than adding a duplicate. */
+static int find_entry_by_stem(const char *stem)
+{
+    for (int i = 0; i < s_ctx.count; i++) {
+        const char *p = entry_primary_path(&s_ctx.entries[i]);
+        if (!p) continue;
+        const char *slash = strrchr(p, '/');
+        const char *base = slash ? slash + 1 : p;
+        char other_stem[32];
+        if (extract_pimslo_stem(base, other_stem, sizeof(other_stem)) &&
+            strcmp(stem, other_stem) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 esp_err_t app_gifs_scan(void)
 {
+    /* Remember the previously-viewed entry by its primary path so we can
+     * restore current_index after the rescan (files may have been added
+     * or removed in between). This is what makes "leave gallery, come
+     * back, land on same GIF" work. */
+    char preserved_path[MAX_PATH_LEN] = "";
+    if (s_ctx.entries && s_ctx.current_index >= 0 &&
+        s_ctx.current_index < s_ctx.count) {
+        const char *p = entry_primary_path(&s_ctx.entries[s_ctx.current_index]);
+        if (p) {
+            strncpy(preserved_path, p, sizeof(preserved_path) - 1);
+            preserved_path[sizeof(preserved_path) - 1] = 0;
+        }
+    }
+
     free_entries();
 
     ensure_gif_dir();
     char gif_dir[MAX_PATH_LEN];
     snprintf(gif_dir, sizeof(gif_dir), "%s/%s", BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME);
 
-    /* Collect PIMSLO stems that already have a finished GIF — those take
-     * priority over the JPEG preview. */
-    char seen_gif_stems[MAX_GIF_FILES][32];
-    int n_seen = 0;
-
     s_ctx.entries = calloc(MAX_GIF_FILES, sizeof(gallery_entry_t));
     if (!s_ctx.entries) return ESP_ERR_NO_MEM;
 
-    /* Pass 1: every .gif in the gifs dir */
+    /* Pass 1: every finished .gif. */
     DIR *dir = opendir(gif_dir);
     if (dir) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL && s_ctx.count < MAX_GIF_FILES) {
             if (!is_gif_file(entry->d_name) || entry->d_name[0] == '.') continue;
-            char stem[32];
-            if (extract_pimslo_stem(entry->d_name, stem, sizeof(stem))
-                && n_seen < MAX_GIF_FILES) {
-                strncpy(seen_gif_stems[n_seen++], stem, 31);
-                seen_gif_stems[n_seen - 1][31] = 0;
-            }
-            s_ctx.entries[s_ctx.count].type = GALLERY_ENTRY_GIF;
-            s_ctx.entries[s_ctx.count].path = malloc(MAX_PATH_LEN);
-            snprintf(s_ctx.entries[s_ctx.count].path, MAX_PATH_LEN,
-                     "%.200s/%.255s", gif_dir, entry->d_name);
-            s_ctx.count++;
+            gallery_entry_t *e = &s_ctx.entries[s_ctx.count++];
+            e->type = GALLERY_ENTRY_GIF;
+            e->gif_path = malloc(MAX_PATH_LEN);
+            snprintf(e->gif_path, MAX_PATH_LEN, "%.200s/%.255s",
+                     gif_dir, entry->d_name);
         }
         closedir(dir);
     }
 
-    /* Pass 2: JPEG previews whose matching GIF isn't ready yet. */
+    /* Pass 2: JPEG previews. If a preview's PIMSLO stem matches an
+     * already-added GIF entry, attach the JPEG path to that entry so
+     * play_current can flash the preview instantly while the GIF's
+     * first-loop decode runs. Previews without a matching GIF become
+     * their own JPEG-type entries. */
     DIR *pdir = opendir(PIMSLO_PREVIEW_DIR);
     if (pdir) {
         struct dirent *entry;
@@ -621,24 +690,41 @@ esp_err_t app_gifs_scan(void)
             if (!ext || strcasecmp(ext, ".jpg") != 0 || entry->d_name[0] == '.') continue;
             char stem[32];
             if (!extract_pimslo_stem(entry->d_name, stem, sizeof(stem))) continue;
-            /* Skip if a matching GIF was already added. */
-            bool shadowed = false;
-            for (int i = 0; i < n_seen; i++) {
-                if (strcmp(seen_gif_stems[i], stem) == 0) { shadowed = true; break; }
-            }
-            if (shadowed) continue;
 
-            s_ctx.entries[s_ctx.count].type = GALLERY_ENTRY_JPEG;
-            s_ctx.entries[s_ctx.count].path = malloc(MAX_PATH_LEN);
-            snprintf(s_ctx.entries[s_ctx.count].path, MAX_PATH_LEN,
-                     "%s/%s", PIMSLO_PREVIEW_DIR, entry->d_name);
-            s_ctx.count++;
+            char jpeg_path[MAX_PATH_LEN];
+            snprintf(jpeg_path, sizeof(jpeg_path), "%s/%s",
+                     PIMSLO_PREVIEW_DIR, entry->d_name);
+
+            int existing = find_entry_by_stem(stem);
+            if (existing >= 0 && s_ctx.entries[existing].type == GALLERY_ENTRY_GIF) {
+                /* Attach preview to existing GIF entry. */
+                s_ctx.entries[existing].jpeg_path = strdup(jpeg_path);
+            } else if (existing < 0) {
+                /* New JPEG-only entry (GIF encode still pending). */
+                gallery_entry_t *e = &s_ctx.entries[s_ctx.count++];
+                e->type = GALLERY_ENTRY_JPEG;
+                e->jpeg_path = strdup(jpeg_path);
+            }
         }
         closedir(pdir);
     }
 
+    /* Restore the previously-viewed entry by path match. If the path no
+     * longer exists (e.g. GIF was deleted) fall back to index 0. */
     s_ctx.current_index = 0;
-    ESP_LOGI(TAG, "Gallery scan: %d entries (GIFs + JPEG previews)", s_ctx.count);
+    if (preserved_path[0]) {
+        for (int i = 0; i < s_ctx.count; i++) {
+            const char *p = entry_primary_path(&s_ctx.entries[i]);
+            if (p && strcmp(p, preserved_path) == 0) {
+                s_ctx.current_index = i;
+                break;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Gallery scan: %d entries, current=%d (preserved_path=%s)",
+             s_ctx.count, s_ctx.current_index,
+             preserved_path[0] ? preserved_path : "<none>");
     return ESP_OK;
 }
 
@@ -775,14 +861,17 @@ esp_err_t app_gifs_play_current(void)
     app_gifs_stop();
 
     const gallery_entry_t *ent = &s_ctx.entries[s_ctx.current_index];
-    ESP_LOGI(TAG, "Gallery entry %d/%d: %s [%s]",
-             s_ctx.current_index + 1, s_ctx.count, ent->path,
-             ent->type == GALLERY_ENTRY_GIF ? "GIF" : "JPEG preview");
+    const char *primary = entry_primary_path(ent);
+    ESP_LOGI(TAG, "Gallery entry %d/%d: %s [%s]%s",
+             s_ctx.current_index + 1, s_ctx.count, primary,
+             ent->type == GALLERY_ENTRY_GIF ? "GIF" : "JPEG preview",
+             (ent->type == GALLERY_ENTRY_GIF && ent->jpeg_path) ?
+                 " (with JPEG preview)" : "");
 
     /* Refresh the on-screen name overlay for this entry, and toggle the
      * "PROCESSING" center badge for JPEG-preview entries (captures whose
      * GIF encode isn't finished yet). */
-    compute_display_name(ent->path, s_ctx.current_label, sizeof(s_ctx.current_label));
+    compute_display_name(primary, s_ctx.current_label, sizeof(s_ctx.current_label));
     bsp_display_lock(0);
     if (s_ctx.name_label) {
         lv_label_set_text(s_ctx.name_label, s_ctx.current_label);
@@ -801,12 +890,25 @@ esp_err_t app_gifs_play_current(void)
 
     if (ent->type == GALLERY_ENTRY_JPEG) {
         /* Static JPEG preview — decode once, no timer. */
-        return show_jpeg(ent->path);
+        return show_jpeg(ent->jpeg_path);
+    }
+
+    /* GIF entry. If we have a preview JPEG for this capture, flash it
+     * onto the canvas *right now* so the user sees something within
+     * ~100 ms instead of staring at the last frame of the previous GIF
+     * for the ~700-2000 ms it takes the decoder's first frame to land.
+     * The playback timer will overwrite the JPEG with the first GIF
+     * frame as soon as the decoder produces it. */
+    if (ent->jpeg_path) {
+        esp_err_t jret = show_jpeg(ent->jpeg_path);
+        if (jret != ESP_OK) {
+            ESP_LOGW(TAG, "JPEG preview flash failed: %s", esp_err_to_name(jret));
+        }
     }
 
     /* GIF — open the decoder and start the frame-paced loop. */
     s_ctx.diag_frame_no = 0;
-    esp_err_t ret = gif_decoder_open(ent->path, &s_ctx.decoder);
+    esp_err_t ret = gif_decoder_open(ent->gif_path, &s_ctx.decoder);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open GIF: %s", esp_err_to_name(ret));
         return ret;

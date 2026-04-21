@@ -43,6 +43,7 @@ static SemaphoreHandle_t s_capture_sem = NULL;
 static QueueHandle_t     s_gif_queue   = NULL;
 static uint16_t          s_next_capture_num = 1;
 static bool              s_encoding = false;
+static volatile bool     s_capturing = false;
 static bool              s_initialized = false;
 
 /* ---- NVS persistence for capture counter ---- */
@@ -127,6 +128,7 @@ static void pimslo_capture_task(void *param)
     while (1) {
         /* Block until capture requested */
         xSemaphoreTake(s_capture_sem, portMAX_DELAY);
+        s_capturing = true;
 
         uint16_t num = s_next_capture_num++;
         save_capture_counter();
@@ -225,6 +227,8 @@ static void pimslo_capture_task(void *param)
         if (!handed_off_to_gif) {
             app_video_stream_realloc_buffers();
         }
+
+        s_capturing = false;
     }
 }
 
@@ -326,6 +330,11 @@ int app_pimslo_get_queue_depth(void)
 bool app_pimslo_is_encoding(void)
 {
     return s_encoding;
+}
+
+bool app_pimslo_is_capturing(void)
+{
+    return s_capturing;
 }
 
 #define P4_PHOTO_DIR "/sdcard/esp32_p4_pic_save"

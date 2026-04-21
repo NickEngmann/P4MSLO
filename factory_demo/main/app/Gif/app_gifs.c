@@ -138,6 +138,15 @@ typedef struct __attribute__((packed)) {
 
 static gif_cache_slot_t g_gif_cache[MAX_CACHED_GIFS];
 
+/* ---- Background-worker shared state --------------------------------
+ *
+ * These coordinate the bg pre-render / encode task with foreground
+ * playback. They're declared up here (not next to the task) so
+ * app_gifs_play_current() can set s_bg_abort_current when it opens a
+ * decoder — that's the signal the bg task polls between frames. */
+static volatile bool s_gallery_open = false;
+static volatile bool s_bg_abort_current = false;
+
 typedef struct {
     lv_obj_t *canvas;
     uint16_t *canvas_buffer;       /* 240x240 for display (decode target) */
@@ -522,6 +531,174 @@ fail_release:
     slot->playback_count = 0;
     slot->complete = false;
     slot->from_disk = false;
+    return ESP_FAIL;
+}
+
+/* ---- Direct JPEG → 240×240 canvas (no GIF decoder) ------------------
+ *
+ * Uses tjpgd with a custom out_cb that applies a source-space crop rect
+ * and nearest-neighbor downscales into a target canvas. Memory cost:
+ * one 32 KB tjpgd work buffer + the destination canvas. The full-res
+ * pixel buffer is never materialized — tjpgd emits MCU tiles and we
+ * pick the pixels we care about inline. */
+
+typedef struct {
+    FILE *fp;
+    uint16_t *canvas;
+    int canvas_w, canvas_h;
+    int crop_x, crop_y, crop_w, crop_h;    /* source-space crop rect */
+} jpeg_crop_ctx_t;
+
+static size_t jpeg_crop_in_cb(JDEC *jd, uint8_t *buf, size_t len)
+{
+    jpeg_crop_ctx_t *c = (jpeg_crop_ctx_t *)jd->device;
+    if (buf) return fread(buf, 1, len, c->fp);
+    return (size_t)(fseek(c->fp, (long)len, SEEK_CUR) == 0 ? len : 0);
+}
+
+static int jpeg_crop_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    jpeg_crop_ctx_t *c = (jpeg_crop_ctx_t *)jd->device;
+    const uint8_t *src = (const uint8_t *)bitmap;
+    int bw = rect->right - rect->left + 1;
+    int bh = rect->bottom - rect->top + 1;
+
+    for (int by = 0; by < bh; by++) {
+        int src_y = rect->top + by;
+        /* Source row must fall inside the crop rect. */
+        if (src_y < c->crop_y || src_y >= c->crop_y + c->crop_h) continue;
+        int cropped_y = src_y - c->crop_y;
+        int out_y = (cropped_y * c->canvas_h) / c->crop_h;
+        if (out_y < 0 || out_y >= c->canvas_h) continue;
+        /* Nearest-neighbor: only emit this source row if it's the first
+         * one mapping to `out_y`. */
+        int first_src_y = c->crop_y + (out_y * c->crop_h) / c->canvas_h;
+        if (src_y != first_src_y) continue;
+
+        for (int bx = 0; bx < bw; bx++) {
+            int src_x = rect->left + bx;
+            if (src_x < c->crop_x || src_x >= c->crop_x + c->crop_w) continue;
+            int cropped_x = src_x - c->crop_x;
+            int out_x = (cropped_x * c->canvas_w) / c->crop_w;
+            if (out_x < 0 || out_x >= c->canvas_w) continue;
+            int first_src_x = c->crop_x + (out_x * c->crop_w) / c->canvas_w;
+            if (src_x != first_src_x) continue;
+
+            const uint8_t *px = &src[(by * bw + bx) * 3];
+            uint16_t pxl = ((px[0] >> 3) << 11)
+                         | ((px[1] >> 2) << 5)
+                         |  (px[2] >> 3);
+            c->canvas[out_y * c->canvas_w + out_x] = (pxl >> 8) | (pxl << 8);
+        }
+    }
+    return 1;
+}
+
+/* Decode one JPEG into `canvas` (canvas_w × canvas_h RGB565 byte-swapped),
+ * applying the given source-space crop rect with nearest-neighbor scaling.
+ * Caller owns `canvas`. */
+static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
+                                              int crop_x, int crop_y,
+                                              int crop_w, int crop_h,
+                                              uint16_t *canvas,
+                                              int canvas_w, int canvas_h)
+{
+    FILE *fp = fopen(jpeg_path, "rb");
+    if (!fp) return ESP_ERR_NOT_FOUND;
+
+    /* tjpgd working buffer. PSRAM so the task stack stays small. */
+    uint8_t *work = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM);
+    if (!work) { fclose(fp); return ESP_ERR_NO_MEM; }
+
+    jpeg_crop_ctx_t ctx = {
+        .fp = fp,
+        .canvas = canvas,
+        .canvas_w = canvas_w, .canvas_h = canvas_h,
+        .crop_x = crop_x, .crop_y = crop_y,
+        .crop_w = crop_w, .crop_h = crop_h,
+    };
+
+    /* Start with a black canvas so any pixels outside the crop stay clear. */
+    memset(canvas, 0x10, (size_t)canvas_w * canvas_h * 2);
+
+    JDEC jd;
+    JRESULT r = gif_jd_prepare(&jd, jpeg_crop_in_cb, work, 32768, &ctx);
+    if (r == JDR_OK) {
+        r = gif_jd_decomp(&jd, jpeg_crop_out_cb, 0);
+    }
+    heap_caps_free(work);
+    fclose(fp);
+    return (r == JDR_OK) ? ESP_OK : ESP_FAIL;
+}
+
+/* Write a .p4ms file for a PIMSLO capture WITHOUT going through the GIF
+ * decoder. Decodes each `pos{1..N}.jpg` to 240×240 via tjpgd with the
+ * given parallax crop, builds the palindrome playback order
+ * (1,2,…,N,N-1,…,2), and saves via save_small_gif. Memory footprint:
+ * ≤ 4 × 115 KB canvases + one 32 KB tjpgd work buffer (≤ ~500 KB). */
+static esp_err_t save_small_gif_from_jpegs(const char *capture_dir,
+                                             const char *gif_output_path,
+                                             const gif_crop_rect_t *crops,
+                                             int num_cams,
+                                             int delay_cs)
+{
+    if (num_cams < 2 || num_cams > MAX_FRAMES_PER_GIF) return ESP_ERR_INVALID_ARG;
+    if (s_ctx.canvas_width <= 0 || s_ctx.canvas_height <= 0) return ESP_ERR_INVALID_STATE;
+
+    gif_cache_slot_t local = {0};
+    local.gif_path = strdup(gif_output_path);
+    if (!local.gif_path) return ESP_ERR_NO_MEM;
+
+    size_t canvas_bytes = (size_t)s_ctx.canvas_width * s_ctx.canvas_height * 2;
+
+    for (int i = 0; i < num_cams; i++) {
+        char jpeg_path[96];
+        snprintf(jpeg_path, sizeof(jpeg_path), "%s/pos%d.jpg", capture_dir, i + 1);
+
+        uint16_t *canvas = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
+        if (!canvas) { free(local.gif_path); goto fail; }
+
+        esp_err_t r = decode_jpeg_crop_to_canvas(jpeg_path,
+                                                  crops[i].x, crops[i].y,
+                                                  crops[i].w, crops[i].h,
+                                                  canvas,
+                                                  s_ctx.canvas_width, s_ctx.canvas_height);
+        if (r != ESP_OK) {
+            heap_caps_free(canvas);
+            ESP_LOGW(TAG, "save_small_gif_from_jpegs: decode %s failed", jpeg_path);
+            free(local.gif_path);
+            goto fail;
+        }
+        local.frames[i].canvas = canvas;
+        local.frames[i].delay_cs = delay_cs;
+        local.frames[i].hash = 0;
+    }
+    local.n_frames = num_cams;
+
+    /* Palindrome playback: 0,1,…,N-1,N-2,…,1  (length = 2N-2). */
+    int pc = 0;
+    for (int i = 0; i < num_cams && pc < (int)sizeof(local.playback_order); i++) {
+        local.playback_order[pc++] = (uint8_t)i;
+    }
+    for (int i = num_cams - 2; i >= 1 && pc < (int)sizeof(local.playback_order); i--) {
+        local.playback_order[pc++] = (uint8_t)i;
+    }
+    local.playback_count = pc;
+    local.complete = true;
+    local.from_disk = false;
+
+    esp_err_t ret = save_small_gif(&local);
+
+    for (int i = 0; i < local.n_frames; i++) {
+        if (local.frames[i].canvas) heap_caps_free(local.frames[i].canvas);
+    }
+    free(local.gif_path);
+    return ret;
+
+fail:
+    for (int i = 0; i < MAX_FRAMES_PER_GIF; i++) {
+        if (local.frames[i].canvas) heap_caps_free(local.frames[i].canvas);
+    }
     return ESP_FAIL;
 }
 
@@ -1315,6 +1492,9 @@ esp_err_t app_gifs_play_current(void)
      * loop decode. A complete slot (memory-resident OR just loaded from
      * .p4ms) plays entirely from the cached canvas table. */
     if (!s_ctx.first_loop_complete) {
+        /* Tell the bg worker to release its own decoder NOW — foreground
+         * is about to claim the ~7 MB PSRAM that a decoder needs. */
+        s_bg_abort_current = true;
         esp_err_t ret = gif_decoder_open(ent->gif_path, &s_ctx.decoder);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to open GIF: %s", esp_err_to_name(ret));
@@ -1501,6 +1681,28 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         jpeg_data[i] = NULL;
     }
 
+    /* Produce the 240×240 .p4ms now — BEFORE gif_encoder_create()
+     * allocates its ~7 MB scaled_buf. Uses tjpgd on the source JPEGs
+     * with the already-computed parallax crops; no GIF decoder involved,
+     * total working set stays under ~500 KB. Gallery can then replay
+     * this capture from disk on future visits without ever touching
+     * the GIF decoder. */
+    {
+        const char *dir_name_p = strrchr(capture_dir, '/');
+        dir_name_p = dir_name_p ? dir_name_p + 1 : capture_dir;
+        char p4ms_gif_path[MAX_PATH_LEN];
+        snprintf(p4ms_gif_path, sizeof(p4ms_gif_path), "%s/%s/%s.gif",
+                 BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, dir_name_p);
+        esp_err_t psave = save_small_gif_from_jpegs(capture_dir, p4ms_gif_path,
+                                                     crops, num_cams, delay_cs);
+        if (psave == ESP_OK) {
+            ESP_LOGI(TAG, "Direct-JPEG .p4ms saved for %s", dir_name_p);
+        } else {
+            ESP_LOGW(TAG, "Direct-JPEG .p4ms save failed (0x%x) — bg worker "
+                          "will retry from .gif later", psave);
+        }
+    }
+
     /* Create encoder — square crop at full resolution */
     gif_encoder_config_t cfg = {
         .frame_delay_cs = delay_cs,
@@ -1667,4 +1869,306 @@ esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+/* ---- Background worker ---------------------------------------------
+ *
+ * Persistent Core-1 task. When the system is otherwise idle (no user in
+ * the gallery, no active PIMSLO capture / encode, no in-flight album
+ * encode), the worker walks two queues:
+ *
+ *   1. `.gif` files under /sdcard/p4mslo_gifs/ that don't yet have a
+ *      matching /sdcard/p4mslo_small/<stem>.p4ms. Opens the decoder,
+ *      iterates the frames, and saves the pre-rendered small version.
+ *   2. JPEG-only gallery entries (preview exists but the .gif was never
+ *      produced — e.g. encode interrupted by a reboot). If the source
+ *      /sdcard/p4mslo/<stem>/pos*.jpg directory still exists, kicks off
+ *      app_gifs_encode_pimslo_from_dir(). That function produces both
+ *      the .gif and the .p4ms in one pass (the direct-JPEG save above).
+ *
+ * Between work items the worker checks `s_gallery_open` and the PIMSLO
+ * flags, and any in-progress pre-render polls `s_bg_abort_current` so
+ * foreground activity can preempt it. */
+
+static TaskHandle_t  s_bg_worker = NULL;
+/* s_gallery_open / s_bg_abort_current are declared near the top of the
+ * file so play_current() can poke them. */
+
+void app_gifs_set_gallery_open(bool open)
+{
+    s_gallery_open = open;
+    if (open) s_bg_abort_current = true;
+}
+
+/* Used once at the top of a bg iteration — full check including a
+ * PSRAM-fragmentation back-stop. Opening a decoder pins ~3.5 MB so we
+ * want to see a comfortable contiguous block BEFORE we commit. */
+static bool bg_should_yield(void)
+{
+    /* The real constraint is the foreground GIF decoder — not whether
+     * the gallery is open. If the active entry is playing from .p4ms
+     * (cached-only mode, no decoder), we can freely pre-render other
+     * entries in the background; the user will see new ones flip to
+     * instant-load as they navigate. */
+    if (s_ctx.decoder != NULL) return true;
+    if (s_ctx.is_encoding) return true;
+    if (app_pimslo_is_encoding()) return true;
+    if (app_pimslo_is_capturing()) return true;
+    if (app_pimslo_get_queue_depth() > 0) return true;
+
+    size_t contig = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (contig < 5 * 1024 * 1024) return true;
+
+    return false;
+}
+
+/* Used inside a running pre-render's per-frame loop. Intentionally does
+ * NOT check the PSRAM contig threshold — the bg decoder itself is
+ * already holding ~3.5 MB, so that check would always trip mid-render
+ * and uselessly abort every attempt. Only checks signals that mean
+ * "foreground truly claimed something new." */
+static bool bg_should_abort_current(void)
+{
+    if (s_bg_abort_current) return true;
+    if (s_ctx.decoder != NULL) return true;        /* foreground opened a decoder */
+    if (s_ctx.is_encoding) return true;
+    if (app_pimslo_is_capturing()) return true;
+    if (app_pimslo_is_encoding()) return true;
+    return false;
+}
+
+/* Session-scoped blacklist of .gif paths that failed bg pre-render at
+ * least once. Prevents the worker from pounding the same broken file
+ * every 3 seconds forever. Cleared on reboot. */
+#define BG_BLACKLIST_MAX 16
+static char *s_bg_blacklist[BG_BLACKLIST_MAX] = {0};
+static int   s_bg_blacklist_n = 0;
+
+static bool bg_is_blacklisted(const char *path)
+{
+    for (int i = 0; i < s_bg_blacklist_n; i++) {
+        if (s_bg_blacklist[i] && strcmp(s_bg_blacklist[i], path) == 0) return true;
+    }
+    return false;
+}
+
+static void bg_blacklist_add(const char *path)
+{
+    if (bg_is_blacklisted(path)) return;
+    if (s_bg_blacklist_n >= BG_BLACKLIST_MAX) return;
+    s_bg_blacklist[s_bg_blacklist_n++] = strdup(path);
+    ESP_LOGW(TAG, "BG: blacklisting %s after repeated failure", path);
+}
+
+/* Search /sdcard/p4mslo_gifs for the first .gif that doesn't have a
+ * matching .p4ms and hasn't been blacklisted this session. */
+static bool bg_find_unprocessed_gif(char *out, size_t cap)
+{
+    char dir[MAX_PATH_LEN];
+    snprintf(dir, sizeof(dir), "%s/%s", BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME);
+    DIR *d = opendir(dir);
+    if (!d) return false;
+
+    bool found = false;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!is_gif_file(e->d_name) || e->d_name[0] == '.') continue;
+        char gif_path[MAX_PATH_LEN];
+        snprintf(gif_path, sizeof(gif_path), "%.200s/%.255s", dir, e->d_name);
+        if (small_file_exists(gif_path)) continue;
+        if (bg_is_blacklisted(gif_path)) continue;
+
+        strncpy(out, gif_path, cap - 1);
+        out[cap - 1] = 0;
+        found = true;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+
+/* Search /sdcard/p4mslo_previews for JPEGs whose capture hasn't
+ * produced a .gif yet, AND whose source /sdcard/p4mslo/<stem>/pos1.jpg
+ * still exists. Returns the capture directory so the encoder can
+ * consume it. */
+static bool bg_find_jpeg_only(char *out_capture_dir, size_t cap)
+{
+    DIR *d = opendir(PIMSLO_PREVIEW_DIR);
+    if (!d) return false;
+
+    bool found = false;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        const char *ext = strrchr(e->d_name, '.');
+        if (!ext || strcasecmp(ext, ".jpg") != 0 || e->d_name[0] == '.') continue;
+        char stem[32];
+        if (!extract_pimslo_stem(e->d_name, stem, sizeof(stem))) continue;
+
+        char gif_path[MAX_PATH_LEN];
+        snprintf(gif_path, sizeof(gif_path), "%s/%s/%s.gif",
+                 BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, stem);
+        struct stat st;
+        if (stat(gif_path, &st) == 0) continue;  /* GIF already produced */
+
+        char capture_dir[MAX_PATH_LEN];
+        snprintf(capture_dir, sizeof(capture_dir), "/sdcard/p4mslo/%s", stem);
+        char pos1[MAX_PATH_LEN + 16];
+        snprintf(pos1, sizeof(pos1), "%s/pos1.jpg", capture_dir);
+        if (stat(pos1, &st) != 0) continue;  /* no source frames */
+
+        strncpy(out_capture_dir, capture_dir, cap - 1);
+        out_capture_dir[cap - 1] = 0;
+        found = true;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+
+/* Decode a .gif into a temporary slot and persist it as .p4ms. Bails
+ * early on foreground activity (polls s_bg_abort_current / s_gallery_open
+ * between frames). Designed to use roughly the same PSRAM as active
+ * playback (~3.5 MB for pixel_indices + growing pending_lzw), so MUST
+ * only be called when the foreground decoder is idle. */
+static esp_err_t bg_render_p4ms_from_gif(const char *gif_path)
+{
+    if (!gif_path || s_ctx.canvas_width <= 0) return ESP_ERR_INVALID_STATE;
+
+    gif_decoder_t *dec = NULL;
+    uint16_t *tmp_canvas = NULL;
+    gif_cache_slot_t local = {0};
+    esp_err_t ret = ESP_FAIL;
+    size_t canvas_bytes = (size_t)s_ctx.canvas_width * s_ctx.canvas_height * 2;
+
+    local.gif_path = strdup(gif_path);
+    if (!local.gif_path) return ESP_ERR_NO_MEM;
+
+    tmp_canvas = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
+    if (!tmp_canvas) { ret = ESP_ERR_NO_MEM; goto done; }
+
+    ret = gif_decoder_open(gif_path, &dec);
+    if (ret != ESP_OK) goto done;
+
+    s_bg_abort_current = false;
+    while (1) {
+        /* Preempt if the foreground claimed a decoder or PIMSLO started
+         * capturing/encoding. Does NOT check PSRAM threshold — our own
+         * decoder is part of what's using it. */
+        if (bg_should_abort_current()) {
+            ret = ESP_ERR_INVALID_STATE;
+            goto done;
+        }
+
+        uint32_t hash = 0;
+        int delay_cs = 10;
+        esp_err_t r = gif_decoder_read_next_frame(dec, &hash, &delay_cs);
+        if (r == ESP_ERR_NOT_FOUND) break;
+        if (r != ESP_OK) { ret = r; goto done; }
+
+        /* Dedup against already-stored unique frames. */
+        int hit = -1;
+        for (int i = 0; i < local.n_frames; i++) {
+            if (local.frames[i].canvas && local.frames[i].hash == hash) { hit = i; break; }
+        }
+
+        if (hit >= 0) {
+            gif_decoder_discard_read_frame(dec);
+        } else {
+            if (local.n_frames >= MAX_FRAMES_PER_GIF) {
+                ret = ESP_ERR_NO_MEM;
+                goto done;
+            }
+            r = gif_decoder_decode_read_frame(dec, tmp_canvas,
+                                                s_ctx.canvas_width,
+                                                s_ctx.canvas_height);
+            if (r != ESP_OK) { ret = r; goto done; }
+            uint16_t *copy = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
+            if (!copy) { ret = ESP_ERR_NO_MEM; goto done; }
+            memcpy(copy, tmp_canvas, canvas_bytes);
+            hit = local.n_frames++;
+            local.frames[hit].canvas = copy;
+            local.frames[hit].hash = hash;
+            local.frames[hit].delay_cs = delay_cs;
+        }
+
+        if (local.playback_count < (int)sizeof(local.playback_order) && hit < 256) {
+            local.playback_order[local.playback_count++] = (uint8_t)hit;
+        }
+    }
+
+    local.complete = true;
+    local.from_disk = false;
+    ret = save_small_gif(&local);
+
+done:
+    if (dec) gif_decoder_close(dec);
+    if (tmp_canvas) heap_caps_free(tmp_canvas);
+    for (int i = 0; i < MAX_FRAMES_PER_GIF; i++) {
+        if (local.frames[i].canvas) heap_caps_free(local.frames[i].canvas);
+    }
+    free(local.gif_path);
+    return ret;
+}
+
+static void bg_worker_task(void *arg)
+{
+    ESP_LOGI(TAG, "BG worker started on core %d", xPortGetCoreID());
+
+    const TickType_t STEP_DELAY = pdMS_TO_TICKS(3000);
+    const TickType_t IDLE_DELAY = pdMS_TO_TICKS(15000);
+    const TickType_t YIELD_DELAY = pdMS_TO_TICKS(2000);
+
+    while (1) {
+        /* Let the system finish booting / settle before the first pass. */
+        vTaskDelay(STEP_DELAY);
+
+        if (bg_should_yield()) {
+            vTaskDelay(YIELD_DELAY);
+            continue;
+        }
+
+        char path[MAX_PATH_LEN];
+
+        /* Priority 1: pre-render .p4ms for existing .gif files. */
+        if (bg_find_unprocessed_gif(path, sizeof(path))) {
+            ESP_LOGI(TAG, "BG: pre-rendering .p4ms for %s", path);
+            esp_err_t r = bg_render_p4ms_from_gif(path);
+            if (r == ESP_OK) {
+                ESP_LOGI(TAG, "BG: pre-render success");
+            } else if (r == ESP_ERR_INVALID_STATE) {
+                /* Foreground claimed the decoder — this isn't the file's
+                 * fault, retry next pass without blacklisting. */
+                ESP_LOGI(TAG, "BG: pre-render aborted (foreground claim)");
+            } else {
+                /* Genuine failure (broken file, OOM, etc) — blacklist so
+                 * we don't keep thrashing on the same source forever. */
+                ESP_LOGW(TAG, "BG: pre-render failed 0x%x", r);
+                bg_blacklist_add(path);
+            }
+            continue;
+        }
+
+        /* Priority 2: encode stale PIMSLO captures. */
+        if (bg_find_jpeg_only(path, sizeof(path))) {
+            ESP_LOGI(TAG, "BG: encoding PIMSLO from %s", path);
+            /* app_gifs_encode_pimslo_from_dir handles freeing/restoring
+             * camera buffers and calling app_gifs_scan() on finish. */
+            app_gifs_encode_pimslo_from_dir(path, 150, 0.05f);
+            continue;
+        }
+
+        /* Nothing to do — idle longer. */
+        vTaskDelay(IDLE_DELAY);
+    }
+}
+
+void app_gifs_start_background_worker(void)
+{
+    if (s_bg_worker) return;
+    BaseType_t r = xTaskCreatePinnedToCore(
+        bg_worker_task, "gif_bg", 8192, NULL, 2, &s_bg_worker, 1);
+    if (r != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start BG worker");
+        s_bg_worker = NULL;
+    }
 }

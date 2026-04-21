@@ -23,6 +23,7 @@
 #include "app_qma6100.h"
 #include "app_serial_cmd.h"
 #include "app_pimslo.h"
+#include "app_gifs.h"
 
 static const char *TAG = "main";
 
@@ -101,6 +102,12 @@ void app_main(void)
     // Initialize serial command interface for automated testing
     ESP_LOGI(TAG, "Initialize serial command interface");
     app_serial_cmd_init();
+
+    // Start the gallery background worker. It pre-renders .p4ms files for
+    // any .gif that lacks one, then re-encodes any stale PIMSLO captures
+    // whose .gif was never produced (e.g. reboot mid-encode). Idles when
+    // the user is on the gallery or PIMSLO is actively capturing/encoding.
+    app_gifs_start_background_worker();
 
     ESP_LOGI(TAG, "Application initialization completed");
 }

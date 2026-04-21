@@ -98,6 +98,33 @@ esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax);
 esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
                                            int frame_delay_ms, float parallax);
 
+/**
+ * @brief Start the background worker that pre-renders `.p4ms` files and
+ *        auto-encodes stale PIMSLO captures.
+ *
+ * One shot; safe to call once at boot after app_gifs_init() and
+ * app_pimslo_init(). The task lives on Core 1 at priority 2 and yields
+ * to foreground activity (open gallery, active PIMSLO capture / encode).
+ *
+ * Work priority (per iteration):
+ *   1. `.gif` files that don't have a matching `.p4ms` — pre-render
+ *      them so next gallery entry plays instantly from disk.
+ *   2. PIMSLO captures that still have a JPEG preview but no `.gif`
+ *      (e.g. encode interrupted by a reboot) — re-run the PIMSLO
+ *      encode from `/sdcard/p4mslo/<stem>/`.
+ *
+ * When both queues are empty the worker idles at low duty cycle.
+ */
+void app_gifs_start_background_worker(void);
+
+/**
+ * @brief Tell the background worker whether the user is on the gallery
+ *        page. When true, the worker aborts any in-progress pre-render
+ *        and pauses scheduling — foreground playback has exclusive
+ *        access to the gif_decoder and the PSRAM it pins.
+ */
+void app_gifs_set_gallery_open(bool open);
+
 #ifdef __cplusplus
 }
 #endif

@@ -46,6 +46,14 @@ int app_pimslo_get_queue_depth(void);
 bool app_pimslo_is_encoding(void);
 
 /**
+ * @brief Check if an SPI capture + save is currently running on the
+ * capture task. True between the semaphore-take and the end of the
+ * capture + JPEG-save cycle. Use from background workers that need to
+ * defer PSRAM-heavy work to avoid contending with the capture buffers.
+ */
+bool app_pimslo_is_capturing(void);
+
+/**
  * @brief Copy the most recent P4 photo into the preview directory, renaming
  * it to P4M<num>.jpg so the gallery can use it as a placeholder while the
  * matching GIF is still encoding.

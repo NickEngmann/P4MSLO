@@ -934,6 +934,9 @@ static void ui_extra_leaving_main(void)
      * gallery anymore; camera / video / encoder paths need that PSRAM. */
     app_gifs_stop();
     app_gifs_flush_cache();
+    /* Let the background worker resume — user no longer holds the
+     * gallery's decoder / PSRAM. */
+    app_gifs_set_gallery_open(false);
 }
 
 /**
@@ -947,6 +950,7 @@ static void ui_extra_redirect_to_main_page(void)
      * Matches what leaving_main() does for non-MAIN destinations. */
     app_gifs_stop();
     app_gifs_flush_cache();
+    app_gifs_set_gallery_open(false);
 
     ui_extra_clear_page();
 
@@ -1054,6 +1058,10 @@ static bool gifs_initialized = false;
 static void ui_extra_redirect_to_gifs_page(void)
 {
     ui_extra_leaving_main();
+    /* Tell the gallery background worker to pause — it's about to try
+     * to open a gif_decoder for pre-rendering, which would conflict with
+     * the one we're about to open for playback. */
+    app_gifs_set_gallery_open(true);
     /* GIF decoder needs up to ~7.4 MB for the decode buffer — free the
      * camera buffers if we're arriving from a camera page. Idempotent. */
     app_video_stream_free_buffers();

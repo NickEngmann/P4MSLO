@@ -513,6 +513,12 @@ static void dispatch_command(char *line)
             cmd_respond("error spi_pimslo capture_ms=%lu saved=%d",
                         (unsigned long)capture_ms, saved);
         }
+    } else if (strcmp(line, "photo_btn") == 0) {
+        /* Simulate a photo-button press: kicks the PIMSLO capture
+         * semaphore so the capture task runs SPI → save → encode in
+         * the background, same as the hardware photo button. */
+        app_pimslo_request_capture();
+        cmd_respond("ok photo_btn (capture queued)");
     } else if (strcmp(line, "pimslo") == 0) {
         /* Create PIMSLO GIF from /sdcard/pimslo/pos{1-4}.jpg */
         int delay = 150;

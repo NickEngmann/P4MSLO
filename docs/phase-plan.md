@@ -2,6 +2,30 @@
 
 This is the working plan for the current multi-feature session. Features are grouped into 5 phases, each landing as its own commit. Phases are ordered so low-risk changes ship first and each later phase can assume the earlier ones are in place.
 
+## Lessons-learned index (updated 2026-04-21)
+
+Concrete things this multi-session implementation cycle taught me, all rediscovered via on-device testing after I'd already "verified" them via host-test + build-only checks:
+
+1. **Host tests + a clean build are not verification.** They guarantee the code compiles and the pure-logic parts work. They tell you nothing about what a 4 KB FreeRTOS task stack can survive, about PSRAM fragmentation under real workloads, or about GIF decoder behavior when the encoder is holding 7 MB. You have to actually flash the firmware and drive the UI to find the interesting failures.
+
+2. **PSRAM is not a flat pool of contiguous bytes.** 7.7 MB free ≠ 7.7 MB allocatable. After a few camera on/off cycles the largest contiguous block drops to ~6.5–6.8 MB — right at the PIMSLO GIF decoder's footprint. Any new 7+ MB consumer must either pre-allocate at boot (before fragmentation) or be rewritten to not need a 7 MB block at all.
+
+3. **Stack sizes matter for callbacks.** The video-stream task runs with 4 KB. A 2 KB stack buffer in any function it calls will blow the stack. Symptom: `MCAUSE=0x1b`, panic in `__ssprint_r`, `S0/FP=0x00000000`. Fix: heap-allocate the buffer or move the work to a different task with more stack.
+
+4. **Every page redirect should explicitly manage its PSRAM footprint.** A one-size-fits-all "leaving_main" hook that unconditionally reallocates viewfinder buffers hurts pure-display pages (GIFS, ALBUM) that need that PSRAM for their own decoders.
+
+5. **GIF playback holds memory across navigation.** If you navigate away without calling `app_gifs_stop()`, the decode buffer + canvas stays allocated and cripples the next camera page's startup.
+
+6. **Global-pointer-based subsystems need NULL guards at every public entry point.** AI detection is off by default to save PSRAM; the album page still unconditionally calls its COCO detector. Result: NULL-this panic. Fix: the detector's public entry point checks initialized state.
+
+7. **The SPI 0x01–0x07 "safe range" was conservative.** With the 10× burst retry the master already does, any command in 0x01–0x0F is reliable. Expanded command space to 0x08 (AUTOFOCUS) and 0x09 (SET_EXPOSURE) without issue.
+
+8. **Extended IDLE header is backward-compatible.** Masters still reading only 5 bytes keep working unchanged — the extra AE bytes at offsets 5-9 are just zero-padding to them.
+
+9. **Background encode vs foreground playback is the architecture issue.** The GIF encoder needs 7 MB; the player needs 7 MB; PSRAM only has ~8 MB contiguous. Neither pausing encoding nor defragmenting solves this robustly — only a streaming decoder that doesn't need the full-res intermediate does. Tracked as "Phase 3-style refactor" in the next steps section.
+
+---
+
 ## On-device verification summary (2026-04-21)
 
 After the code landed, flashed to real P4-EYE hardware and 2 S3 cameras (OTA via HTTP). Reproduced the originally-reported "take picture → P4 freezes + returns to home screen" crash on the first press after flash — traced via RISC-V panic dump (`MCAUSE=0x1b`, stack protection fault in video-stream task), root-caused to a 2 KB on-stack copy buffer in the Phase 2 preview-save path, fixed by moving the save into the PIMSLO capture task (8 KB stack) + heap-allocating the buffer. Commit `988da32`.
@@ -13,6 +37,23 @@ Third issue: gallery entry OOM'd the GIF decoder because my Phase 2 `leaving_mai
 End-to-end verified on device: photo button → P4 JPEG saved → preview JPG copied → SPI capture 3/4 cameras → GIF queued → GIF encoded to `P4M0008.gif` (7.9 MB on SD), zero panics. 80/80 host tests pass, +20 from this session.
 
 Phase 5 `wifi_start` runs, fails cleanly (C6 SDIO transport pins not wired to esp_hosted defaults), device stays stable — confirms the documented "needs schematic review" blocker.
+
+### Round 2 on-device findings + fixes (2026-04-21 later)
+
+After the user pointed out that the "end-to-end" claim was too strong ("GIF menu still says 'press to play', Album crashes"), I ran an exhaustive page+button sweep via serial. Found:
+
+- **Gallery "press to play" bug** — GIFS decode_buffer (6.7 MB) alloc failed because the GIF decoder also kept a 3.3 MB pixel_indices buffer alongside it; 10 MB > 8 MB max contig.
+  Fix: in-place backwards palette→RGB565 conversion, single buffer used for both LZW output and final RGB565. Peak 10 MB → 6.7 MB. Commit `e0dea27`.
+- **Album crash** — `app_coco_od_detect()` called `detect->run(img)` on a NULL `detect` because AI init is off by default at boot.
+  Fix: guard the public entry point against uninitialized state. Commit `e0dea27`.
+- **Camera-buffer realloc fails after GIF→CAMERA** — GIF playback kept running after leaving GIFS, holding 7 MB PSRAM.
+  Fix: `app_gifs_stop()` on every page transition (in `leaving_main` and `redirect_to_main_page`). Commit `8666f6d`.
+- **PSRAM fragmentation after camera ops** — contiguous block drops below decode-buffer size even with 7.7 MB total free.
+  Mitigation: video-stream buffer alloc/free churn on OOM to consolidate heap. Commit `06f4ead`.
+- **Encoder/player contention** — PIMSLO GIF encode holds 7 MB, gallery needs another 7 MB.
+  Mitigation: skip auto-play when encoder is busy. Commit `06f4ead`.
+
+53+ page/button combinations now pass a clean sweep. Real remaining issue: full-res 1824×1920 PIMSLO GIF playback is at the PSRAM ceiling and occasionally OOMs under fragmentation + encoder contention. Decided next: streaming decoder rewrite to remove the 7 MB decode buffer entirely.
 
 ---
 

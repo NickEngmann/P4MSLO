@@ -5,7 +5,7 @@
 - **Language**: C (ESP-IDF v5.5.3 framework)
 - **Target**: ESP32-P4X-EYE development board
 - **UI**: LVGL 8.3.11 with SquareLine Studio (4 screens, 7 fonts, 21 images)
-- **Tests**: 60 tests across 6 suites, 17 mock headers
+- **Tests**: 80 tests across 8 suites, 17 mock headers
 - **CI**: GitHub Actions — host tests, Docker tests, ESP-IDF cross-compilation
 
 ## Build & Run
@@ -51,7 +51,7 @@ docker run --rm p4mslo-ci
 
 ## Testing
 
-### Test Suites (60 tests)
+### Test Suites (80 tests)
 
 | Suite | File | Tests | What it covers |
 |-------|------|-------|----------------|
@@ -61,6 +61,8 @@ docker run --rm p4mslo-ci
 | AI Buffers | `test/test_ai_buffers.c` | 8 | Buffer init, alignment, circular index, deinit safety |
 | Sleep/Wakeup | `test/test_sleep_wakeup.c` | 5 | Wakeup cause, timer+interval, GPIO wakeup |
 | UI Simulator | `test/simulator/test_ui_simulator.c` | 13 | Full UI workflow, knob debounce, menu wrap, USB interrupt |
+| Phase 2 Preview | `test/test_phase2_preview.c` | 9 | Preview-scan, path format, copy-buffer size invariant, fw-version macro, WiFi config sanity |
+| Phase 4 Exposure | `test/test_phase4_exposure.c` | 11 | Status-flag disjointness, SPI command uniqueness, AE header encode/decode, SET_EXPOSURE wire protocol, OV5640 gain packing, fast-mode timing |
 
 ### Mock Infrastructure (17 headers in `test/mocks/`)
 
@@ -254,9 +256,14 @@ GIF encoding runs in the background — the user only waits for the capture phas
 - **LVGL/lv_drivers** — Must be manually cloned into `test/simulator/` (gitignored)
 - **Chip revision** — ESP32-P4X-EYE dev boards are rev v1.3; ESP-IDF v5.5.3 defaults to rev v3.01+ minimum
 - **ESP32-P4 HW JPEG decoder** — Cannot decode 4:2:2 subsampled JPEGs (OV5640/OV3660 output). Use tjpgd software decoder instead.
-- **PSRAM fragmentation** — 32MB PSRAM but largest contiguous block is ~8.26MB after boot. Buffers over 8MB fail to allocate regardless of total free memory.
+- **PSRAM fragmentation** — 32MB PSRAM but largest contiguous block is ~8.26MB after boot. Buffers over 8MB fail to allocate regardless of total free memory. After camera operations, the largest contig block drifts down to ~6.5-6.8 MB even with 7.7 MB free — close to the floor for the PIMSLO GIF decoder's 6.7 MB decode buffer. If an allocation fails, try `app_video_stream_realloc_buffers()` + `app_video_stream_free_buffers()` to consolidate the heap.
 - **SPI max 16MHz** — ESP32-S3 SPI slave can't sustain 20MHz+. Tested 20/26/40MHz — all fail with timeouts.
 - **Single HW JPEG decoder** — The album module and GIF encoder cannot both hold a `jpeg_decoder_engine` simultaneously. The GIF encoder releases the album's decoder before encoding and reacquires after.
+- **Video-stream task stack is 4 KB** — don't put >1 KB on-stack buffers in any of its frame callbacks or in functions that callback invokes. Stack-protection fault panics in `__ssprint_r`/`_svfprintf_r` with `MCAUSE=0x1b` and `S0/FP=0` are the canonical symptom. Push big buffers to the heap or run the work on the PIMSLO capture task (8 KB stack).
+- **AI detection is OFF by default at boot** — `app_ai_detect_init()` is commented out in `main.c` to save ~10 MB PSRAM. Any caller invoking COCO/face/pedestrian detect functions must guard against uninitialized state (NULL global `detect` pointer → load-access panic). See `app_coco_od_detect()` for the guard pattern.
+- **Pure-display pages must free viewfinder PSRAM** — on entering GIFS / ALBUM / USB / SETTINGS from a camera page, call `app_video_stream_free_buffers()` in the redirect function. `ui_extra_leaving_main()` should NOT blindly reallocate camera buffers — only camera pages (CAMERA / INTERVAL_CAM / VIDEO_MODE / AI_DETECT) need them, and they should call `app_video_stream_realloc_buffers()` explicitly.
+- **GIF playback must stop on every page transition** — `app_gifs_stop()` is called from `ui_extra_leaving_main()` and `ui_extra_redirect_to_main_page()`. A running GIF holds ~7 MB of PSRAM (decode_buffer + canvas) that will starve subsequent camera buffer allocations.
+- **GIF encoder and playback can't coexist** — both want a ~7 MB scaled buffer and PSRAM only has ~8 MB contiguous. `ui_extra_redirect_to_gifs_page()` checks `app_gifs_is_encoding()` and `app_pimslo_is_encoding()` and skips auto-play when an encode is active; user can re-enter gallery once the encode finishes.
 
 ## Flash via Docker
 
@@ -287,3 +294,8 @@ docker run --rm -v $(pwd):/workspace -w /workspace/factory_demo \
 11. SPI clock speeds above 16MHz cause all S3 cameras to timeout — the SPI slave firmware can't keep up. Don't try 20MHz+.
 12. After failed high-speed SPI tests, S3 cameras may get stuck in DATA mode. OTA reflash to reset their SPI state.
 13. System time defaults to 2026-01-01 (set in `main.c` via `settimeofday`). Without RTC, files would otherwise get 1980 timestamps.
+14. Background tasks that run work from a frame callback must check their own stack size. The video-stream task's 4 KB stack blew up the first time we added a 2 KB file-copy buffer in the photo-save path — move such work to the PIMSLO capture task (8 KB) instead.
+15. The P4-to-S3 SPI protocol now supports commands in the `0x01–0x0F` range. The 10× burst retry in `spi_camera_send_control` makes the whole range wire-reliable, NOT just `0x01–0x07` as earlier comments claimed. Adding new commands (e.g. SPI_CMD_AUTOFOCUS=0x08, SPI_CMD_SET_EXPOSURE=0x09) works — slave's scan loop matches any known command byte in rx[0..7].
+16. The extended SPI IDLE header carries current OV5640 AE gain + exposure in bytes 5-9 so the master can snapshot one camera's exposure state via a normal status poll and broadcast it to the others via SPI_CMD_SET_EXPOSURE. See `SPI_IDLE_HEADER_AE_GAIN_OFFSET` and `SPI_IDLE_HEADER_AE_EXPOSURE_OFFSET` in `esp32s3/src/spi/SPISlave.h` + mirror constants on P4 side. Any master still reading only 5 bytes continues to work unchanged.
+17. OV5640 autofocus requires a proprietary firmware blob (~4 KB) loaded to sensor register 0x8000 via SCCB — esp32-camera v2.0.4 does NOT bundle this. `CameraManager::autofocus()` is currently a stub that returns true immediately so the master's AF_LOCKED polling doesn't hang. Real AF integration path is documented in `docs/phase-plan.md` Phase 4.
+18. P4 WiFi goes through the onboard ESP32-C6 via `espressif/esp_wifi_remote` + `esp_hosted` managed components. On boot WiFi is OFF; user brings it up with the `wifi_start` serial command. C6 SDIO transport pins on the P4-EYE may not match the esp_hosted defaults — needs schematic confirmation. See `factory_demo/main/app/Net/app_p4_net.c`.

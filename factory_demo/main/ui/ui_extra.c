@@ -925,10 +925,15 @@ static void ui_extra_leaving_main(void)
     if (ui_PanelHomeBackground) {
         lv_obj_add_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_HIDDEN);
     }
-    /* If the previous page was GIFS, its ~7 MB decode+canvas buffers are
-     * still allocated — stop playback so subsequent camera pages can
-     * actually reallocate their viewfinder. Idempotent. */
+    /* If the previous page was GIFS, its decoder + canvas buffer are
+     * still open — stop playback so subsequent camera pages can
+     * reallocate their viewfinder. Idempotent.
+     *
+     * Also flush the cross-GIF canvas cache (up to ~3.5 MB of PSRAM
+     * pinned for previously-watched GIFs). The user isn't viewing the
+     * gallery anymore; camera / video / encoder paths need that PSRAM. */
     app_gifs_stop();
+    app_gifs_flush_cache();
 }
 
 /**
@@ -938,9 +943,10 @@ static void ui_extra_redirect_to_main_page(void)
 {
     current_page = UI_PAGE_MAIN;
 
-    /* Stop GIF playback if we're coming from the gallery. Matches what
-     * leaving_main() does for non-MAIN destinations. */
+    /* Stop GIF playback + flush cache if we're coming from the gallery.
+     * Matches what leaving_main() does for non-MAIN destinations. */
     app_gifs_stop();
+    app_gifs_flush_cache();
 
     ui_extra_clear_page();
 

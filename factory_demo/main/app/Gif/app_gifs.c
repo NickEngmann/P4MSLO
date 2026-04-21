@@ -82,10 +82,10 @@ typedef struct {
     uint32_t hash;       /* LZW hash (for dedup when populating) */
 } cached_frame_t;
 
-typedef struct {
+typedef struct gif_cache_slot {
     char *gif_path;                              /* NULL if slot empty */
     cached_frame_t frames[MAX_FRAMES_PER_GIF];
-    int total_frames;                            /* set on first-loop complete */
+    int n_frames;                                /* number of canvases cached so far */
     bool complete;                               /* true once wrap-around seen */
     int64_t last_used_us;
 } gif_cache_slot_t;
@@ -109,11 +109,12 @@ typedef struct {
     bool is_playing;
     bool is_encoding;
 
-    /* Per-GIF decoded-frame cache. Freed on stop(). Entries are populated
-     * as frames are decoded — reverse frames in PIMSLO palindromes hit
-     * this cache and skip the LZW decode entirely. */
-    frame_cache_t frame_cache[MAX_FRAME_CACHE];
-    int frame_cache_n;
+    /* Points into g_gif_cache[] — the slot for the currently-playing
+     * GIF. Persists across stop()/play_current() so navigating away and
+     * coming back doesn't force a re-decode. Set by play_current()
+     * after finding or allocating a slot; cleared to NULL between plays
+     * or when the slot gets LRU-evicted. */
+    struct gif_cache_slot *active_slot;
 
     /* Short display name of the current entry (e.g. "P4M0007" or
      * "pimslo"). Shown in `name_label` — a regular LVGL label widget
@@ -171,6 +172,102 @@ static inline uint16_t rgb888_to_rgb565_swapped(uint8_t r, uint8_t g, uint8_t b)
 {
     uint16_t px = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
     return (px >> 8) | (px << 8);  /* Byte swap for LV_COLOR_16_SWAP */
+}
+
+/* ---- Global GIF canvas cache (across-gallery-entries) ---- */
+
+static int64_t now_us(void) { return esp_timer_get_time(); }
+
+static gif_cache_slot_t *slot_find(const char *gif_path)
+{
+    for (int i = 0; i < MAX_CACHED_GIFS; i++) {
+        if (g_gif_cache[i].gif_path &&
+            strcmp(g_gif_cache[i].gif_path, gif_path) == 0) {
+            return &g_gif_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void slot_free(gif_cache_slot_t *s)
+{
+    if (!s || !s->gif_path) return;
+    for (int i = 0; i < MAX_FRAMES_PER_GIF; i++) {
+        if (s->frames[i].canvas) {
+            heap_caps_free(s->frames[i].canvas);
+            s->frames[i].canvas = NULL;
+        }
+    }
+    free(s->gif_path);
+    s->gif_path = NULL;
+    s->n_frames = 0;
+    s->complete = false;
+    s->last_used_us = 0;
+}
+
+/* Evict the least-recently-used populated slot and return it (freed
+ * and ready to be re-allocated by the caller). */
+static gif_cache_slot_t *slot_evict_lru(void)
+{
+    gif_cache_slot_t *oldest = NULL;
+    for (int i = 0; i < MAX_CACHED_GIFS; i++) {
+        if (!g_gif_cache[i].gif_path) continue;
+        if (!oldest || g_gif_cache[i].last_used_us < oldest->last_used_us) {
+            oldest = &g_gif_cache[i];
+        }
+    }
+    if (oldest) {
+        ESP_LOGI(TAG, "LRU-evicting slot for %s (n_frames=%d)",
+                 oldest->gif_path, oldest->n_frames);
+        slot_free(oldest);
+    }
+    return oldest;
+}
+
+/* Find or allocate a slot for the given GIF path. Allocates a new empty
+ * slot (possibly evicting LRU) if none exists for this path. Updates
+ * last_used_us so slot_evict_lru won't pick this one next. */
+static gif_cache_slot_t *slot_find_or_alloc(const char *gif_path)
+{
+    gif_cache_slot_t *s = slot_find(gif_path);
+    if (s) {
+        s->last_used_us = now_us();
+        return s;
+    }
+    /* Find an empty slot first. */
+    for (int i = 0; i < MAX_CACHED_GIFS; i++) {
+        if (!g_gif_cache[i].gif_path) {
+            s = &g_gif_cache[i];
+            s->gif_path = strdup(gif_path);
+            s->n_frames = 0;
+            s->complete = false;
+            s->last_used_us = now_us();
+            return s;
+        }
+    }
+    /* All slots full — evict LRU and take it. */
+    s = slot_evict_lru();
+    if (s) {
+        s->gif_path = strdup(gif_path);
+        s->n_frames = 0;
+        s->complete = false;
+        s->last_used_us = now_us();
+    }
+    return s;
+}
+
+/* Flush the entire global cache. Called when leaving the gallery so
+ * the ~3 MB of pinned PSRAM is available for camera / GIF-encoder work. */
+void app_gifs_flush_cache(void)
+{
+    int freed = 0;
+    for (int i = 0; i < MAX_CACHED_GIFS; i++) {
+        if (g_gif_cache[i].gif_path) {
+            slot_free(&g_gif_cache[i]);
+            freed++;
+        }
+    }
+    if (freed) ESP_LOGI(TAG, "Flushed %d cached GIF slot(s)", freed);
 }
 
 /* Cycle the "loading..." overlay's trailing dots so the user sees
@@ -250,13 +347,15 @@ static void playback_timer_cb(lv_timer_t *timer)
     uint32_t hash = 0;
     esp_err_t ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
     if (ret == ESP_ERR_NOT_FOUND) {
-        /* End of file — loop back to the first frame. This is also the
-         * cue that we've completed one full pass: the frame-offset map
-         * and canvas cache are now populated, so subsequent frames will
-         * fast-path at native framerate. Hide the "loading..." overlay. */
+        /* End of file — loop back to frame 0. Also the signal that one
+         * full loop is done: offset map + canvas cache are populated,
+         * subsequent reads fast-path. Hide loading overlay + mark the
+         * cache slot complete so next play_current on this path can
+         * skip loading entirely. */
         if (!s_ctx.first_loop_complete) {
             s_ctx.first_loop_complete = true;
             hide_loading_overlay();
+            if (s_ctx.active_slot) s_ctx.active_slot->complete = true;
         }
         gif_decoder_reset(s_ctx.decoder);
         ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
@@ -266,18 +365,19 @@ static void playback_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    /* Cache lookup. */
+    /* Cache lookup against the active global slot (persists across
+     * play_current calls so previously-watched GIFs replay instantly). */
+    gif_cache_slot_t *slot = s_ctx.active_slot;
     int hit_idx = -1;
-    for (int i = 0; i < s_ctx.frame_cache_n; i++) {
-        if (s_ctx.frame_cache[i].used && s_ctx.frame_cache[i].hash == hash) {
-            hit_idx = i; break;
+    if (slot) {
+        for (int i = 0; i < slot->n_frames; i++) {
+            if (slot->frames[i].canvas && slot->frames[i].hash == hash) {
+                hit_idx = i; break;
+            }
         }
     }
 
-    /* Throttled diagnostic: the first handful of frames of each GIF only.
-     * Lets us see hashes + hit/miss to prove (or disprove) the dedup,
-     * without flooding serial during long playback. Counter resets on
-     * each new play_current(). */
+    /* Throttled diagnostic (first 20 frames of each play_current). */
     const int DIAG_LIMIT = 20;
     bool diag_log = s_ctx.diag_frame_no < DIAG_LIMIT;
     int this_frame = s_ctx.diag_frame_no++;
@@ -287,7 +387,7 @@ static void playback_timer_cb(lv_timer_t *timer)
             ESP_LOGI(TAG, "f#%d HIT  hash=%08x slot=%d delay=%dcs",
                      this_frame, (unsigned)hash, hit_idx, delay_cs);
         }
-        memcpy(s_ctx.canvas_buffer, s_ctx.frame_cache[hit_idx].canvas, canvas_bytes);
+        memcpy(s_ctx.canvas_buffer, slot->frames[hit_idx].canvas, canvas_bytes);
         gif_decoder_discard_read_frame(s_ctx.decoder);
     } else {
         uint32_t t0 = diag_log ? esp_log_timestamp() : 0;
@@ -298,14 +398,14 @@ static void playback_timer_cb(lv_timer_t *timer)
         if (ret != ESP_OK) { app_gifs_stop(); return; }
 
         bool cached = false;
-        if (s_ctx.frame_cache_n < MAX_FRAME_CACHE) {
+        if (slot && slot->n_frames < MAX_FRAMES_PER_GIF) {
             uint16_t *copy = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
             if (copy) {
                 memcpy(copy, s_ctx.canvas_buffer, canvas_bytes);
-                int i = s_ctx.frame_cache_n++;
-                s_ctx.frame_cache[i].hash = hash;
-                s_ctx.frame_cache[i].canvas = copy;
-                s_ctx.frame_cache[i].used = true;
+                int i = slot->n_frames++;
+                slot->frames[i].hash = hash;
+                slot->frames[i].canvas = copy;
+                slot->frames[i].delay_cs = delay_cs;
                 cached = true;
             }
         }
@@ -314,7 +414,7 @@ static void playback_timer_cb(lv_timer_t *timer)
                           "cached=%d total_cached=%d",
                      this_frame, (unsigned)hash,
                      (unsigned long)(esp_log_timestamp() - t0),
-                     delay_cs, cached, s_ctx.frame_cache_n);
+                     delay_cs, cached, slot ? slot->n_frames : 0);
         }
     }
 
@@ -906,7 +1006,19 @@ esp_err_t app_gifs_play_current(void)
         }
     }
 
-    /* GIF — open the decoder and start the frame-paced loop. */
+    /* GIF — acquire the global cache slot first so the playback timer
+     * can mirror decoded frames into it for later replays. Slot is
+     * reused on revisits, so a GIF that's already been watched once
+     * comes back with its canvases already populated and the timer
+     * cascades into cache hits starting at frame 0. */
+    s_ctx.active_slot = slot_find_or_alloc(ent->gif_path);
+    if (s_ctx.active_slot) {
+        ESP_LOGI(TAG, "cache slot: n_frames=%d complete=%d",
+                 s_ctx.active_slot->n_frames, s_ctx.active_slot->complete);
+    } else {
+        ESP_LOGW(TAG, "No cache slot available (all full, eviction failed)");
+    }
+    s_ctx.first_loop_complete = s_ctx.active_slot && s_ctx.active_slot->complete;
     s_ctx.diag_frame_no = 0;
     esp_err_t ret = gif_decoder_open(ent->gif_path, &s_ctx.decoder);
     if (ret != ESP_OK) {
@@ -920,10 +1032,13 @@ esp_err_t app_gifs_play_current(void)
              s_ctx.decode_width, s_ctx.decode_height,
              s_ctx.canvas_width, s_ctx.canvas_height);
 
-    /* Show the "loading..." overlay during first-loop decoding; it self-
-     * hides the moment the decoder wraps back to frame 0 in the playback
-     * timer callback (meaning all frames are now cached). */
-    show_loading_overlay();
+    /* Show the "loading..." overlay only when we expect a slow first
+     * loop. If this GIF's cache slot is already marked complete (user
+     * watched it before, frames are in PSRAM), skip the overlay —
+     * playback will hit the fast path immediately. */
+    if (!s_ctx.first_loop_complete) {
+        show_loading_overlay();
+    }
 
     s_ctx.is_playing = true;
     s_ctx.play_timer = lv_timer_create(playback_timer_cb, 100, NULL);
@@ -952,16 +1067,13 @@ void app_gifs_stop(void)
         s_ctx.decoder = NULL;
     }
 
-    /* Free per-GIF frame cache. Each canvas is 115 KB in PSRAM — leaving
-     * them around after stop would eat several hundred KB for a file
-     * we're no longer viewing. */
-    for (int i = 0; i < s_ctx.frame_cache_n; i++) {
-        if (s_ctx.frame_cache[i].canvas) {
-            heap_caps_free(s_ctx.frame_cache[i].canvas);
-        }
-    }
-    memset(s_ctx.frame_cache, 0, sizeof(s_ctx.frame_cache));
-    s_ctx.frame_cache_n = 0;
+    /* Note: we DO NOT free the canvas cache here. It lives in
+     * g_gif_cache[] across play_current calls so navigating between
+     * GIFs or leaving and re-entering the gallery can replay previously
+     * decoded frames instantly. Eviction happens LRU-style when a new
+     * GIF needs a slot, or wholesale via app_gifs_flush_cache() when
+     * leaving the gallery for a page that needs the PSRAM. */
+    s_ctx.active_slot = NULL;
 }
 
 bool app_gifs_is_playing(void) { return s_ctx.is_playing; }

@@ -47,6 +47,16 @@ esp_err_t app_gifs_play_current(void);
 /** @brief Stop playback */
 void app_gifs_stop(void);
 
+/**
+ * @brief Free the cross-GIF decoded-frame cache.
+ *
+ * The gallery keeps recently-watched GIFs' decoded canvases in PSRAM
+ * so scrolling between them replays instantly. That cache is ~700 KB
+ * per GIF × up to 5 GIFs = ~3.5 MB pinned. Call this when leaving the
+ * gallery so camera / video / GIF-encoder paths get that PSRAM back.
+ */
+void app_gifs_flush_cache(void);
+
 /** @brief Check if currently playing */
 bool app_gifs_is_playing(void);
 

@@ -155,6 +155,18 @@ Tasks:
 
 ---
 
+## Gallery UX round 2 ✅ SHIPPED (2026-04-21 later)
+
+Follow-ups to the original gallery UX commits, addressing the "still not flowy" feedback after users actually used the feature:
+
+- **Dual-path gallery entries** — `gallery_entry_t` now carries both `gif_path` and `jpeg_path`. Scan merges `/sdcard/p4mslo_gifs/*.gif` with `/sdcard/p4mslo_previews/*.jpg` by PIMSLO stem so each capture appears exactly once. A GIF-with-preview entry flashes the JPEG onto the canvas via tjpgd (~100 ms) before opening the GIF decoder, so the user never stares at a stale frame waiting for the first LZW decode.
+- **Last-viewed memory** — `app_gifs_scan()` preserves `current_index` by path-matching across rescans. Leave the gallery, edit settings, come back — you land on whichever GIF you were watching.
+- **Persistent cross-GIF canvas cache** — `g_gif_cache[5]` slots keyed by `gif_path`. Each slot holds up to 12 decoded canvases + per-frame delays. `play_current` looks up the slot first; if it exists and is `complete`, the loading overlay is skipped and playback hits cache on frame 0. LRU eviction when capacity is exceeded. Flushed on gallery exit so camera / video paths get the ~3.5 MB of PSRAM back.
+
+Verified on device: 3 MISSes + 9 HITs on fresh play, `f#0 HIT slot=0` immediately on navigate-back, `Flushed 2 cached GIF slot(s)` on gallery exit, `LRU-evicting slot for ...` after 6 navigations, gallery persists current_index across leave→return.
+
+---
+
 ## Gallery UX + streaming GIF decoder ✅ SHIPPED (2026-04-21)
 
 After the user pointed out that gallery playback was stuck at ~2 s/frame and demanded real fixes rather than deferrals, landed a substantially rewritten GIF playback path. Combines:

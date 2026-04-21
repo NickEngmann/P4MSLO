@@ -127,6 +127,9 @@ esp_err_t HttpServer::handleStatus(httpd_req_t *req) {
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "version", MOMENT_VERSION);
+#ifdef P4MSLO_FIRMWARE_VERSION
+    cJSON_AddStringToObject(root, "firmware_version", P4MSLO_FIRMWARE_VERSION);
+#endif
     cJSON_AddNumberToObject(root, "uptime_ms", (double)(esp_timer_get_time() / 1000));
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
 

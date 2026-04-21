@@ -30,6 +30,10 @@
 
 static const char *TAG = "moment";
 
+#ifndef P4MSLO_FIRMWARE_VERSION
+#define P4MSLO_FIRMWARE_VERSION "unknown"
+#endif
+
 static CameraManager  cameraManager;
 static SDCardManager  sdCardManager;
 static SPISlave       spiSlave;
@@ -281,7 +285,7 @@ extern "C" void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  Moment PIMSLO v%s", MOMENT_VERSION);
+    ESP_LOGI(TAG, "  Moment PIMSLO v%s  (%s)", MOMENT_VERSION, P4MSLO_FIRMWARE_VERSION);
     ESP_LOGI(TAG, "  Point-and-Shoot Camera");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());

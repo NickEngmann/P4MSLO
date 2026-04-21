@@ -110,6 +110,10 @@ static void cmd_gpio_read(const char *arg)
     cmd_respond("gpio %d = %d", pin, level);
 }
 
+#ifndef P4MSLO_FIRMWARE_VERSION
+#define P4MSLO_FIRMWARE_VERSION "unknown"
+#endif
+
 static void cmd_status(void)
 {
     ui_page_t page = ui_extra_get_current_page();
@@ -123,7 +127,8 @@ static void cmd_status(void)
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     bool sd_mounted = ui_extra_get_sd_card_mounted();
 
-    cmd_respond("page=%s sd=%s free_heap=%zu free_psram=%zu gifs_count=%d gifs_encoding=%d gifs_playing=%d pimslo_queue=%d pimslo_encoding=%d",
+    cmd_respond("fw=%s page=%s sd=%s free_heap=%zu free_psram=%zu gifs_count=%d gifs_encoding=%d gifs_playing=%d pimslo_queue=%d pimslo_encoding=%d",
+                P4MSLO_FIRMWARE_VERSION,
                 page_name, sd_mounted ? "yes" : "no",
                 free_heap, free_psram,
                 app_gifs_get_count(),

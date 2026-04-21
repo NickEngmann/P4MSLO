@@ -26,8 +26,16 @@
 
 static const char *TAG = "main";
 
+#ifndef P4MSLO_FIRMWARE_VERSION
+#define P4MSLO_FIRMWARE_VERSION "unknown"
+#endif
+
 void app_main(void)
 {
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "  P4MSLO firmware %s", P4MSLO_FIRMWARE_VERSION);
+    ESP_LOGI(TAG, "========================================");
+
     // Initialize NVS
     ESP_LOGI(TAG, "Initialize NVS");
     esp_err_t ret = nvs_flash_init();

@@ -453,10 +453,29 @@ esp_err_t app_gifs_play_current(void)
     size_t decode_buf_size = s_ctx.decode_width * s_ctx.decode_height * 2;
     s_ctx.decode_buffer = heap_caps_malloc(decode_buf_size, MALLOC_CAP_SPIRAM);
     if (!s_ctx.decode_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate %zu byte decode buffer", decode_buf_size);
-        gif_decoder_close(s_ctx.decoder);
-        s_ctx.decoder = NULL;
-        return ESP_ERR_NO_MEM;
+        /* PSRAM free total is usually enough but fragmentation from prior
+         * camera buffer cycles can leave the largest contiguous block below
+         * the 6.7 MB we need. Attempt to defragment by forcing a
+         * video-stream buffer churn (alloc → free) then retrying. The video
+         * stream's aligned_calloc occupies the same priority ranges that
+         * fragment the heap, so allocating+freeing can consolidate gaps. */
+        size_t contig = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        size_t total  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGW(TAG, "Decode buf %zu bytes: PSRAM contig=%zu free=%zu — "
+                      "attempting defrag", decode_buf_size, contig, total);
+        app_video_stream_realloc_buffers();
+        app_video_stream_free_buffers();
+        s_ctx.decode_buffer = heap_caps_malloc(decode_buf_size, MALLOC_CAP_SPIRAM);
+        if (!s_ctx.decode_buffer) {
+            contig = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+            ESP_LOGE(TAG, "Still can't allocate %zu byte decode buffer after "
+                          "defrag attempt (contig now %zu)",
+                     decode_buf_size, contig);
+            gif_decoder_close(s_ctx.decoder);
+            s_ctx.decoder = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "Defrag worked — decode buffer allocated");
     }
 
     ESP_LOGI(TAG, "GIF: %dx%d, decode buffer: %zu bytes",

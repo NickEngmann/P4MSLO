@@ -26,6 +26,7 @@
 #include "app_video_stream.h"
 #include "app_isp.h"
 #include "app_gifs.h"
+#include "app_pimslo.h"
 
 /* Constants */
 #define IMG_BASE_ZOOM       60
@@ -1063,10 +1064,20 @@ static void ui_extra_redirect_to_gifs_page(void)
             gifs_initialized = true;
         }
         /* Refresh the gallery's file list (picks up new GIFs + preview jpgs
-         * since last visit) and start playing the newest one immediately. */
+         * since last visit) and start playing the newest one immediately —
+         * but only if a PIMSLO GIF encode isn't currently running. A running
+         * encode holds ~7 MB for its scaled_buf, and the playback decoder
+         * needs another ~7 MB, which doesn't fit in PSRAM. When that
+         * collision happens, skip auto-play so the user sees the static
+         * thumbnail instead of a silently-failed-to-start state — they
+         * can navigate and the system will retry on the next redirect. */
         app_gifs_scan();
         if (app_gifs_get_count() > 0) {
-            app_gifs_play_current();
+            if (app_gifs_is_encoding() || app_pimslo_is_encoding()) {
+                ESP_LOGI(TAG, "Gallery entry: encoder busy — skipping auto-play");
+            } else {
+                app_gifs_play_current();
+            }
         }
     } else {
         lv_obj_clear_flag(ui_PanelGifsPopupSDWarning, LV_OBJ_FLAG_HIDDEN);

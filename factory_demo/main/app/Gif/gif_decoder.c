@@ -362,8 +362,28 @@ void gif_decoder_close(gif_decoder_t *dec)
 static esp_err_t ensure_pending_cap(gif_decoder_t *dec, size_t need)
 {
     if (dec->pending_lzw_cap >= need) return ESP_OK;
-    size_t new_cap = dec->pending_lzw_cap ? dec->pending_lzw_cap : 16384;
-    while (new_cap < need) new_cap *= 2;
+
+    /* Grow to at least `need`, but cap the overshoot. Pure doubling
+     * jumped from 2 MB to 4 MB even when only 2.2 MB was required,
+     * and under PSRAM fragmentation 4 MB contiguous often wasn't
+     * available. Use the smaller of {double, need + 25% slack}. */
+    size_t want_double = dec->pending_lzw_cap ? dec->pending_lzw_cap * 2 : 16384;
+    size_t want_slack  = need + (need / 4);
+    size_t new_cap = (want_double < want_slack) ? want_double : want_slack;
+    if (new_cap < need) new_cap = need;
+
+    /* When there's no valid content to preserve (between frames we reset
+     * pending_lzw_len=0), free the old block before allocating the new
+     * one. heap_caps_realloc keeps both alive transiently; under PSRAM
+     * fragmentation the target contiguous region may not exist if the
+     * old block pins a hole. Freeing first turns a copy-and-grow into a
+     * plain malloc. */
+    if (dec->pending_lzw_len == 0 && dec->pending_lzw) {
+        heap_caps_free(dec->pending_lzw);
+        dec->pending_lzw = NULL;
+        dec->pending_lzw_cap = 0;
+    }
+
     uint8_t *nb = heap_caps_realloc(dec->pending_lzw, new_cap, MALLOC_CAP_SPIRAM);
     if (!nb) {
         ESP_LOGE(TAG, "Failed to grow pending_lzw to %zu bytes", new_cap);

@@ -86,9 +86,55 @@ typedef struct gif_cache_slot {
     char *gif_path;                              /* NULL if slot empty */
     cached_frame_t frames[MAX_FRAMES_PER_GIF];
     int n_frames;                                /* number of canvases cached so far */
+
+    /* Playback order as a sequence of indices into frames[]. Populated
+     * on the first pass through a GIF. For a 6-frame palindrome like
+     * PIMSLO's this is [0,1,2,3,2,1] — 6 entries pointing at 4 unique
+     * canvases. Persisted alongside the canvases in the .p4ms file so
+     * the prerendered fast path can replay without re-opening the GIF. */
+    uint8_t playback_order[MAX_FRAMES_PER_GIF * 2];
+    int playback_count;
+
     bool complete;                               /* true once wrap-around seen */
+    bool from_disk;                              /* loaded from .p4ms, no decoder needed */
+    int playback_pos;                            /* for the no-decoder "cached-only" mode */
+
     int64_t last_used_us;
 } gif_cache_slot_t;
+
+/* ---- Prerendered small-GIF cache on SD card ------------------------
+ *
+ * After the decoder's first loop completes (we have the full hash-
+ * deduped canvas set + playback order), we persist a minimal binary
+ * representation of the 240×240 version into /sdcard/p4mslo_small/.
+ * Next time the user visits that entry — even after a reboot — the
+ * gallery loads the .p4ms directly, skipping gif_decoder_open's
+ * 3.5 MB pixel_indices allocation and the ~600-700 ms/frame LZW
+ * decode. Playback starts instantly at native framerate.
+ *
+ * Format is deliberately trivial (not a real GIF):
+ *   [P4MS header, 16 bytes]
+ *   [unique canvas × n_unique]           — 115 200 bytes each
+ *   [per-frame meta × n_playback]        — delay_cs + unique_idx
+ */
+#define P4MS_DIR     "/sdcard/p4mslo_small"
+#define P4MS_MAGIC   "P4MS"
+#define P4MS_VERSION 1
+
+typedef struct __attribute__((packed)) {
+    char     magic[4];      /* "P4MS" */
+    uint8_t  version;       /* 1 */
+    uint8_t  reserved[3];
+    uint16_t width;         /* 240 */
+    uint16_t height;        /* 240 */
+    uint16_t n_unique;      /* number of distinct canvases stored */
+    uint16_t n_playback;    /* length of the playback sequence */
+} p4ms_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t unique_idx;    /* index into the stored canvas array */
+    uint16_t delay_cs;
+} p4ms_frame_meta_t;
 
 static gif_cache_slot_t g_gif_cache[MAX_CACHED_GIFS];
 
@@ -201,7 +247,10 @@ static void slot_free(gif_cache_slot_t *s)
     free(s->gif_path);
     s->gif_path = NULL;
     s->n_frames = 0;
+    s->playback_count = 0;
     s->complete = false;
+    s->from_disk = false;
+    s->playback_pos = 0;
     s->last_used_us = 0;
 }
 
@@ -240,7 +289,10 @@ static gif_cache_slot_t *slot_find_or_alloc(const char *gif_path)
             s = &g_gif_cache[i];
             s->gif_path = strdup(gif_path);
             s->n_frames = 0;
+            s->playback_count = 0;
             s->complete = false;
+            s->from_disk = false;
+            s->playback_pos = 0;
             s->last_used_us = now_us();
             return s;
         }
@@ -268,6 +320,209 @@ void app_gifs_flush_cache(void)
         }
     }
     if (freed) ESP_LOGI(TAG, "Flushed %d cached GIF slot(s)", freed);
+}
+
+/* ---- Prerendered .p4ms persistence ---------------------------------- */
+
+static void ensure_small_dir(void) { mkdir(P4MS_DIR, 0755); }
+
+/* Given a GIF path like "/sdcard/p4mslo_gifs/P4M0007.gif", compute the
+ * matching .p4ms path "/sdcard/p4mslo_small/P4M0007.p4ms". Returns false
+ * if the source doesn't have a usable basename + extension. */
+static bool gif_path_to_small_path(const char *gif_path,
+                                    char *out, size_t out_cap)
+{
+    const char *slash = strrchr(gif_path, '/');
+    const char *base = slash ? slash + 1 : gif_path;
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot == base) return false;
+    size_t stem_len = (size_t)(dot - base);
+    if (stem_len == 0) return false;
+    int n = snprintf(out, out_cap, "%s/%.*s.p4ms",
+                     P4MS_DIR, (int)stem_len, base);
+    return n > 0 && (size_t)n < out_cap;
+}
+
+static bool small_file_exists(const char *gif_path)
+{
+    char path[MAX_PATH_LEN];
+    if (!gif_path_to_small_path(gif_path, path, sizeof(path))) return false;
+    struct stat st;
+    return stat(path, &st) == 0 && st.st_size > (off_t)sizeof(p4ms_header_t);
+}
+
+/* Persist the slot's unique canvases + playback order to .p4ms. Called
+ * once per GIF, right when its cache slot becomes `complete`. On success
+ * subsequent visits skip the decoder entirely. Writes atomically via a
+ * .tmp suffix → rename so a power cut during write can't leave a
+ * truncated file masquerading as valid. */
+static esp_err_t save_small_gif(const gif_cache_slot_t *slot)
+{
+    if (!slot || !slot->gif_path || !slot->complete) return ESP_ERR_INVALID_STATE;
+    if (slot->n_frames <= 0 || slot->playback_count <= 0) return ESP_ERR_INVALID_STATE;
+    if (slot->from_disk) return ESP_OK;  /* loaded from disk — already persisted */
+
+    char final_path[MAX_PATH_LEN];
+    if (!gif_path_to_small_path(slot->gif_path, final_path, sizeof(final_path))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (small_file_exists(slot->gif_path)) return ESP_OK;  /* already on disk */
+
+    ensure_small_dir();
+
+    char tmp_path[MAX_PATH_LEN + 8];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path);
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        ESP_LOGW(TAG, "save_small_gif: fopen(%s) failed", tmp_path);
+        return ESP_FAIL;
+    }
+
+    p4ms_header_t hdr = {
+        .magic   = { 'P', '4', 'M', 'S' },
+        .version = P4MS_VERSION,
+        .reserved = {0, 0, 0},
+        .width   = (uint16_t)s_ctx.canvas_width,
+        .height  = (uint16_t)s_ctx.canvas_height,
+        .n_unique   = (uint16_t)slot->n_frames,
+        .n_playback = (uint16_t)slot->playback_count,
+    };
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1) goto fail;
+
+    size_t canvas_bytes = (size_t)s_ctx.canvas_width * s_ctx.canvas_height * 2;
+    for (int i = 0; i < slot->n_frames; i++) {
+        if (!slot->frames[i].canvas) goto fail;
+        if (fwrite(slot->frames[i].canvas, 1, canvas_bytes, f) != canvas_bytes) goto fail;
+    }
+
+    for (int i = 0; i < slot->playback_count; i++) {
+        uint8_t idx = slot->playback_order[i];
+        if (idx >= slot->n_frames) goto fail;
+        p4ms_frame_meta_t meta = {
+            .unique_idx = idx,
+            .delay_cs = (uint16_t)slot->frames[idx].delay_cs,
+        };
+        if (fwrite(&meta, sizeof(meta), 1, f) != 1) goto fail;
+    }
+
+    fflush(f);
+    fclose(f);
+
+    /* Atomic swap into place. */
+    if (rename(tmp_path, final_path) != 0) {
+        ESP_LOGW(TAG, "save_small_gif: rename(%s → %s) failed",
+                 tmp_path, final_path);
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Saved small GIF: %s (%d unique × %d playback, %zu bytes canvas each)",
+             final_path, slot->n_frames, slot->playback_count, canvas_bytes);
+    return ESP_OK;
+
+fail:
+    fclose(f);
+    remove(tmp_path);
+    ESP_LOGW(TAG, "save_small_gif: write failed for %s", final_path);
+    return ESP_FAIL;
+}
+
+/* Load a prerendered .p4ms into the given slot. On success the slot is
+ * ready for cached-only playback: n_frames = unique canvases, playback
+ * sequence in playback_order[], complete=true, from_disk=true. */
+static esp_err_t load_small_gif(const char *gif_path, gif_cache_slot_t *slot)
+{
+    if (!slot) return ESP_ERR_INVALID_ARG;
+
+    char path[MAX_PATH_LEN];
+    if (!gif_path_to_small_path(gif_path, path, sizeof(path))) return ESP_ERR_INVALID_ARG;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return ESP_ERR_NOT_FOUND;
+
+    p4ms_header_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) { fclose(f); return ESP_FAIL; }
+    if (memcmp(hdr.magic, P4MS_MAGIC, 4) != 0 || hdr.version != P4MS_VERSION) {
+        ESP_LOGW(TAG, "load_small_gif: bad magic/version in %s", path);
+        fclose(f);
+        return ESP_FAIL;
+    }
+    if (hdr.width != s_ctx.canvas_width || hdr.height != s_ctx.canvas_height) {
+        ESP_LOGW(TAG, "load_small_gif: dim mismatch %dx%d (have %dx%d)",
+                 hdr.width, hdr.height, s_ctx.canvas_width, s_ctx.canvas_height);
+        fclose(f);
+        return ESP_FAIL;
+    }
+    if (hdr.n_unique == 0 || hdr.n_unique > MAX_FRAMES_PER_GIF ||
+        hdr.n_playback == 0 || hdr.n_playback > MAX_FRAMES_PER_GIF * 2) {
+        ESP_LOGW(TAG, "load_small_gif: bad counts u=%u p=%u",
+                 hdr.n_unique, hdr.n_playback);
+        fclose(f);
+        return ESP_FAIL;
+    }
+
+    size_t canvas_bytes = (size_t)hdr.width * hdr.height * 2;
+
+    /* Drop any stale canvases first (should already be empty if this is
+     * a freshly-allocated slot, but be defensive). */
+    for (int i = 0; i < MAX_FRAMES_PER_GIF; i++) {
+        if (slot->frames[i].canvas) {
+            heap_caps_free(slot->frames[i].canvas);
+            slot->frames[i].canvas = NULL;
+        }
+    }
+
+    for (int i = 0; i < hdr.n_unique; i++) {
+        uint16_t *buf = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            ESP_LOGE(TAG, "load_small_gif: OOM on canvas %d", i);
+            goto fail_release;
+        }
+        if (fread(buf, 1, canvas_bytes, f) != canvas_bytes) {
+            heap_caps_free(buf);
+            ESP_LOGW(TAG, "load_small_gif: short read on canvas %d", i);
+            goto fail_release;
+        }
+        slot->frames[i].canvas = buf;
+        slot->frames[i].hash = 0;  /* not used in from_disk mode */
+        slot->frames[i].delay_cs = 10;  /* filled in from meta below */
+    }
+
+    for (int i = 0; i < hdr.n_playback; i++) {
+        p4ms_frame_meta_t meta;
+        if (fread(&meta, sizeof(meta), 1, f) != 1) goto fail_release;
+        if (meta.unique_idx >= hdr.n_unique) goto fail_release;
+        slot->playback_order[i] = (uint8_t)meta.unique_idx;
+        slot->frames[meta.unique_idx].delay_cs = (int)meta.delay_cs;
+    }
+
+    fclose(f);
+
+    slot->n_frames = hdr.n_unique;
+    slot->playback_count = hdr.n_playback;
+    slot->complete = true;
+    slot->from_disk = true;
+    slot->playback_pos = 0;
+    slot->last_used_us = now_us();
+
+    ESP_LOGI(TAG, "Loaded small GIF: %s (%d unique × %d playback)",
+             path, hdr.n_unique, hdr.n_playback);
+    return ESP_OK;
+
+fail_release:
+    fclose(f);
+    for (int i = 0; i < MAX_FRAMES_PER_GIF; i++) {
+        if (slot->frames[i].canvas) {
+            heap_caps_free(slot->frames[i].canvas);
+            slot->frames[i].canvas = NULL;
+        }
+    }
+    slot->n_frames = 0;
+    slot->playback_count = 0;
+    slot->complete = false;
+    slot->from_disk = false;
+    return ESP_FAIL;
 }
 
 /* Cycle the "loading..." overlay's trailing dots so the user sees
@@ -329,45 +584,80 @@ static void compute_display_name(const char *path, char *out, size_t out_cap)
     out[len] = 0;
 }
 
+/* Render one frame from the slot's pre-decoded canvases. Used by both
+ * the "from .p4ms" case and the post-first-loop fast path. Advances
+ * slot->playback_pos; loops back to 0 at the end. */
+static void render_cached_frame(lv_timer_t *timer, gif_cache_slot_t *slot)
+{
+    int pos = slot->playback_pos;
+    if (pos < 0 || pos >= slot->playback_count) pos = 0;
+    uint8_t idx = slot->playback_order[pos];
+    if (idx >= slot->n_frames) idx = 0;
+    cached_frame_t *cf = &slot->frames[idx];
+    if (!cf->canvas) return;
+
+    size_t canvas_bytes = (size_t)s_ctx.canvas_width * s_ctx.canvas_height * 2;
+    memcpy(s_ctx.canvas_buffer, cf->canvas, canvas_bytes);
+
+    bsp_display_lock(0);
+    lv_canvas_set_buffer(s_ctx.canvas, s_ctx.canvas_buffer,
+                         s_ctx.canvas_width, s_ctx.canvas_height,
+                         LV_IMG_CF_TRUE_COLOR);
+    lv_obj_invalidate(s_ctx.canvas);
+    bsp_display_unlock();
+
+    slot->playback_pos = (pos + 1) % slot->playback_count;
+    if (cf->delay_cs > 0 && timer) lv_timer_set_period(timer, cf->delay_cs * 10);
+}
+
 static void playback_timer_cb(lv_timer_t *timer)
 {
-    if (!s_ctx.is_playing || !s_ctx.decoder || !s_ctx.canvas_buffer) {
+    if (!s_ctx.is_playing || !s_ctx.canvas_buffer) return;
+    gif_cache_slot_t *slot = s_ctx.active_slot;
+
+play_from_cache:
+    /* Fast path: slot is complete (either decoded on a previous loop or
+     * loaded from .p4ms). Iterate the stored canvases in the stored
+     * playback order — no LZW decode, no SD I/O, no decoder state. */
+    if (slot && slot->complete && slot->n_frames > 0 && slot->playback_count > 0) {
+        render_cached_frame(timer, slot);
         return;
     }
 
-    int delay_cs = 10;
-    size_t canvas_bytes = s_ctx.canvas_width * s_ctx.canvas_height * 2;
+    if (!s_ctx.decoder) return;
 
-    /* Two-step dedup-aware decode. Step 1: pull the next frame's
-     * compressed LZW bytes into the decoder's internal buffer and hash
-     * them. Step 2: if that hash is in our frame cache, memcpy the
-     * cached canvas (fast path); otherwise decode for real and insert
-     * the result into the cache. Reverse frames in PIMSLO palindromes
-     * hit the cache and skip LZW decode entirely. */
+    int delay_cs = 10;
+    size_t canvas_bytes = (size_t)s_ctx.canvas_width * s_ctx.canvas_height * 2;
+
+    /* Two-step dedup-aware decode: pull next frame's compressed bytes,
+     * hash them, consult the cache, then either memcpy the cached
+     * canvas (fast) or run LZW decode. While we're still in the first
+     * loop (slot->complete == false) we also append to playback_order
+     * so the resulting slot can be persisted to .p4ms. */
     uint32_t hash = 0;
     esp_err_t ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
     if (ret == ESP_ERR_NOT_FOUND) {
-        /* End of file — loop back to frame 0. Also the signal that one
-         * full loop is done: offset map + canvas cache are populated,
-         * subsequent reads fast-path. Hide loading overlay + mark the
-         * cache slot complete so next play_current on this path can
-         * skip loading entirely. */
-        if (!s_ctx.first_loop_complete) {
+        /* End of file — first loop is done. Mark complete, persist to
+         * .p4ms, release the decoder (frees ~3.5 MB pixel_indices), and
+         * jump into the cached-only fast path for this frame + all
+         * subsequent ticks. */
+        if (slot && !slot->complete) {
+            slot->complete = true;
             s_ctx.first_loop_complete = true;
             hide_loading_overlay();
-            if (s_ctx.active_slot) s_ctx.active_slot->complete = true;
+            (void)save_small_gif(slot);   /* best-effort; logs on failure */
         }
-        gif_decoder_reset(s_ctx.decoder);
-        ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
-        if (ret != ESP_OK) { app_gifs_stop(); return; }
+        if (s_ctx.decoder) {
+            gif_decoder_close(s_ctx.decoder);
+            s_ctx.decoder = NULL;
+        }
+        goto play_from_cache;
     } else if (ret != ESP_OK) {
         app_gifs_stop();
         return;
     }
 
-    /* Cache lookup against the active global slot (persists across
-     * play_current calls so previously-watched GIFs replay instantly). */
-    gif_cache_slot_t *slot = s_ctx.active_slot;
+    /* Lookup against slot's unique-canvas table. */
     int hit_idx = -1;
     if (slot) {
         for (int i = 0; i < slot->n_frames; i++) {
@@ -377,11 +667,11 @@ static void playback_timer_cb(lv_timer_t *timer)
         }
     }
 
-    /* Throttled diagnostic (first 20 frames of each play_current). */
     const int DIAG_LIMIT = 20;
     bool diag_log = s_ctx.diag_frame_no < DIAG_LIMIT;
     int this_frame = s_ctx.diag_frame_no++;
 
+    int produced_idx = -1;
     if (hit_idx >= 0) {
         if (diag_log) {
             ESP_LOGI(TAG, "f#%d HIT  hash=%08x slot=%d delay=%dcs",
@@ -389,6 +679,7 @@ static void playback_timer_cb(lv_timer_t *timer)
         }
         memcpy(s_ctx.canvas_buffer, slot->frames[hit_idx].canvas, canvas_bytes);
         gif_decoder_discard_read_frame(s_ctx.decoder);
+        produced_idx = hit_idx;
     } else {
         uint32_t t0 = diag_log ? esp_log_timestamp() : 0;
         ret = gif_decoder_decode_read_frame(s_ctx.decoder,
@@ -407,6 +698,7 @@ static void playback_timer_cb(lv_timer_t *timer)
                 slot->frames[i].canvas = copy;
                 slot->frames[i].delay_cs = delay_cs;
                 cached = true;
+                produced_idx = i;
             }
         }
         if (diag_log) {
@@ -418,6 +710,13 @@ static void playback_timer_cb(lv_timer_t *timer)
         }
     }
 
+    /* Record this frame's slot index in the playback sequence — used to
+     * persist and replay the GIF without re-opening the decoder. */
+    if (slot && !slot->complete && produced_idx >= 0 && produced_idx < 256 &&
+        slot->playback_count < (int)(sizeof(slot->playback_order))) {
+        slot->playback_order[slot->playback_count++] = (uint8_t)produced_idx;
+    }
+
     /* Push the freshly-rendered canvas to LVGL. */
     bsp_display_lock(0);
     lv_canvas_set_buffer(s_ctx.canvas, s_ctx.canvas_buffer,
@@ -426,40 +725,9 @@ static void playback_timer_cb(lv_timer_t *timer)
     lv_obj_invalidate(s_ctx.canvas);
     bsp_display_unlock();
 
-    /* Adjust timer period for next frame */
-    if (delay_cs > 0) {
-        lv_timer_set_period(timer, delay_cs * 10);
-    }
+    if (delay_cs > 0) lv_timer_set_period(timer, delay_cs * 10);
 }
 
-static void display_gif_info(void)
-{
-    if (s_ctx.count == 0 || !s_ctx.canvas_buffer) return;
-
-    bsp_display_lock(0);
-
-    /* Clear canvas to dark background */
-    memset(s_ctx.canvas_buffer, 0x10, s_ctx.canvas_width * s_ctx.canvas_height * 2);
-    lv_canvas_set_buffer(s_ctx.canvas, s_ctx.canvas_buffer,
-                         s_ctx.canvas_width, s_ctx.canvas_height,
-                         LV_IMG_CF_TRUE_COLOR);
-
-    /* Draw GIF filename and index */
-    lv_draw_label_dsc_t label_dsc;
-    lv_draw_label_dsc_init(&label_dsc);
-    label_dsc.color = lv_color_white();
-    label_dsc.font = &lv_font_montserrat_16;
-    label_dsc.align = LV_TEXT_ALIGN_CENTER;
-
-    char text[64];
-    snprintf(text, sizeof(text), "GIF %d / %d\n\nPress to play",
-             s_ctx.current_index + 1, s_ctx.count);
-    lv_canvas_draw_text(s_ctx.canvas, 20, s_ctx.canvas_height / 2 - 30,
-                        s_ctx.canvas_width - 40, &label_dsc, text);
-
-    lv_obj_invalidate(s_ctx.canvas);
-    bsp_display_unlock();
-}
 
 /* ---- Encoding task ---- */
 
@@ -836,7 +1104,10 @@ esp_err_t app_gifs_next(void)
     if (s_ctx.count == 0) return ESP_FAIL;
     app_gifs_stop();
     s_ctx.current_index = (s_ctx.current_index + 1) % s_ctx.count;
-    display_gif_info();
+    /* No display_gif_info() here — the UI auto-calls app_gifs_play_current()
+     * immediately after this, and leaving the prior frame on-screen for
+     * the brief window until the new one renders looks smoother than
+     * flashing a "Press to play" placeholder over the canvas. */
     return ESP_OK;
 }
 
@@ -845,7 +1116,6 @@ esp_err_t app_gifs_prev(void)
     if (s_ctx.count == 0) return ESP_FAIL;
     app_gifs_stop();
     s_ctx.current_index = (s_ctx.current_index + s_ctx.count - 1) % s_ctx.count;
-    display_gif_info();
     return ESP_OK;
 }
 
@@ -1008,36 +1278,59 @@ esp_err_t app_gifs_play_current(void)
 
     /* GIF — acquire the global cache slot first so the playback timer
      * can mirror decoded frames into it for later replays. Slot is
-     * reused on revisits, so a GIF that's already been watched once
-     * comes back with its canvases already populated and the timer
-     * cascades into cache hits starting at frame 0. */
+     * reused on revisits: a GIF already watched once comes back with
+     * its canvases in memory, and we skip the decoder entirely. */
     s_ctx.active_slot = slot_find_or_alloc(ent->gif_path);
-    if (s_ctx.active_slot) {
-        ESP_LOGI(TAG, "cache slot: n_frames=%d complete=%d",
-                 s_ctx.active_slot->n_frames, s_ctx.active_slot->complete);
-    } else {
+    if (!s_ctx.active_slot) {
         ESP_LOGW(TAG, "No cache slot available (all full, eviction failed)");
+    }
+
+    /* Empty slot (fresh or just evicted) — try the on-disk prerendered
+     * 240×240 copy first. If it loads, playback runs entirely from
+     * memory with no GIF decoder and no ~3.5 MB pixel_indices. */
+    if (s_ctx.active_slot &&
+        !s_ctx.active_slot->complete &&
+        s_ctx.active_slot->n_frames == 0) {
+        (void)load_small_gif(ent->gif_path, s_ctx.active_slot);
+    }
+
+    if (s_ctx.active_slot) {
+        s_ctx.active_slot->playback_pos = 0;
+        /* If a previous play was interrupted mid-decode, drop the
+         * partial playback-order log — the decoder-driven path restarts
+         * from frame 0 and would otherwise double-log entries. */
+        if (!s_ctx.active_slot->complete) {
+            s_ctx.active_slot->playback_count = 0;
+        }
+        ESP_LOGI(TAG, "cache slot: n_frames=%d playback=%d complete=%d from_disk=%d",
+                 s_ctx.active_slot->n_frames,
+                 s_ctx.active_slot->playback_count,
+                 s_ctx.active_slot->complete,
+                 s_ctx.active_slot->from_disk);
     }
     s_ctx.first_loop_complete = s_ctx.active_slot && s_ctx.active_slot->complete;
     s_ctx.diag_frame_no = 0;
-    esp_err_t ret = gif_decoder_open(ent->gif_path, &s_ctx.decoder);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open GIF: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    s_ctx.decode_width = gif_decoder_get_width(s_ctx.decoder);
-    s_ctx.decode_height = gif_decoder_get_height(s_ctx.decoder);
 
-    ESP_LOGI(TAG, "GIF: %dx%d → canvas %dx%d",
-             s_ctx.decode_width, s_ctx.decode_height,
-             s_ctx.canvas_width, s_ctx.canvas_height);
-
-    /* Show the "loading..." overlay only when we expect a slow first
-     * loop. If this GIF's cache slot is already marked complete (user
-     * watched it before, frames are in PSRAM), skip the overlay —
-     * playback will hit the fast path immediately. */
+    /* Only open the GIF decoder when we actually need to do a first-
+     * loop decode. A complete slot (memory-resident OR just loaded from
+     * .p4ms) plays entirely from the cached canvas table. */
     if (!s_ctx.first_loop_complete) {
+        esp_err_t ret = gif_decoder_open(ent->gif_path, &s_ctx.decoder);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to open GIF: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        s_ctx.decode_width = gif_decoder_get_width(s_ctx.decoder);
+        s_ctx.decode_height = gif_decoder_get_height(s_ctx.decoder);
+        ESP_LOGI(TAG, "GIF: %dx%d → canvas %dx%d (first-loop decode)",
+                 s_ctx.decode_width, s_ctx.decode_height,
+                 s_ctx.canvas_width, s_ctx.canvas_height);
         show_loading_overlay();
+    } else {
+        s_ctx.decode_width = s_ctx.canvas_width;
+        s_ctx.decode_height = s_ctx.canvas_height;
+        ESP_LOGI(TAG, "Playing %s from cached canvases (no decoder)",
+                 ent->gif_path);
     }
 
     s_ctx.is_playing = true;

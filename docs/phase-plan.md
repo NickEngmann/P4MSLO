@@ -2,6 +2,21 @@
 
 This is the working plan for the current multi-feature session. Features are grouped into 5 phases, each landing as its own commit. Phases are ordered so low-risk changes ship first and each later phase can assume the earlier ones are in place.
 
+## On-device verification summary (2026-04-21)
+
+After the code landed, flashed to real P4-EYE hardware and 2 S3 cameras (OTA via HTTP). Reproduced the originally-reported "take picture → P4 freezes + returns to home screen" crash on the first press after flash — traced via RISC-V panic dump (`MCAUSE=0x1b`, stack protection fault in video-stream task), root-caused to a 2 KB on-stack copy buffer in the Phase 2 preview-save path, fixed by moving the save into the PIMSLO capture task (8 KB stack) + heap-allocating the buffer. Commit `988da32`.
+
+Second issue surfaced: GIF encoder OOM because the capture task reallocated viewfinder PSRAM too eagerly, starving the follow-on GIF task. Fixed with a handoff flag that keeps viewfinder freed through the full capture+encode cycle (same commit).
+
+Third issue: gallery entry OOM'd the GIF decoder because my Phase 2 `leaving_main()` always reallocated camera buffers — even for pure-display pages. Fixed by making each page explicitly state whether it needs the viewfinder. Commit `a53201d`.
+
+End-to-end verified on device: photo button → P4 JPEG saved → preview JPG copied → SPI capture 3/4 cameras → GIF queued → GIF encoded to `P4M0008.gif` (7.9 MB on SD), zero panics. 80/80 host tests pass, +20 from this session.
+
+Phase 5 `wifi_start` runs, fails cleanly (C6 SDIO transport pins not wired to esp_hosted defaults), device stays stable — confirms the documented "needs schematic review" blocker.
+
+---
+
+
 ## Features in this session
 
 | # | Feature | Phase | Complexity | Risk |

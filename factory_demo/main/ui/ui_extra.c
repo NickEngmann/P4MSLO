@@ -909,16 +909,21 @@ static void ui_extra_clear_popup_window(void)
 
 /**
  * @brief Called before every non-MAIN redirect. Hides the white home overlay
- * and brings the video-stream buffers back so camera pages have what they
- * need. Safe to call even when the buffers are already allocated — the
- * realloc is a no-op in that case.
+ * so the destination page renders without the home backdrop behind it.
+ *
+ * NOTE: camera buffers are NOT allocated here. Only camera-using pages
+ * (CAMERA / INTERVAL_CAM / VIDEO_MODE / AI_DETECT) should pull them back
+ * in via app_video_stream_realloc_buffers(); pure-display pages (GIFS,
+ * ALBUM, USB_DISK, SETTINGS) need the ~7 MB of PSRAM for their own
+ * decoders (GIF playback decode buffer is up to 7.4 MB). A bug in an
+ * earlier Phase 2 iteration reallocated unconditionally here and the GIF
+ * gallery OOM'd on entry; don't reintroduce that.
  */
 static void ui_extra_leaving_main(void)
 {
     if (ui_PanelHomeBackground) {
         lv_obj_add_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_HIDDEN);
     }
-    app_video_stream_realloc_buffers();
 }
 
 /**
@@ -957,6 +962,7 @@ static void ui_extra_redirect_to_main_page(void)
 static void ui_extra_redirect_to_camera_page(void)
 {
     ui_extra_leaving_main();
+    app_video_stream_realloc_buffers();  /* viewfinder */
     current_page = UI_PAGE_CAMERA;
 
     ui_extra_clear_page();
@@ -973,6 +979,7 @@ static void ui_extra_redirect_to_camera_page(void)
 static void ui_extra_redirect_to_interval_camera_page(void)
 {
     ui_extra_leaving_main();
+    app_video_stream_realloc_buffers();  /* viewfinder */
     current_page = UI_PAGE_INTERVAL_CAM;
 
     ui_extra_clear_page();
@@ -989,6 +996,7 @@ static void ui_extra_redirect_to_interval_camera_page(void)
 static void ui_extra_redirect_to_video_mode_page(void)
 {
     ui_extra_leaving_main();
+    app_video_stream_realloc_buffers();  /* viewfinder + video encode */
     current_page = UI_PAGE_VIDEO_MODE;
 
     ui_extra_clear_page();
@@ -1005,6 +1013,9 @@ static void ui_extra_redirect_to_video_mode_page(void)
 static void ui_extra_redirect_to_album_page(void)
 {
     ui_extra_leaving_main();
+    /* Album's JPEG decoder uses a large PSRAM buffer — free camera
+     * buffers if we came from a camera page. Idempotent. */
+    app_video_stream_free_buffers();
     current_page = UI_PAGE_ALBUM;
 
     ui_extra_clear_page();
@@ -1028,6 +1039,9 @@ static bool gifs_initialized = false;
 static void ui_extra_redirect_to_gifs_page(void)
 {
     ui_extra_leaving_main();
+    /* GIF decoder needs up to ~7.4 MB for the decode buffer — free the
+     * camera buffers if we're arriving from a camera page. Idempotent. */
+    app_video_stream_free_buffers();
     current_page = UI_PAGE_GIFS;
 
     ui_extra_clear_page();
@@ -1119,6 +1133,7 @@ static void ui_extra_redirect_to_settings_page(void)
 static void ui_extra_redirect_to_ai_detect_page(void)
 {
     ui_extra_leaving_main();
+    app_video_stream_realloc_buffers();  /* viewfinder + AI detection buffers */
     current_page = UI_PAGE_AI_DETECT;
 
     ui_extra_clear_page();

@@ -34,15 +34,12 @@ int gif_decoder_get_height(gif_decoder_t *dec);
 /**
  * @brief Decode the next frame directly into a scaled RGB565 buffer.
  *
- * The decoder feeds its LZW output into a 1-row-wide scanline scratch
- * owned by the decoder (~src_w bytes), then nearest-neighbor scales each
- * source row that maps to a new output row into `target_rgb565`. It never
- * materializes the full-resolution RGB565 intermediate, so peak memory
- * is bounded regardless of GIF dimensions.
+ * Full-frame indices buffer (width × height bytes, allocated in open())
+ * is filled from the LZW stream, then nearest-neighbor-scaled into
+ * `target_rgb565`.
  *
  * @param dec             Decoder context.
  * @param target_rgb565   Output buffer (`target_w * target_h * 2` bytes).
- *                        Typically this is the LCD canvas (240×240×2).
  * @param target_w        Target (output) width in pixels.
  * @param target_h        Target (output) height in pixels.
  * @param[out] delay_cs   Frame delay in centiseconds.
@@ -52,6 +49,33 @@ esp_err_t gif_decoder_next_frame(gif_decoder_t *dec,
                                   uint16_t *target_rgb565,
                                   int target_w, int target_h,
                                   int *delay_cs);
+
+/* ---- Two-step API for frame-cache dedup ------------------------------
+ *
+ * The usage pattern is:
+ *   1. call `read_next_frame` — pulls the frame's compressed LZW data
+ *      off the SD card into an internal buffer, computes a 32-bit
+ *      FNV-1a hash of the compressed bytes, returns that hash + the
+ *      frame delay. File cursor is advanced past the frame.
+ *   2. caller consults its own cache keyed by that hash.
+ *       - cache hit: call `discard_read_frame` and memcpy the cached
+ *         canvas into `target_rgb565` yourself. No LZW decode happens.
+ *       - cache miss: call `decode_read_frame` which feeds the buffered
+ *         LZW data through the normal decode + scale path into
+ *         `target_rgb565`, then drops the buffer.
+ *
+ * For PIMSLO GIFs (reverse frames written byte-for-byte identical to
+ * the forward frames), this lets a naive caller skip two full-frame
+ * LZW decodes per loop at the cost of one hash per frame. */
+esp_err_t gif_decoder_read_next_frame(gif_decoder_t *dec,
+                                       uint32_t *hash_out,
+                                       int *delay_cs_out);
+
+esp_err_t gif_decoder_decode_read_frame(gif_decoder_t *dec,
+                                         uint16_t *target_rgb565,
+                                         int target_w, int target_h);
+
+void gif_decoder_discard_read_frame(gif_decoder_t *dec);
 
 /**
  * @brief Reset to the first frame (seek to beginning)

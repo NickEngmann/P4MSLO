@@ -9,7 +9,10 @@
 #include "app_gifs.h"
 #include "gif_encoder.h"
 #include "gif_decoder.h"
+#include "gif_tjpgd.h"
 #include "driver/jpeg_decode.h"
+#include "app_pimslo.h"
+#include "ui/ui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,19 +33,39 @@ static const char *TAG = "app_gifs";
 
 #define MAX_PATH_LEN  512
 #define MAX_GIF_FILES 64
+#define MAX_FRAME_CACHE 12   /* unique frames we'll cache per GIF — plenty
+                              * for PIMSLO 6-frame palindromes with headroom */
 
 /* Photo source directory (same as album) */
 #define PIC_FOLDER_NAME "esp32_p4_pic_save"
 
+typedef enum {
+    GALLERY_ENTRY_GIF,    /* animated */
+    GALLERY_ENTRY_JPEG,   /* still preview (encode not yet done) */
+} gallery_entry_type_t;
+
+typedef struct {
+    char *path;
+    gallery_entry_type_t type;
+} gallery_entry_t;
+
+/* Frame cache entry — maps a hash of a frame's LZW bytes to its
+ * already-decoded 240×240 canvas. */
+typedef struct {
+    uint32_t hash;
+    uint16_t *canvas;  /* canvas_width * canvas_height * 2 bytes, PSRAM */
+    bool used;
+} frame_cache_t;
+
 typedef struct {
     lv_obj_t *canvas;
-    uint16_t *canvas_buffer;       /* 240x240 for display (streaming decode target) */
+    uint16_t *canvas_buffer;       /* 240x240 for display (decode target) */
     int canvas_width, canvas_height;
 
     /* Native source dimensions of the currently-open GIF, for logging. */
     int decode_width, decode_height;
 
-    char **filenames;
+    gallery_entry_t *entries;      /* sized `count`, owned */
     int count;
     int current_index;
 
@@ -50,6 +73,31 @@ typedef struct {
     lv_timer_t *play_timer;
     bool is_playing;
     bool is_encoding;
+
+    /* Per-GIF decoded-frame cache. Freed on stop(). Entries are populated
+     * as frames are decoded — reverse frames in PIMSLO palindromes hit
+     * this cache and skip the LZW decode entirely. */
+    frame_cache_t frame_cache[MAX_FRAME_CACHE];
+    int frame_cache_n;
+
+    /* Short display name of the current entry (e.g. "P4M0007" or
+     * "pimslo"). Shown in `name_label` — a regular LVGL label widget
+     * positioned at the bottom of the GIFS screen, NOT drawn into the
+     * canvas pixel buffer. Keeping this in its own LVGL object layer
+     * avoids the earlier black-screen bug where drawing rect+text
+     * directly onto the canvas buffer blanked the display. */
+    char current_label[32];
+    lv_obj_t *name_label;
+
+    /* Shown in the center of the screen ONLY when the current entry is
+     * a JPEG preview (i.e. the GIF encode is still queued or running).
+     * Tells the user the image is a still frame and a full PIMSLO GIF
+     * will replace it once encoding finishes. Hidden for GIF entries. */
+    lv_obj_t *processing_label;
+
+    /* Per-GIF frame counter used only for throttled hash/hit/miss diag
+     * logging (first 20 frames of each play_current). Reset per play. */
+    int diag_frame_no;
 
     size_t cache_line_size;
 } gifs_context_t;
@@ -79,6 +127,21 @@ static inline uint16_t rgb888_to_rgb565_swapped(uint8_t r, uint8_t g, uint8_t b)
     return (px >> 8) | (px << 8);  /* Byte swap for LV_COLOR_16_SWAP */
 }
 
+/* Pull the display filename out of a full path. Keeps the extension so
+ * the user can tell at a glance whether an entry is a finished animated
+ * GIF or the JPEG placeholder for a capture whose encode isn't done yet.
+ * "/sdcard/p4mslo_gifs/P4M0007.gif" → "P4M0007.gif"
+ * "/sdcard/p4mslo_previews/P4M0006.jpg" → "P4M0006.jpg"  */
+static void compute_display_name(const char *path, char *out, size_t out_cap)
+{
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    size_t len = strlen(base);
+    if (len >= out_cap) len = out_cap - 1;
+    memcpy(out, base, len);
+    out[len] = 0;
+}
+
 static void playback_timer_cb(lv_timer_t *timer)
 {
     if (!s_ctx.is_playing || !s_ctx.decoder || !s_ctx.canvas_buffer) {
@@ -86,30 +149,76 @@ static void playback_timer_cb(lv_timer_t *timer)
     }
 
     int delay_cs = 10;
-    /* Decoder streams straight into the 240×240 canvas buffer, doing
-     * nearest-neighbor downscale during LZW decode — no 6.7 MB full-res
-     * intermediate needed. */
-    esp_err_t ret = gif_decoder_next_frame(s_ctx.decoder,
-                                            s_ctx.canvas_buffer,
-                                            s_ctx.canvas_width,
-                                            s_ctx.canvas_height,
-                                            &delay_cs);
+    size_t canvas_bytes = s_ctx.canvas_width * s_ctx.canvas_height * 2;
 
+    /* Two-step dedup-aware decode. Step 1: pull the next frame's
+     * compressed LZW bytes into the decoder's internal buffer and hash
+     * them. Step 2: if that hash is in our frame cache, memcpy the
+     * cached canvas (fast path); otherwise decode for real and insert
+     * the result into the cache. Reverse frames in PIMSLO palindromes
+     * hit the cache and skip LZW decode entirely. */
+    uint32_t hash = 0;
+    esp_err_t ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
     if (ret == ESP_ERR_NOT_FOUND) {
-        /* Loop: reset to first frame */
+        /* Loop: reset to first frame and try again. */
         gif_decoder_reset(s_ctx.decoder);
-        ret = gif_decoder_next_frame(s_ctx.decoder,
-                                      s_ctx.canvas_buffer,
-                                      s_ctx.canvas_width,
-                                      s_ctx.canvas_height,
-                                      &delay_cs);
-        if (ret != ESP_OK) {
-            app_gifs_stop();
-            return;
-        }
+        ret = gif_decoder_read_next_frame(s_ctx.decoder, &hash, &delay_cs);
+        if (ret != ESP_OK) { app_gifs_stop(); return; }
     } else if (ret != ESP_OK) {
         app_gifs_stop();
         return;
+    }
+
+    /* Cache lookup. */
+    int hit_idx = -1;
+    for (int i = 0; i < s_ctx.frame_cache_n; i++) {
+        if (s_ctx.frame_cache[i].used && s_ctx.frame_cache[i].hash == hash) {
+            hit_idx = i; break;
+        }
+    }
+
+    /* Throttled diagnostic: the first handful of frames of each GIF only.
+     * Lets us see hashes + hit/miss to prove (or disprove) the dedup,
+     * without flooding serial during long playback. Counter resets on
+     * each new play_current(). */
+    const int DIAG_LIMIT = 20;
+    bool diag_log = s_ctx.diag_frame_no < DIAG_LIMIT;
+    int this_frame = s_ctx.diag_frame_no++;
+
+    if (hit_idx >= 0) {
+        if (diag_log) {
+            ESP_LOGI(TAG, "f#%d HIT  hash=%08x slot=%d delay=%dcs",
+                     this_frame, (unsigned)hash, hit_idx, delay_cs);
+        }
+        memcpy(s_ctx.canvas_buffer, s_ctx.frame_cache[hit_idx].canvas, canvas_bytes);
+        gif_decoder_discard_read_frame(s_ctx.decoder);
+    } else {
+        uint32_t t0 = diag_log ? esp_log_timestamp() : 0;
+        ret = gif_decoder_decode_read_frame(s_ctx.decoder,
+                                             s_ctx.canvas_buffer,
+                                             s_ctx.canvas_width,
+                                             s_ctx.canvas_height);
+        if (ret != ESP_OK) { app_gifs_stop(); return; }
+
+        bool cached = false;
+        if (s_ctx.frame_cache_n < MAX_FRAME_CACHE) {
+            uint16_t *copy = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
+            if (copy) {
+                memcpy(copy, s_ctx.canvas_buffer, canvas_bytes);
+                int i = s_ctx.frame_cache_n++;
+                s_ctx.frame_cache[i].hash = hash;
+                s_ctx.frame_cache[i].canvas = copy;
+                s_ctx.frame_cache[i].used = true;
+                cached = true;
+            }
+        }
+        if (diag_log) {
+            ESP_LOGI(TAG, "f#%d MISS hash=%08x decode=%lums delay=%dcs "
+                          "cached=%d total_cached=%d",
+                     this_frame, (unsigned)hash,
+                     (unsigned long)(esp_log_timestamp() - t0),
+                     delay_cs, cached, s_ctx.frame_cache_n);
+        }
     }
 
     /* Push the freshly-rendered canvas to LVGL. */
@@ -322,71 +431,138 @@ esp_err_t app_gifs_init(lv_obj_t *canvas)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Create the entry-name label as an overlay on the gallery screen.
+     * A regular LVGL label stacked above the canvas avoids poking at the
+     * canvas pixel buffer directly — much safer than lv_canvas_draw_text
+     * and zero per-frame cost. */
+    s_ctx.name_label = lv_label_create(ui_ScreenGifs);
+    lv_obj_set_style_bg_color(s_ctx.name_label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_ctx.name_label, LV_OPA_60, 0);
+    lv_obj_set_style_text_color(s_ctx.name_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_ctx.name_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_pad_all(s_ctx.name_label, 3, 0);
+    lv_obj_set_style_radius(s_ctx.name_label, 4, 0);
+    lv_obj_align(s_ctx.name_label, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_label_set_text(s_ctx.name_label, "");
+    /* Hidden until the first play_current() updates its text. */
+    lv_obj_add_flag(s_ctx.name_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* Center "PROCESSING" badge for JPEG-preview entries — a static
+     * still frame with this overlay tells the user the captured burst
+     * hasn't finished encoding into a GIF yet. Hidden on GIF entries. */
+    s_ctx.processing_label = lv_label_create(ui_ScreenGifs);
+    lv_obj_set_style_bg_color(s_ctx.processing_label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_ctx.processing_label, LV_OPA_70, 0);
+    lv_obj_set_style_text_color(s_ctx.processing_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_ctx.processing_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_pad_all(s_ctx.processing_label, 8, 0);
+    lv_obj_set_style_radius(s_ctx.processing_label, 6, 0);
+    lv_obj_align(s_ctx.processing_label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(s_ctx.processing_label, "PROCESSING");
+    lv_obj_add_flag(s_ctx.processing_label, LV_OBJ_FLAG_HIDDEN);
+
     return ESP_OK;
+}
+
+static void free_entries(void)
+{
+    if (!s_ctx.entries) return;
+    for (int i = 0; i < s_ctx.count; i++) {
+        if (s_ctx.entries[i].path) free(s_ctx.entries[i].path);
+    }
+    free(s_ctx.entries);
+    s_ctx.entries = NULL;
+    s_ctx.count = 0;
 }
 
 void app_gifs_deinit(void)
 {
     app_gifs_stop();
-
-    if (s_ctx.filenames) {
-        for (int i = 0; i < s_ctx.count; i++) {
-            if (s_ctx.filenames[i]) free(s_ctx.filenames[i]);
-        }
-        free(s_ctx.filenames);
-        s_ctx.filenames = NULL;
-    }
-
+    free_entries();
     if (s_ctx.canvas_buffer) {
         heap_caps_free(s_ctx.canvas_buffer);
         s_ctx.canvas_buffer = NULL;
     }
+}
 
-    s_ctx.count = 0;
+/* Extract the PIMSLO capture stem from a filename like "P4M0007.gif"
+ * or "P4M0007.jpg" → writes "P4M0007" into `stem_out`.
+ * Returns true if the basename matched the PIMSLO pattern. */
+static bool extract_pimslo_stem(const char *name, char *stem_out, size_t stem_cap)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    size_t len = (size_t)(dot - name);
+    if (len == 0 || len >= stem_cap) return false;
+    memcpy(stem_out, name, len);
+    stem_out[len] = 0;
+    return true;
 }
 
 esp_err_t app_gifs_scan(void)
 {
-    /* Free old filenames */
-    if (s_ctx.filenames) {
-        for (int i = 0; i < s_ctx.count; i++) {
-            if (s_ctx.filenames[i]) free(s_ctx.filenames[i]);
-        }
-        free(s_ctx.filenames);
-        s_ctx.filenames = NULL;
-        s_ctx.count = 0;
-    }
+    free_entries();
 
     ensure_gif_dir();
-
     char gif_dir[MAX_PATH_LEN];
     snprintf(gif_dir, sizeof(gif_dir), "%s/%s", BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME);
 
+    /* Collect PIMSLO stems that already have a finished GIF — those take
+     * priority over the JPEG preview. */
+    char seen_gif_stems[MAX_GIF_FILES][32];
+    int n_seen = 0;
+
+    s_ctx.entries = calloc(MAX_GIF_FILES, sizeof(gallery_entry_t));
+    if (!s_ctx.entries) return ESP_ERR_NO_MEM;
+
+    /* Pass 1: every .gif in the gifs dir */
     DIR *dir = opendir(gif_dir);
-    if (!dir) {
-        ESP_LOGW(TAG, "Cannot open %s", gif_dir);
-        return ESP_OK;
-    }
-
-    s_ctx.filenames = heap_caps_calloc(MAX_GIF_FILES, sizeof(char *), MALLOC_CAP_SPIRAM);
-    if (!s_ctx.filenames) {
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL && s_ctx.count < MAX_GIF_FILES) {
+            if (!is_gif_file(entry->d_name) || entry->d_name[0] == '.') continue;
+            char stem[32];
+            if (extract_pimslo_stem(entry->d_name, stem, sizeof(stem))
+                && n_seen < MAX_GIF_FILES) {
+                strncpy(seen_gif_stems[n_seen++], stem, 31);
+                seen_gif_stems[n_seen - 1][31] = 0;
+            }
+            s_ctx.entries[s_ctx.count].type = GALLERY_ENTRY_GIF;
+            s_ctx.entries[s_ctx.count].path = malloc(MAX_PATH_LEN);
+            snprintf(s_ctx.entries[s_ctx.count].path, MAX_PATH_LEN,
+                     "%.200s/%.255s", gif_dir, entry->d_name);
+            s_ctx.count++;
+        }
         closedir(dir);
-        return ESP_ERR_NO_MEM;
     }
 
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL && s_ctx.count < MAX_GIF_FILES) {
-        if (!is_gif_file(entry->d_name)) continue;
-        if (entry->d_name[0] == '.') continue;
+    /* Pass 2: JPEG previews whose matching GIF isn't ready yet. */
+    DIR *pdir = opendir(PIMSLO_PREVIEW_DIR);
+    if (pdir) {
+        struct dirent *entry;
+        while ((entry = readdir(pdir)) != NULL && s_ctx.count < MAX_GIF_FILES) {
+            const char *ext = strrchr(entry->d_name, '.');
+            if (!ext || strcasecmp(ext, ".jpg") != 0 || entry->d_name[0] == '.') continue;
+            char stem[32];
+            if (!extract_pimslo_stem(entry->d_name, stem, sizeof(stem))) continue;
+            /* Skip if a matching GIF was already added. */
+            bool shadowed = false;
+            for (int i = 0; i < n_seen; i++) {
+                if (strcmp(seen_gif_stems[i], stem) == 0) { shadowed = true; break; }
+            }
+            if (shadowed) continue;
 
-        s_ctx.filenames[s_ctx.count] = heap_caps_malloc(MAX_PATH_LEN, MALLOC_CAP_SPIRAM);
-        snprintf(s_ctx.filenames[s_ctx.count], MAX_PATH_LEN, "%.200s/%.255s", gif_dir, entry->d_name);
-        s_ctx.count++;
+            s_ctx.entries[s_ctx.count].type = GALLERY_ENTRY_JPEG;
+            s_ctx.entries[s_ctx.count].path = malloc(MAX_PATH_LEN);
+            snprintf(s_ctx.entries[s_ctx.count].path, MAX_PATH_LEN,
+                     "%s/%s", PIMSLO_PREVIEW_DIR, entry->d_name);
+            s_ctx.count++;
+        }
+        closedir(pdir);
     }
-    closedir(dir);
 
     s_ctx.current_index = 0;
-    ESP_LOGI(TAG, "Found %d GIF files", s_ctx.count);
+    ESP_LOGI(TAG, "Gallery scan: %d entries (GIFs + JPEG previews)", s_ctx.count);
     return ESP_OK;
 }
 
@@ -411,45 +587,168 @@ esp_err_t app_gifs_prev(void)
     return ESP_OK;
 }
 
+/* Decode a full-size JPEG into the 240×240 canvas buffer via tjpgd.
+ * Used for entries that don't yet have a GIF (the PIMSLO encode is still
+ * running or was interrupted). Static image, no animation. */
+typedef struct {
+    FILE *fp;
+    uint16_t *canvas;
+    int canvas_w, canvas_h;
+    int src_w, src_h;  /* learned from the JPEG header via jd_prepare */
+} jpeg_ctx_t;
+
+static size_t jpeg_in_cb(JDEC *jd, uint8_t *buf, size_t len)
+{
+    jpeg_ctx_t *c = (jpeg_ctx_t *)jd->device;
+    if (buf) return fread(buf, 1, len, c->fp);
+    return (size_t)(fseek(c->fp, (long)len, SEEK_CUR) == 0 ? len : 0);
+}
+
+static int jpeg_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    jpeg_ctx_t *c = (jpeg_ctx_t *)jd->device;
+    const uint8_t *src = (const uint8_t *)bitmap;
+    int bw = rect->right - rect->left + 1;
+    int bh = rect->bottom - rect->top + 1;
+
+    /* Nearest-neighbor downscale each decoded MCU tile into the canvas.
+     * For each output pixel we check if there's a source pixel in THIS
+     * tile that maps to it; if so, write it. Rows/cols outside this
+     * tile are handled by other tile calls. */
+    for (int by = 0; by < bh; by++) {
+        int src_y = rect->top + by;
+        int out_y = (src_y * c->canvas_h) / c->src_h;
+        if (out_y < 0 || out_y >= c->canvas_h) continue;
+        /* Only emit if this source row is the "first" for that out_y. */
+        int first_src_y_for_out = (out_y * c->src_h) / c->canvas_h;
+        if (src_y != first_src_y_for_out) continue;
+
+        for (int bx = 0; bx < bw; bx++) {
+            int src_x = rect->left + bx;
+            int out_x = (src_x * c->canvas_w) / c->src_w;
+            if (out_x < 0 || out_x >= c->canvas_w) continue;
+            int first_src_x_for_out = (out_x * c->src_w) / c->canvas_w;
+            if (src_x != first_src_x_for_out) continue;
+
+            const uint8_t *px = &src[(by * bw + bx) * 3];
+            /* Byte-swapped RGB565 for LV_COLOR_16_SWAP (matches the GIF
+             * decoder output format so the canvas renders identically). */
+            uint16_t pxl = ((px[0] >> 3) << 11)
+                         | ((px[1] >> 2) << 5)
+                         |  (px[2] >> 3);
+            c->canvas[out_y * c->canvas_w + out_x] = (pxl >> 8) | (pxl << 8);
+        }
+    }
+    return 1;
+}
+
+static esp_err_t show_jpeg(const char *path)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return ESP_FAIL;
+
+    /* Reasonable working buffer size for tjpgd's LUT + state. */
+    static uint8_t tjpgd_work[32768] __attribute__((aligned(4)));
+
+    jpeg_ctx_t ctx = {
+        .fp = fp,
+        .canvas = s_ctx.canvas_buffer,
+        .canvas_w = s_ctx.canvas_width,
+        .canvas_h = s_ctx.canvas_height,
+    };
+
+    JDEC jd;
+    JRESULT r = gif_jd_prepare(&jd, jpeg_in_cb, tjpgd_work, sizeof(tjpgd_work), &ctx);
+    if (r != JDR_OK) {
+        ESP_LOGE(TAG, "JPEG header parse failed for %s (jdr=%d)", path, r);
+        fclose(fp);
+        return ESP_FAIL;
+    }
+    ctx.src_w = jd.width;
+    ctx.src_h = jd.height;
+
+    /* Clear canvas before decode so untouched areas don't show stale data. */
+    memset(s_ctx.canvas_buffer, 0x10,
+           s_ctx.canvas_width * s_ctx.canvas_height * 2);
+
+    r = gif_jd_decomp(&jd, jpeg_out_cb, 0);
+    fclose(fp);
+    if (r != JDR_OK) {
+        ESP_LOGE(TAG, "JPEG decode failed (jdr=%d)", r);
+        return ESP_FAIL;
+    }
+
+    /* Push to display. No timer — this is a static preview. */
+    bsp_display_lock(0);
+    lv_canvas_set_buffer(s_ctx.canvas, s_ctx.canvas_buffer,
+                         s_ctx.canvas_width, s_ctx.canvas_height,
+                         LV_IMG_CF_TRUE_COLOR);
+    lv_obj_invalidate(s_ctx.canvas);
+    bsp_display_unlock();
+    return ESP_OK;
+}
+
 esp_err_t app_gifs_play_current(void)
 {
     if (s_ctx.count == 0 || !s_ctx.canvas_buffer) {
-        ESP_LOGE(TAG, "Cannot play: count=%d canvas=%p", s_ctx.count, s_ctx.canvas_buffer);
+        ESP_LOGE(TAG, "Cannot play: count=%d canvas=%p",
+                 s_ctx.count, s_ctx.canvas_buffer);
         return ESP_FAIL;
     }
 
     app_gifs_stop();
 
-    ESP_LOGI(TAG, "Playing: %s", s_ctx.filenames[s_ctx.current_index]);
+    const gallery_entry_t *ent = &s_ctx.entries[s_ctx.current_index];
+    ESP_LOGI(TAG, "Gallery entry %d/%d: %s [%s]",
+             s_ctx.current_index + 1, s_ctx.count, ent->path,
+             ent->type == GALLERY_ENTRY_GIF ? "GIF" : "JPEG preview");
 
-    esp_err_t ret = gif_decoder_open(s_ctx.filenames[s_ctx.current_index], &s_ctx.decoder);
+    /* Refresh the on-screen name overlay for this entry, and toggle the
+     * "PROCESSING" center badge for JPEG-preview entries (captures whose
+     * GIF encode isn't finished yet). */
+    compute_display_name(ent->path, s_ctx.current_label, sizeof(s_ctx.current_label));
+    bsp_display_lock(0);
+    if (s_ctx.name_label) {
+        lv_label_set_text(s_ctx.name_label, s_ctx.current_label);
+        lv_obj_clear_flag(s_ctx.name_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_ctx.name_label);
+    }
+    if (s_ctx.processing_label) {
+        if (ent->type == GALLERY_ENTRY_JPEG) {
+            lv_obj_clear_flag(s_ctx.processing_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(s_ctx.processing_label);
+        } else {
+            lv_obj_add_flag(s_ctx.processing_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    bsp_display_unlock();
+
+    if (ent->type == GALLERY_ENTRY_JPEG) {
+        /* Static JPEG preview — decode once, no timer. */
+        return show_jpeg(ent->path);
+    }
+
+    /* GIF — open the decoder and start the frame-paced loop. */
+    s_ctx.diag_frame_no = 0;
+    esp_err_t ret = gif_decoder_open(ent->path, &s_ctx.decoder);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open GIF: %s", esp_err_to_name(ret));
         return ret;
     }
-
-    /* Record GIF native dimensions for logging / possible future use. The
-     * streaming decoder no longer needs a full-res intermediate buffer —
-     * it renders straight into canvas_buffer at target resolution. */
     s_ctx.decode_width = gif_decoder_get_width(s_ctx.decoder);
     s_ctx.decode_height = gif_decoder_get_height(s_ctx.decoder);
 
-    ESP_LOGI(TAG, "GIF: %dx%d → canvas %dx%d (streaming)",
+    ESP_LOGI(TAG, "GIF: %dx%d → canvas %dx%d",
              s_ctx.decode_width, s_ctx.decode_height,
              s_ctx.canvas_width, s_ctx.canvas_height);
 
     s_ctx.is_playing = true;
-
-    /* Create LVGL timer for frame-paced playback */
     s_ctx.play_timer = lv_timer_create(playback_timer_cb, 100, NULL);
     if (!s_ctx.play_timer) {
         app_gifs_stop();
         return ESP_FAIL;
     }
-
-    /* Decode and display the first frame immediately */
     playback_timer_cb(s_ctx.play_timer);
-
     return ESP_OK;
 }
 
@@ -466,6 +765,17 @@ void app_gifs_stop(void)
         gif_decoder_close(s_ctx.decoder);
         s_ctx.decoder = NULL;
     }
+
+    /* Free per-GIF frame cache. Each canvas is 115 KB in PSRAM — leaving
+     * them around after stop would eat several hundred KB for a file
+     * we're no longer viewing. */
+    for (int i = 0; i < s_ctx.frame_cache_n; i++) {
+        if (s_ctx.frame_cache[i].canvas) {
+            heap_caps_free(s_ctx.frame_cache[i].canvas);
+        }
+    }
+    memset(s_ctx.frame_cache, 0, sizeof(s_ctx.frame_cache));
+    s_ctx.frame_cache_n = 0;
 }
 
 bool app_gifs_is_playing(void) { return s_ctx.is_playing; }

@@ -155,6 +155,22 @@ Tasks:
 
 ---
 
+## Gallery UX + streaming GIF decoder ✅ SHIPPED (2026-04-21)
+
+After the user pointed out that gallery playback was stuck at ~2 s/frame and demanded real fixes rather than deferrals, landed a substantially rewritten GIF playback path. Combines:
+
+- **Streaming-ish decoder** that drops the 6.7 MB full-res RGB565 intermediate — `gif_decoder_next_frame()` now nearest-neighbor-scales palette indices straight into a 240×240 target buffer. Peak memory 10 MB → ~3.6 MB (3.5 MB `pixel_indices` + 115 KB canvas).
+- **Two-step decode API** (`read_next_frame` / `decode_read_frame` / `discard_read_frame`) so the app layer can peek a frame's hash before committing to a full LZW decode. Hash is FNV-1a over the compressed LZW bytes, so reverse frames in PIMSLO palindromes fingerprint identical to their forward originals.
+- **Per-decoder frame-offset map** — after the first pass through a file, each frame's (start_offset, end_offset, hash, delay) is remembered. On subsequent loops the decoder fast-paths to `fseek(end_offset)` and returns the recorded hash without reading the ~1 MB of compressed data again. Measured result: hits the GIF's native 150 ms framerate on loop 2 and beyond; first loop is still decode-limited (~600-700 ms per unique frame).
+- **Canvas frame cache** in `app_gifs.c` — 115 KB per unique frame, keyed on the decoder's hash. A 6-frame PIMSLO palindrome dedups to 4 unique canvases (~460 KB total).
+- **JPEG preview fallback** — gallery scans both `/sdcard/p4mslo_gifs/*.gif` and `/sdcard/p4mslo_previews/*.jpg`. When a capture's GIF encode isn't done yet, the gallery shows its static JPEG via tjpgd, overlaid with a centered **PROCESSING** badge so the user knows the animated version is still in flight. As soon as the GIF lands on disk the next gallery scan prefers it.
+- **Auto-play on nav** — `btn_up` / `btn_down` open and play the neighboring entry immediately. No more "press to play" intermediate state.
+- **On-screen entry name** — bottom-center LVGL label (not drawn onto the canvas pixel buffer, which caused a screen-blank bug on an earlier attempt) shows the current filename.
+
+Verified on device: fresh-boot GIF entry, post-fragmentation GIF entry, encoder-busy entry (gracefully static-frames), JPEG-preview navigation (shows PROCESSING badge), 20-step full-gallery navigation without panics, steady-state ~150 ms framerate after first loop.
+
+---
+
 ## Phase 3 — Parallel GIF encoding 🟡 DEFERRED (see note)
 
 **Deferral rationale (2026-04-19):** After landing Phase 2, the measured MAIN-page PSRAM state is 8.3 MB free, which is also the largest-contiguous-block ceiling (per CLAUDE.md "Known Issues" — 32 MB total, ~8.26 MB max contiguous after boot). The planned double-buffered inter-frame pipeline needs 2× 7.0 MB RGB565 scaled buffers = 14 MB peak — physically infeasible without freeing substantially more PSRAM than what Phase 2 unlocked.

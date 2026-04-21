@@ -35,7 +35,48 @@ struct gif_decoder {
      * For 1824×1920 PIMSLO GIFs that's 3.5 MB — down from the old
      * 3.3 MB pixel_indices + 6.7 MB rgb565 = 10 MB peak. */
     uint8_t *pixel_indices;
+
+    /* Per-frame buffered LZW data for the read_next_frame / decode_read_frame
+     * two-step API (used by the frame-cache dedup path). Allocated lazily,
+     * freed in close(). */
+    uint8_t *pending_lzw;
+    size_t  pending_lzw_cap;   /* allocated size of pending_lzw */
+    size_t  pending_lzw_len;   /* bytes of valid data */
+    int     pending_min_code_size;
+    int     pending_delay_cs;
+    bool    pending_valid;     /* true between read_next_frame and
+                                  decode_read_frame/discard_read_frame */
+
+    /* Per-frame offset map, built up on the first pass through the GIF.
+     * On subsequent loop iterations, if the current file offset matches
+     * a recorded frame start, we fseek straight to its end_offset and
+     * return the cached hash — no need to read+hash the ~1 MB of
+     * compressed data again. This is what lets playback actually hit
+     * the GIF's native framerate on cache-hit loops; otherwise the SD
+     * read-back of each frame's LZW bytes dominates the frame period. */
+#define GIF_MAX_FRAMES 16
+    struct {
+        long start_offset;   /* file offset at frame header start */
+        long end_offset;     /* file offset just past the 0-terminator */
+        uint32_t hash;
+        int delay_cs;
+        bool used;
+    } frame_map[GIF_MAX_FRAMES];
+    int frame_map_n;
 };
+
+/* FNV-1a 32-bit hash, used to key the frame cache. Fast, good-enough
+ * distribution for our use case (dedup matched against a handful of
+ * frames per GIF). */
+static uint32_t fnv1a_update(uint32_t h, const uint8_t *data, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        h ^= data[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+#define FNV1A_INIT 0x811c9dc5u
 
 /* ---- Helpers ---- */
 
@@ -298,6 +339,11 @@ esp_err_t gif_decoder_reset(gif_decoder_t *dec)
 {
     if (!dec->fp) return ESP_FAIL;
     fseek(dec->fp, dec->first_frame_offset, SEEK_SET);
+    /* Drop any pending frame buffered by a prior read_next_frame that the
+     * caller didn't finalize — otherwise a reset + decode_read_frame would
+     * decode last-loop's last frame instead of the first. */
+    dec->pending_valid = false;
+    dec->pending_lzw_len = 0;
     return ESP_OK;
 }
 
@@ -307,5 +353,216 @@ void gif_decoder_close(gif_decoder_t *dec)
     if (dec->fp) fclose(dec->fp);
     if (dec->path) free(dec->path);
     if (dec->pixel_indices) heap_caps_free(dec->pixel_indices);
+    if (dec->pending_lzw) heap_caps_free(dec->pending_lzw);
     free(dec);
+}
+
+/* Ensure the pending_lzw buffer has at least `need` bytes of capacity.
+ * Grows by doubling. Allocated in PSRAM since it can exceed 1 MB. */
+static esp_err_t ensure_pending_cap(gif_decoder_t *dec, size_t need)
+{
+    if (dec->pending_lzw_cap >= need) return ESP_OK;
+    size_t new_cap = dec->pending_lzw_cap ? dec->pending_lzw_cap : 16384;
+    while (new_cap < need) new_cap *= 2;
+    uint8_t *nb = heap_caps_realloc(dec->pending_lzw, new_cap, MALLOC_CAP_SPIRAM);
+    if (!nb) {
+        ESP_LOGE(TAG, "Failed to grow pending_lzw to %zu bytes", new_cap);
+        return ESP_ERR_NO_MEM;
+    }
+    dec->pending_lzw = nb;
+    dec->pending_lzw_cap = new_cap;
+    return ESP_OK;
+}
+
+/* Read the next image block (skipping extensions / trailers) from the
+ * file, buffer its LZW sub-blocks into dec->pending_lzw, compute a hash
+ * of those bytes. File cursor is left just past this frame's data.
+ *
+ * Fast path: if we've seen a frame starting at the current offset before
+ * (and recorded its hash + end offset on that pass), seek directly to
+ * the end and return the recorded hash without reading the LZW bytes.
+ * This makes cache-hit playback I/O-free and lets us actually hit the
+ * GIF's 150 ms framerate instead of being stuck at SD-read speed. */
+esp_err_t gif_decoder_read_next_frame(gif_decoder_t *dec,
+                                       uint32_t *hash_out,
+                                       int *delay_cs_out)
+{
+    if (!dec || !dec->fp) return ESP_ERR_INVALID_STATE;
+
+    long current_offset = ftell(dec->fp);
+    /* Fast path — already-scanned frame starting here. */
+    for (int i = 0; i < dec->frame_map_n; i++) {
+        if (dec->frame_map[i].used &&
+            dec->frame_map[i].start_offset == current_offset) {
+            fseek(dec->fp, dec->frame_map[i].end_offset, SEEK_SET);
+            if (hash_out) *hash_out = dec->frame_map[i].hash;
+            if (delay_cs_out) *delay_cs_out = dec->frame_map[i].delay_cs;
+            dec->pending_valid = false;   /* no pending data on fast path */
+            return ESP_OK;
+        }
+    }
+
+    int delay_cs = 10;  /* default 100 ms */
+
+    while (1) {
+        uint8_t block_type;
+        if (fread(&block_type, 1, 1, dec->fp) != 1) return ESP_ERR_NOT_FOUND;
+
+        if (block_type == 0x3B) return ESP_ERR_NOT_FOUND;  /* trailer */
+
+        if (block_type == 0x21) {
+            uint8_t label;
+            fread(&label, 1, 1, dec->fp);
+            if (label == 0xF9) {
+                uint8_t size;
+                fread(&size, 1, 1, dec->fp);
+                if (size >= 4) {
+                    uint8_t gce[4];
+                    fread(gce, 1, 4, dec->fp);
+                    delay_cs = gce[1] | ((int)gce[2] << 8);
+                    if (delay_cs == 0) delay_cs = 10;
+                    if (size > 4) fseek(dec->fp, size - 4, SEEK_CUR);
+                }
+                uint8_t term; fread(&term, 1, 1, dec->fp);
+            } else {
+                while (1) {
+                    uint8_t bs;
+                    if (fread(&bs, 1, 1, dec->fp) != 1 || bs == 0) break;
+                    fseek(dec->fp, bs, SEEK_CUR);
+                }
+            }
+            continue;
+        }
+
+        if (block_type == 0x2C) {
+            /* Image Descriptor — skip the position/size/LCT stuff but
+             * remember min_code_size so decode_read_frame can replay it. */
+            fseek(dec->fp, 8, SEEK_CUR);  /* left, top, width, height */
+            uint8_t img_packed;
+            fread(&img_packed, 1, 1, dec->fp);
+            bool has_lct = (img_packed & 0x80) != 0;
+            bool interlaced = (img_packed & 0x40) != 0;
+            if (interlaced) {
+                ESP_LOGE(TAG, "Interlaced GIFs not supported");
+                return ESP_FAIL;
+            }
+            if (has_lct) {
+                int lct_size = 1 << ((img_packed & 0x07) + 1);
+                fseek(dec->fp, lct_size * 3, SEEK_CUR);
+            }
+            uint8_t min_code_size;
+            fread(&min_code_size, 1, 1, dec->fp);
+
+            /* Buffer every sub-block into pending_lzw in order (with the
+             * 1-byte sub-block size prefix so decode can replay it
+             * identically). Accumulate hash as we go. */
+            dec->pending_lzw_len = 0;
+            uint32_t hash = FNV1A_INIT;
+            hash = fnv1a_update(hash, &min_code_size, 1);
+
+            while (1) {
+                uint8_t bs;
+                if (fread(&bs, 1, 1, dec->fp) != 1) return ESP_FAIL;
+                esp_err_t r = ensure_pending_cap(dec, dec->pending_lzw_len + 1 + bs);
+                if (r != ESP_OK) return r;
+                dec->pending_lzw[dec->pending_lzw_len++] = bs;
+                if (bs == 0) break;
+                fread(&dec->pending_lzw[dec->pending_lzw_len], 1, bs, dec->fp);
+                hash = fnv1a_update(hash, &dec->pending_lzw[dec->pending_lzw_len], bs);
+                dec->pending_lzw_len += bs;
+            }
+
+            dec->pending_min_code_size = min_code_size;
+            dec->pending_delay_cs = delay_cs;
+            dec->pending_valid = true;
+
+            /* Record (start, end, hash, delay) for this frame so the
+             * next loop iteration can skip the SD read. */
+            if (dec->frame_map_n < GIF_MAX_FRAMES) {
+                int i = dec->frame_map_n++;
+                dec->frame_map[i].start_offset = current_offset;
+                dec->frame_map[i].end_offset   = ftell(dec->fp);
+                dec->frame_map[i].hash         = hash;
+                dec->frame_map[i].delay_cs     = delay_cs;
+                dec->frame_map[i].used         = true;
+            }
+
+            if (hash_out) *hash_out = hash;
+            if (delay_cs_out) *delay_cs_out = delay_cs;
+            return ESP_OK;
+        }
+
+        /* Unknown block — skip */
+        ESP_LOGW(TAG, "Unknown block type 0x%02X (skipping)", block_type);
+    }
+}
+
+esp_err_t gif_decoder_decode_read_frame(gif_decoder_t *dec,
+                                         uint16_t *target_rgb565,
+                                         int target_w, int target_h)
+{
+    if (!dec || !dec->pending_valid) return ESP_ERR_INVALID_STATE;
+
+    gif_lzw_dec_t *lzw = NULL;
+    esp_err_t ret = gif_lzw_dec_create(dec->pending_min_code_size, &lzw);
+    if (ret != ESP_OK) return ret;
+
+    const int src_w = dec->width;
+    const int src_h = dec->height;
+    int decoded_pixels = 0;
+    memset(dec->pixel_indices, 0, dec->pixel_count);
+
+    /* Replay sub-blocks from pending_lzw into the LZW decoder. Each
+     * sub-block is prefixed by its 1-byte size; size 0 terminates. */
+    size_t pos = 0;
+    while (pos < dec->pending_lzw_len) {
+        uint8_t bs = dec->pending_lzw[pos++];
+        if (bs == 0) break;
+        int out_len = 0;
+        gif_lzw_dec_feed(lzw, &dec->pending_lzw[pos], bs,
+                         dec->pixel_indices + decoded_pixels,
+                         dec->pixel_count - decoded_pixels,
+                         &out_len);
+        decoded_pixels += out_len;
+        pos += bs;
+    }
+    gif_lzw_dec_destroy(lzw);
+
+    /* Nearest-neighbor downscale indices → target_rgb565, same as
+     * gif_decoder_next_frame. */
+    for (int out_y = 0; out_y < target_h; out_y++) {
+        int sy = (out_y * src_h) / target_h;
+        if (sy >= src_h) sy = src_h - 1;
+        const uint8_t *src_row = &dec->pixel_indices[sy * src_w];
+        uint16_t *dst_row = &target_rgb565[out_y * target_w];
+        for (int out_x = 0; out_x < target_w; out_x++) {
+            int sx = (out_x * src_w) / target_w;
+            if (sx >= src_w) sx = src_w - 1;
+            const gif_color_t *c = &dec->palette.entries[src_row[sx]];
+            dst_row[out_x] = rgb888_to_rgb565(c->r, c->g, c->b);
+        }
+    }
+
+    /* Free the transient buffer — realloc on next read. Keeping it around
+     * would pin ~1 MB of PSRAM per open decoder for no benefit. */
+    if (dec->pending_lzw) {
+        heap_caps_free(dec->pending_lzw);
+        dec->pending_lzw = NULL;
+        dec->pending_lzw_cap = 0;
+    }
+    dec->pending_lzw_len = 0;
+    dec->pending_valid = false;
+    return ESP_OK;
+}
+
+void gif_decoder_discard_read_frame(gif_decoder_t *dec)
+{
+    if (!dec) return;
+    if (dec->pending_lzw) {
+        heap_caps_free(dec->pending_lzw);
+        dec->pending_lzw = NULL;
+        dec->pending_lzw_cap = 0;
+    }
+    dec->pending_lzw_len = 0;
+    dec->pending_valid = false;
 }

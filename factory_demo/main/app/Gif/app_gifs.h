@@ -125,6 +125,15 @@ void app_gifs_start_background_worker(void);
  */
 void app_gifs_set_gallery_open(bool open);
 
+/**
+ * @brief True once the user has opened the gallery at least once since
+ *        boot. Used by the PIMSLO encode task as a gate: the ~7 MB GIF
+ *        encode is deferred until the user has demonstrated they care
+ *        about GIFs right now, so boot-time / camera-time PSRAM stays
+ *        available for viewfinder buffers.
+ */
+bool app_gifs_gallery_ever_opened(void);
+
 #ifdef __cplusplus
 }
 #endif

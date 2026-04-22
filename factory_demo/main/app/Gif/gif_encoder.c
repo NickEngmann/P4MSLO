@@ -369,20 +369,18 @@ esp_err_t gif_encoder_create(const gif_encoder_config_t *config, gif_encoder_t *
         return ret;
     }
 
-    /* Create JPEG decoder engine */
-    jpeg_decode_engine_cfg_t dec_cfg = { .timeout_ms = 100 };
-    ret = jpeg_new_decoder_engine(&dec_cfg, &enc->jpeg_handle);
-    if (ret != ESP_OK) {
-        gif_quantize_destroy(enc->quantizer);
-        free(enc);
-        return ret;
-    }
+    /* Note: we historically allocated a HW JPEG decoder engine here, but
+     * the actual JPEG decoding path uses tjpgd (see decode_and_scale_jpeg)
+     * because the ESP32-P4 HW decoder can't handle the OV5640's 4:2:2
+     * subsampled output. The HW handle was never used. Worse — its
+     * internal rxlink GDMA allocation would fail under PSRAM fragmentation
+     * during repeat encode cycles, panicking the system. Dropping it. */
+    enc->jpeg_handle = NULL;
 
     /* Create PPA client */
     ppa_client_config_t ppa_cfg = { .oper_type = PPA_OPERATION_SRM };
     ret = ppa_register_client(&ppa_cfg, &enc->ppa_handle);
     if (ret != ESP_OK) {
-        jpeg_del_decoder_engine(enc->jpeg_handle);
         gif_quantize_destroy(enc->quantizer);
         free(enc);
         return ret;

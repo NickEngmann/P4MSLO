@@ -12,6 +12,7 @@
 #include "gif_tjpgd.h"
 #include "driver/jpeg_decode.h"
 #include "app_pimslo.h"
+#include "ui_extra.h"
 #include "ui/ui.h"
 
 #include <stdio.h>
@@ -207,6 +208,14 @@ typedef struct {
 static gifs_context_t s_ctx = {0};
 
 /* ---- Internal helpers ---- */
+
+/* Wrapper for lv_async_call so bg tasks can request a gallery rescan
+ * without racing LVGL on s_ctx.entries. */
+static void scan_async_cb(void *arg)
+{
+    (void)arg;
+    app_gifs_scan();
+}
 
 static bool is_gif_file(const char *name)
 {
@@ -1047,8 +1056,8 @@ cleanup:
 
     s_ctx.is_encoding = false;
 
-    /* Rescan to pick up the new GIF */
-    app_gifs_scan();
+    /* Rescan to pick up the new GIF — deferred to LVGL task. */
+    lv_async_call(scan_async_cb, NULL);
 
     vTaskDelete(NULL);
 }
@@ -1830,13 +1839,33 @@ cleanup_enc:
     gif_encoder_destroy(enc);
 cleanup_buffers:
     app_album_reacquire_jpeg_decoder();
-    app_video_stream_realloc_buffers();
+    /* Only restore viewfinder when the user is actually on a camera-type
+     * page. On ALBUM / GIFS / USB / SETTINGS / MAIN the ~7 MB of camera
+     * buffers aren't needed and reallocating them after every encode
+     * fragments PSRAM — the NEXT encode then fails to load its 800 KB
+     * source JPEGs (observed: "OOM for pos2.jpg (858825 bytes)"). The
+     * camera-page redirect will reallocate when the user returns. */
+    {
+        ui_page_t p = ui_extra_get_current_page();
+        if (p == UI_PAGE_CAMERA || p == UI_PAGE_INTERVAL_CAM ||
+            p == UI_PAGE_VIDEO_MODE || p == UI_PAGE_AI_DETECT) {
+            app_video_stream_realloc_buffers();
+        } else {
+            ESP_LOGI(TAG, "Skipping viewfinder realloc — user is off a camera page");
+        }
+    }
 cleanup:
     for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {
         if (jpeg_data[i]) heap_caps_free(jpeg_data[i]);
     }
     s_ctx.is_encoding = false;
-    app_gifs_scan();
+    /* Defer the gallery rescan to the LVGL task. This function runs on
+     * the pimslo-encode / bg-worker task, and app_gifs_scan() mutates
+     * s_ctx.entries — the exact array the LVGL task reads on every
+     * button event / redraw. Running it async via LVGL serializes it
+     * onto the same single-threaded loop the gallery UI uses, so there's
+     * no chance LVGL is mid-read when we free_entries + re-populate. */
+    lv_async_call(scan_async_cb, NULL);
     return ret;
 }
 
@@ -1894,10 +1923,50 @@ static TaskHandle_t  s_bg_worker = NULL;
 /* s_gallery_open / s_bg_abort_current are declared near the top of the
  * file so play_current() can poke them. */
 
+/* True after the user opens the gallery for the first time. Gates the
+ * PSRAM-heavy bg encode work off until the user has actually
+ * demonstrated interest in GIFs — before that, camera captures are the
+ * priority and every byte of PSRAM the viewfinder can find is needed. */
+static volatile bool s_gallery_ever_opened = false;
+
 void app_gifs_set_gallery_open(bool open)
 {
     s_gallery_open = open;
-    if (open) s_bg_abort_current = true;
+    if (open) {
+        s_bg_abort_current = true;
+        s_gallery_ever_opened = true;
+    }
+}
+
+bool app_gifs_gallery_ever_opened(void)
+{
+    return s_gallery_ever_opened;
+}
+
+/* Camera-type pages have the ~7 MB viewfinder buffer live. Opening a
+ * bg gif_decoder at the same time produces enough PSRAM fragmentation
+ * that the viewfinder's next realloc fails, freezing the camera UI.
+ * The gallery check (s_ctx.decoder / s_gallery_open) is separate and
+ * only covers gif playback contention. */
+static bool bg_camera_page_active(void)
+{
+    ui_page_t p = ui_extra_get_current_page();
+    return (p == UI_PAGE_CAMERA ||
+            p == UI_PAGE_INTERVAL_CAM ||
+            p == UI_PAGE_VIDEO_MODE ||
+            p == UI_PAGE_AI_DETECT);
+}
+
+/* Pages where a ~7 MB encode can safely run without destabilizing the
+ * LCD SPI DMA or the gallery's canvas cache. See encode_should_defer()
+ * in app_pimslo.c for the rationale — this mirrors that check for the
+ * bg-worker's own encode path. */
+static bool bg_encode_safe_page(void)
+{
+    ui_page_t p = ui_extra_get_current_page();
+    return (p == UI_PAGE_ALBUM ||
+            p == UI_PAGE_USB_DISK ||
+            p == UI_PAGE_SETTINGS);
 }
 
 /* Used once at the top of a bg iteration — full check including a
@@ -1915,6 +1984,7 @@ static bool bg_should_yield(void)
     if (app_pimslo_is_encoding()) return true;
     if (app_pimslo_is_capturing()) return true;
     if (app_pimslo_get_queue_depth() > 0) return true;
+    if (bg_camera_page_active()) return true;
 
     size_t contig = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     if (contig < 5 * 1024 * 1024) return true;
@@ -1934,6 +2004,7 @@ static bool bg_should_abort_current(void)
     if (s_ctx.is_encoding) return true;
     if (app_pimslo_is_capturing()) return true;
     if (app_pimslo_is_encoding()) return true;
+    if (bg_camera_page_active()) return true;      /* viewfinder owns PSRAM */
     return false;
 }
 
@@ -2148,8 +2219,13 @@ static void bg_worker_task(void *arg)
             continue;
         }
 
-        /* Priority 2: encode stale PIMSLO captures. */
-        if (bg_find_jpeg_only(path, sizeof(path))) {
+        /* Priority 2: encode stale PIMSLO captures. ~7 MB scaled_buf, so
+         * only run while the user is on a page that isn't holding heavy
+         * display / gallery buffers. Safe: ALBUM / USB / SETTINGS. Also
+         * gated on gallery-opened-once. */
+        if (s_gallery_ever_opened &&
+            bg_encode_safe_page() &&
+            bg_find_jpeg_only(path, sizeof(path))) {
             ESP_LOGI(TAG, "BG: encoding PIMSLO from %s", path);
             /* app_gifs_encode_pimslo_from_dir handles freeing/restoring
              * camera buffers and calling app_gifs_scan() on finish. */
@@ -2165,8 +2241,20 @@ static void bg_worker_task(void *arg)
 void app_gifs_start_background_worker(void)
 {
     if (s_bg_worker) return;
+
+    /* Seed the canvas dimensions here so that save_small_gif_from_jpegs() can
+     * run before the user ever opens the gallery page. Without this the
+     * PIMSLO encode path's inline .p4ms save bails with ESP_ERR_INVALID_STATE
+     * on the first photo_btn of a fresh boot. app_gifs_init() will overwrite
+     * these with the same values when the gallery is opened later — idempotent. */
+    if (s_ctx.canvas_width <= 0)  s_ctx.canvas_width  = BSP_LCD_H_RES;
+    if (s_ctx.canvas_height <= 0) s_ctx.canvas_height = BSP_LCD_V_RES;
+
     BaseType_t r = xTaskCreatePinnedToCore(
-        bg_worker_task, "gif_bg", 8192, NULL, 2, &s_bg_worker, 1);
+        /* 16 KB stack — matches pimslo_encode_queue_task because this
+         * task calls the same app_gifs_encode_pimslo_from_dir pipeline.
+         * 8 KB overflowed the stack on pass 1 pre-palette work. */
+        bg_worker_task, "gif_bg", 16384, NULL, 2, &s_bg_worker, 1);
     if (r != pdPASS) {
         ESP_LOGE(TAG, "Failed to start BG worker");
         s_bg_worker = NULL;

@@ -68,6 +68,15 @@ static lv_obj_t *ui_PanelHomeBackground = NULL;
 static ai_detect_mode_t current_ai_detect_mode = AI_DETECT_PEDESTRIAN;
 static lv_obj_t *ai_mode_label = NULL;
 
+/* Centered "saving..." overlay on the camera screen. Shown while the
+ * PIMSLO capture task is busy (GPIO34 trigger → SPI transfer × 4 → SD
+ * writes, ~3-14 s depending on how many cameras respond on first try).
+ * Hidden as soon as the capture task clears its busy flag. A single
+ * LVGL timer polls the state + animates the trailing dots. */
+static lv_obj_t  *saving_label  = NULL;
+static lv_timer_t *saving_timer = NULL;
+static int       saving_dot_step = 0;
+
 // UI settings
 static uint16_t magnification_factor = DEFAULT_MAGNIFICATION_FACTOR;
 static uint16_t interval_time = DEFAULT_INTERVAL_TIME;
@@ -126,7 +135,6 @@ static const PageMapping page_map[] = {
     {"CAMERA", UI_PAGE_CAMERA},
     {"INTERVAL CAM", UI_PAGE_INTERVAL_CAM},
     {"VIDEO MODE", UI_PAGE_VIDEO_MODE},
-    {"AI DETECT", UI_PAGE_AI_DETECT},
     {"GIFS", UI_PAGE_GIFS},
     {"ALBUM", UI_PAGE_ALBUM},
     {"USB DISK", UI_PAGE_USB_DISK},
@@ -608,6 +616,40 @@ static void scroll_end_event_cb(lv_event_t * e)
 /* Timer Callbacks                                 */
 /*-------------------------------------------------*/
 
+/* Poll the PIMSLO capture state and show/hide "saving..." on the camera
+ * screen accordingly. Only active when the user is on a camera-type
+ * page; stays hidden everywhere else so it doesn't draw over the
+ * gallery, album, etc. */
+static void saving_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!saving_label) return;
+
+    ui_page_t page = ui_extra_get_current_page();
+    bool on_camera = (page == UI_PAGE_CAMERA ||
+                      page == UI_PAGE_INTERVAL_CAM ||
+                      page == UI_PAGE_VIDEO_MODE);
+    bool should_show = on_camera && app_pimslo_is_capturing();
+
+    bool currently_hidden = lv_obj_has_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
+
+    if (should_show) {
+        static const char *patterns[6] = {
+            "saving", "saving.", "saving..", "saving...",
+            "saving..", "saving.",
+        };
+        lv_label_set_text(saving_label, patterns[saving_dot_step % 6]);
+        saving_dot_step++;
+        if (currently_hidden) {
+            lv_obj_clear_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(saving_label);
+        }
+    } else if (!currently_hidden) {
+        lv_obj_add_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
+        saving_dot_step = 0;
+    }
+}
+
 /**
  * @brief Popup timer callback
  * @param timer Timer object
@@ -785,16 +827,17 @@ static void lv_scroll_create(void)
     lv_label_set_text(info_label, "");  
 
     const char* btn_texts[] = {
-        "CAMERA", "INTERVAL CAM", "VIDEO MODE", "AI DETECT", "GIFS",
+        "CAMERA", "INTERVAL CAM", "VIDEO MODE", "GIFS",
         "ALBUM", "USB DISK", "SETTINGS"
     };
 
-    // Define the image source for each button
+    // Define the image source for each button. AI DETECT is no longer
+    // exposed as a menu entry (feature deprioritized), but UI_PAGE_AI_DETECT
+    // remains in the enum to keep existing guards/checks compiling.
     const void* img_srcs[] = {
         &ui_img_camera_big_png,
         &ui_img_interval_big_png,
         &ui_img_video_big_png,
-        &ui_img_ai_detect_png,
         &ui_img_gifs_big_png,
         &ui_img_album_big_png,
         &ui_img_usb_big_png,
@@ -2233,6 +2276,21 @@ void ui_extra_init(void)
     /* Pull it to the back so the scroll UI (created above) floats on top */
     lv_obj_move_background(ui_PanelHomeBackground);
     lv_obj_add_flag(ui_PanelHomeBackground, LV_OBJ_FLAG_HIDDEN);
+
+    /* "saving..." overlay shown on the camera screen whenever the PIMSLO
+     * capture task is busy. A 300 ms LVGL timer polls app_pimslo_is_capturing
+     * and shows / hides the label, also animating the trailing dots. */
+    saving_label = lv_label_create(ui_ScreenCamera);
+    lv_obj_set_style_bg_color(saving_label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(saving_label, LV_OPA_70, 0);
+    lv_obj_set_style_text_color(saving_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(saving_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_pad_all(saving_label, 10, 0);
+    lv_obj_set_style_radius(saving_label, 6, 0);
+    lv_obj_align(saving_label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(saving_label, "saving");
+    lv_obj_add_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
+    saving_timer = lv_timer_create(saving_timer_cb, 300, NULL);
 
     // reset flag
     is_camera_settings_panel_active = false;

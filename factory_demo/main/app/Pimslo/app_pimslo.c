@@ -11,6 +11,7 @@
 #include "spi_camera.h"
 #include "app_gifs.h"
 #include "app_video_stream.h"
+#include "ui_extra.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
@@ -91,14 +92,22 @@ static void save_capture_counter(void)
 
 static void load_fast_mode(void)
 {
-    uint8_t v = 0;
+    /* Fast mode defaults to ON — the Phase 4 AF + AE pre-pass was
+     * observed to leave the OV5640 sensors in a state where the
+     * subsequent trigger produced no JPEG for ~44 s. Skipping the
+     * pre-pass recovers reliable photo_btn captures (3-4/4 per run at
+     * ~3-4 s) and trades away a feature that's a stub anyway (AF isn't
+     * actually implemented on the S3 side — the firmware blob's not
+     * loaded). NVS override still lets the user flip it off if desired. */
+    uint8_t v = 1;
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        /* If the key doesn't exist, v keeps the default (1). */
         nvs_get_u8(h, NVS_KEY_FAST_MODE, &v);
         nvs_close(h);
     }
     spi_camera_set_fast_mode(v != 0);
-    ESP_LOGI(TAG, "Fast capture mode: %s", v ? "ON" : "off");
+    ESP_LOGI(TAG, "Fast capture mode: %s (default ON)", v ? "ON" : "off");
 }
 
 bool app_pimslo_get_fast_mode(void)
@@ -199,40 +208,61 @@ static void pimslo_capture_task(void *param)
         ESP_LOGI(TAG, "Capture %03d: %d/4 cameras in %lums",
                  num, saved, (unsigned long)capture_ms);
 
-        /* Enqueue GIF encode job if we got enough cameras. Critical detail:
-         * if we're handing off to the GIF task we DO NOT realloc viewfinder
-         * buffers here. The GIF task needs to load 4×~600KB JPEGs before it
-         * can free the viewfinder itself — but on CAMERA page there isn't
-         * enough PSRAM to hold both simultaneously, so reallocating here
-         * would starve the GIF task. The GIF task's own free/realloc pair
-         * closes the cycle: buffers stay freed through capture + encode,
-         * then come back once the GIF is done. */
-        bool handed_off_to_gif = false;
+        /* Enqueue GIF encode job if we got enough cameras. The GIF encoder
+         * runs later — it defers until the user navigates off the camera
+         * page so the viewfinder stays live between captures. */
         if (saved >= 2) {
             pimslo_gif_job_t job = { .capture_num = num };
             if (xQueueSend(s_gif_queue, &job, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "GIF queue full — dropping P4M%04d", num);
             } else {
-                ESP_LOGI(TAG, "Queued GIF encode for P4M%04d (queue: %d)",
+                ESP_LOGI(TAG, "Queued GIF encode for P4M%04d (queue: %d, deferred until off-camera)",
                          num, (int)uxQueueMessagesWaiting(s_gif_queue));
-                handed_off_to_gif = true;
             }
         } else {
             ESP_LOGW(TAG, "Capture %03d: only %d cameras — skipping GIF", num, saved);
         }
 
-        /* Restore viewfinder ONLY if we aren't passing PSRAM responsibility
-         * to the GIF task. Keeps the viewfinder frozen end-to-end through a
-         * successful PIMSLO cycle, but unfreezes it on a capture failure. */
-        if (!handed_off_to_gif) {
-            app_video_stream_realloc_buffers();
-        }
+        /* Always restore viewfinder now. The user should be able to take
+         * another photo within ~3-4 s. The encoder task, when it eventually
+         * runs, will free+realloc the viewfinder on its own — but only
+         * once the user has left a camera page, so the freeze is invisible. */
+        app_video_stream_realloc_buffers();
 
         s_capturing = false;
     }
 }
 
 /* ---- GIF Encode Queue Task (Core 1, persistent) ---- */
+
+/* Pages whose viewfinder owns ~7 MB of PSRAM, or whose display path is
+ * sensitive to the encoder's memory footprint. GIF encoding needs ~7 MB
+ * for its scaled_buf; if it fires while the LCD's SPI master is trying
+ * to allocate its DMA buffer mid-frame, the LCD transmit fails and the
+ * LVGL task hangs (taskLVGL watchdog). So we defer encodes on every
+ * page the user can actively see the display on, and resume as soon as
+ * the user navigates off it.
+ *
+ * Gallery (GIFS) is in this list because the canvas cache slots + the
+ * active playback canvas + LVGL's display buffer already eat into the
+ * available contiguous PSRAM — adding a 7 MB encode on top pushes the
+ * LCD SPI DMA alloc over the edge. Encodes therefore run only when the
+ * user is on ALBUM / USB / SETTINGS, where the display traffic is low
+ * and the UI isn't holding heavy canvas buffers. */
+static bool encode_should_defer(void)
+{
+    ui_page_t p = ui_extra_get_current_page();
+    if (p == UI_PAGE_CAMERA ||
+        p == UI_PAGE_INTERVAL_CAM ||
+        p == UI_PAGE_VIDEO_MODE ||
+        p == UI_PAGE_AI_DETECT ||
+        p == UI_PAGE_MAIN ||
+        p == UI_PAGE_GIFS) return true;
+    if (!app_gifs_gallery_ever_opened()) return true;
+    if (app_gifs_is_encoding()) return true;  /* album encoder uses same PSRAM */
+    if (app_gifs_is_playing()) return true;   /* gallery playback holds canvas buffers */
+    return false;
+}
 
 static void pimslo_encode_queue_task(void *param)
 {
@@ -244,9 +274,15 @@ static void pimslo_encode_queue_task(void *param)
         /* Block until a job is available */
         xQueueReceive(s_gif_queue, &job, portMAX_DELAY);
 
-        /* Wait if album GIF encoding is in progress (shared PSRAM) */
-        while (app_gifs_is_encoding()) {
-            ESP_LOGI(TAG, "Waiting for album GIF encode to finish...");
+        /* Defer encoding until the user is off a camera page. Logs only
+         * once per transition so we don't spam during a long stay. */
+        bool logged_waiting = false;
+        while (encode_should_defer()) {
+            if (!logged_waiting) {
+                ESP_LOGI(TAG, "Deferring P4M%04d encode — user on camera page / album encoding",
+                         job.capture_num);
+                logged_waiting = true;
+            }
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
 

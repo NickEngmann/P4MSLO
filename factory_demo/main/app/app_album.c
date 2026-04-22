@@ -898,26 +898,32 @@ esp_err_t app_album_refresh(void) {
     return ret;
 }
 
+/* Deliberately leaves the HW decoder engine allocated. Repeated
+ * create/destroy of the HW decoder caused `jpeg_new_decoder_engine(82):
+ * no memory for jpeg decode rxlink` panics under PSRAM fragmentation
+ * during encode cycles — the rxlink GDMA allocation would fail on
+ * restart. The encoder (gif_encoder) doesn't use the HW decoder at all
+ * (tjpgd does its decoding), so there's no reason to release it. We
+ * only drop the large ~6 MB PPA output buffer, which is the real
+ * memory pressure the encoder needs reclaimed. */
 void app_album_release_jpeg_decoder(void) {
-    if (album_ctx.jpeg_handle) {
-        jpeg_del_decoder_engine(album_ctx.jpeg_handle);
-        album_ctx.jpeg_handle = NULL;
-        ESP_LOGI(TAG, "Released JPEG decoder for GIF encoding");
-    }
     if (album_ctx.ppa_buffer) {
         heap_caps_free(album_ctx.ppa_buffer);
         album_ctx.ppa_buffer = NULL;
-        ESP_LOGI(TAG, "Released PPA buffer");
+        ESP_LOGI(TAG, "Released PPA buffer (HW decoder kept alive)");
     }
 }
 
 void app_album_reacquire_jpeg_decoder(void) {
+    /* HW decoder is persistent — if somehow destroyed, try a one-shot
+     * recreate, but don't crash if it fails (log only). */
     if (!album_ctx.jpeg_handle) {
         jpeg_decode_engine_cfg_t cfg = { .timeout_ms = 40 };
         esp_err_t ret = jpeg_new_decoder_engine(&cfg, &album_ctx.jpeg_handle);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to reacquire JPEG decoder: 0x%x", ret);
-            return;
+            ESP_LOGW(TAG, "HW decoder recreate failed: 0x%x (album may be degraded)", ret);
+            album_ctx.jpeg_handle = NULL;
+            /* Don't return — still try to restore PPA buffer. */
         }
     }
     if (!album_ctx.ppa_buffer) {
@@ -926,10 +932,11 @@ void app_album_reacquire_jpeg_decoder(void) {
         };
         album_ctx.ppa_buffer = jpeg_alloc_decoder_mem(1920 * 1088 * 3, &mem_cfg, &tx_buffer_size);
         if (!album_ctx.ppa_buffer) {
-            ESP_LOGE(TAG, "Failed to reacquire PPA buffer");
+            ESP_LOGW(TAG, "PPA buffer reacquire failed (album may be degraded)");
         }
     }
-    ESP_LOGI(TAG, "Reacquired JPEG decoder + PPA buffer");
+    ESP_LOGI(TAG, "Reacquired PPA buffer%s",
+             album_ctx.jpeg_handle ? "" : " (HW decoder is NULL)");
 }
 
 // Clean up album resources

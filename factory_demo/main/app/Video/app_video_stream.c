@@ -180,6 +180,11 @@ esp_err_t app_video_stream_take_photo(void)
     return ESP_OK;
 }
 
+bool app_video_stream_is_camera_initialized(void)
+{
+    return camera_state.flags.is_initialized;
+}
+
 /**
  * @brief Stop photo capture
  * 
@@ -581,6 +586,15 @@ void app_video_stream_free_buffers(void)
 
     /* Free AI detection buffers */
     app_ai_detection_deinit();
+
+    /* Mark the camera as NOT initialized — the caller will eventually
+     * realloc buffers, and when that happens the frame callback's init
+     * counter restarts. Saving overlay peeks at this via
+     * app_video_stream_is_camera_initialized() so it stays visible
+     * through the re-init window (up to CAMERA_INIT_FRAMES frames)
+     * instead of hiding the moment s_capturing flips to false. */
+    camera_state.flags.is_initialized = false;
+    camera_state.init_count = 0;
 
     buffers_freed = true;
     ESP_LOGI(TAG, "Camera buffers freed (PSRAM free: %zu)", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));

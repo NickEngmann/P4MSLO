@@ -211,11 +211,19 @@ static gifs_context_t s_ctx = {0};
 /* ---- Internal helpers ---- */
 
 /* Wrapper for lv_async_call so bg tasks can request a gallery rescan
- * without racing LVGL on s_ctx.entries. */
+ * without racing LVGL on s_ctx.entries. Also auto-resumes playback if
+ * the user is still parked on the gallery — the bg encode path stops
+ * playback + flushes the canvas cache before it allocates its 7 MB
+ * scaled_buf, and without this the display would stay frozen on the
+ * last pre-encode frame. Safe no-op on every other page. */
 static void scan_async_cb(void *arg)
 {
     (void)arg;
     app_gifs_scan();
+    if (ui_extra_get_current_page() == UI_PAGE_GIFS &&
+        app_gifs_get_count() > 0) {
+        app_gifs_play_current();
+    }
 }
 
 static bool is_gif_file(const char *name)
@@ -573,17 +581,21 @@ static int jpeg_crop_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
     int bw = rect->right - rect->left + 1;
     int bh = rect->bottom - rect->top + 1;
 
+    /* Nearest-neighbor downscale. We emit every source pixel that falls
+     * inside the crop rect into its out_x/out_y slot — later writes
+     * overwrite earlier ones (last-write-wins). The earlier "only emit
+     * the first src that maps to this out" check was broken for non-
+     * integer scale ratios (1824→240 = 7.6): integer division of
+     * (out*crop/canvas) did not always round-trip with (src*canvas/crop),
+     * leaving some output columns unwritten. Those cells kept the
+     * memset'd 0x1010 value, rendering as the dark-blue vertical bars
+     * on the .p4ms previews. */
     for (int by = 0; by < bh; by++) {
         int src_y = rect->top + by;
-        /* Source row must fall inside the crop rect. */
         if (src_y < c->crop_y || src_y >= c->crop_y + c->crop_h) continue;
         int cropped_y = src_y - c->crop_y;
         int out_y = (cropped_y * c->canvas_h) / c->crop_h;
         if (out_y < 0 || out_y >= c->canvas_h) continue;
-        /* Nearest-neighbor: only emit this source row if it's the first
-         * one mapping to `out_y`. */
-        int first_src_y = c->crop_y + (out_y * c->crop_h) / c->canvas_h;
-        if (src_y != first_src_y) continue;
 
         for (int bx = 0; bx < bw; bx++) {
             int src_x = rect->left + bx;
@@ -591,8 +603,6 @@ static int jpeg_crop_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
             int cropped_x = src_x - c->crop_x;
             int out_x = (cropped_x * c->canvas_w) / c->crop_w;
             if (out_x < 0 || out_x >= c->canvas_w) continue;
-            int first_src_x = c->crop_x + (out_x * c->crop_w) / c->canvas_w;
-            if (src_x != first_src_x) continue;
 
             const uint8_t *px = &src[(by * bw + bx) * 3];
             uint16_t pxl = ((px[0] >> 3) << 11)
@@ -649,6 +659,7 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
 static esp_err_t save_small_gif_from_jpegs(const char *capture_dir,
                                              const char *gif_output_path,
                                              const gif_crop_rect_t *crops,
+                                             const int *src_pos,
                                              int num_cams,
                                              int delay_cs)
 {
@@ -663,7 +674,8 @@ static esp_err_t save_small_gif_from_jpegs(const char *capture_dir,
 
     for (int i = 0; i < num_cams; i++) {
         char jpeg_path[96];
-        snprintf(jpeg_path, sizeof(jpeg_path), "%s/pos%d.jpg", capture_dir, i + 1);
+        snprintf(jpeg_path, sizeof(jpeg_path), "%s/pos%d.jpg",
+                 capture_dir, src_pos[i]);
 
         uint16_t *canvas = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
         if (!canvas) { free(local.gif_path); goto fail; }
@@ -1430,24 +1442,20 @@ static int jpeg_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
     int bw = rect->right - rect->left + 1;
     int bh = rect->bottom - rect->top + 1;
 
-    /* Nearest-neighbor downscale each decoded MCU tile into the canvas.
-     * For each output pixel we check if there's a source pixel in THIS
-     * tile that maps to it; if so, write it. Rows/cols outside this
-     * tile are handled by other tile calls. */
+    /* Nearest-neighbor downscale. Emit every source pixel into its
+     * out_x/out_y slot (last-write-wins). The earlier "skip unless this
+     * is the first src mapping to out" short-circuit was wrong for
+     * non-integer scale ratios — it missed output cells entirely, which
+     * showed as vertical dark-blue bars on the JPEG preview. */
     for (int by = 0; by < bh; by++) {
         int src_y = rect->top + by;
         int out_y = (src_y * c->canvas_h) / c->src_h;
         if (out_y < 0 || out_y >= c->canvas_h) continue;
-        /* Only emit if this source row is the "first" for that out_y. */
-        int first_src_y_for_out = (out_y * c->src_h) / c->canvas_h;
-        if (src_y != first_src_y_for_out) continue;
 
         for (int bx = 0; bx < bw; bx++) {
             int src_x = rect->left + bx;
             int out_x = (src_x * c->canvas_w) / c->src_w;
             if (out_x < 0 || out_x >= c->canvas_w) continue;
-            int first_src_x_for_out = (out_x * c->src_w) / c->canvas_w;
-            if (src_x != first_src_x_for_out) continue;
 
             const uint8_t *px = &src[(by * bw + bx) * 3];
             /* Byte-swapped RGB565 for LV_COLOR_16_SWAP (matches the GIF
@@ -1712,27 +1720,32 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     uint8_t *jpeg_data[MAX_PIMSLO_CAMS] = {NULL};
     size_t jpeg_size[MAX_PIMSLO_CAMS] = {0};
     int num_cams = 0;
+    /* Track original camera position (1-indexed) alongside each loaded
+     * JPEG so we still compute parallax correctly when captures have
+     * gaps (e.g. cam 2 failed, saved pos1+pos3+pos4 — num_cams=3, but
+     * src_pos = [1, 3, 4] so parallax is spread across the true
+     * positions, not collapsed into consecutive positions). */
+    int src_pos[MAX_PIMSLO_CAMS] = {0};
 
     for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {
         char path[80];
         snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, i + 1);
         FILE *f = fopen(path, "rb");
-        if (!f) {
-            ESP_LOGW(TAG, "No file %s — using %d cameras", path, i);
-            break;
-        }
+        if (!f) continue;          /* skip gaps instead of breaking */
+
         fseek(f, 0, SEEK_END);
-        jpeg_size[i] = ftell(f);
+        jpeg_size[num_cams] = ftell(f);
         fseek(f, 0, SEEK_SET);
-        jpeg_data[i] = heap_caps_malloc(jpeg_size[i], MALLOC_CAP_SPIRAM);
-        if (!jpeg_data[i]) {
+        jpeg_data[num_cams] = heap_caps_malloc(jpeg_size[num_cams], MALLOC_CAP_SPIRAM);
+        if (!jpeg_data[num_cams]) {
             fclose(f);
-            ESP_LOGE(TAG, "OOM for %s (%zu bytes)", path, jpeg_size[i]);
-            break;
+            ESP_LOGE(TAG, "OOM for %s (%zu bytes)", path, jpeg_size[num_cams]);
+            continue;
         }
-        fread(jpeg_data[i], 1, jpeg_size[i], f);
+        fread(jpeg_data[num_cams], 1, jpeg_size[num_cams], f);
         fclose(f);
-        ESP_LOGI(TAG, "Loaded %s: %zu bytes", path, jpeg_size[i]);
+        src_pos[num_cams] = i + 1;      /* 1-indexed original position */
+        ESP_LOGI(TAG, "Loaded %s: %zu bytes", path, jpeg_size[num_cams]);
         num_cams++;
     }
 
@@ -1764,17 +1777,25 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     ESP_LOGI(TAG, "PIMSLO: %dx%d source → %dx%d square, %d cameras, parallax=%.2f, crop_w=%d",
              src_w, src_h, square, square, num_cams, strength, crop_w);
 
-    /* Calculate parallax crop rects for each position */
+    /* Calculate parallax crop rects for each loaded camera. Use each
+     * camera's TRUE position (src_pos[i]) instead of its index in the
+     * compact loaded-only array, so gaps don't squish the parallax.
+     * If cam 2 is missing (src_pos = [1, 3, 4]), positions 1 and 3
+     * keep their original parallax offsets and the resulting sequence
+     * just lacks the middle frame. */
     gif_crop_rect_t crops[MAX_PIMSLO_CAMS];
     for (int i = 0; i < num_cams; i++) {
-        float crop_ratio = (num_cams > 1) ? (float)i / (num_cams - 1) : 0.0f;
+        /* src_pos is 1-indexed; convert to 0..3 position for ratio */
+        float crop_ratio = (MAX_PIMSLO_CAMS > 1)
+            ? (float)(src_pos[i] - 1) / (MAX_PIMSLO_CAMS - 1)
+            : 0.0f;
         int parallax_offset = (int)(crop_ratio * total_parallax);
         crops[i].x = h_margin + parallax_offset;
         crops[i].y = v_margin;
         crops[i].w = crop_w;
         crops[i].h = square;
         ESP_LOGI(TAG, "  Pos %d: crop(%d, %d, %d, %d)",
-                 i+1, crops[i].x, crops[i].y, crop_w, square);
+                 src_pos[i], crops[i].x, crops[i].y, crop_w, square);
     }
 
     /* Free camera buffers for PSRAM */
@@ -1804,7 +1825,7 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         snprintf(p4ms_gif_path, sizeof(p4ms_gif_path), "%s/%s/%s.gif",
                  BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, dir_name_p);
         esp_err_t psave = save_small_gif_from_jpegs(capture_dir, p4ms_gif_path,
-                                                     crops, num_cams, delay_cs);
+                                                     crops, src_pos, num_cams, delay_cs);
         if (psave == ESP_OK) {
             ESP_LOGI(TAG, "Direct-JPEG .p4ms saved for %s", dir_name_p);
         } else {
@@ -1826,10 +1847,12 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     ret = gif_encoder_create(&cfg, &enc);
     if (ret != ESP_OK) goto cleanup_buffers;
 
-    /* Pass 1: Build palette from all unique frames (re-read each from SD) */
+    /* Pass 1: Build palette from all loaded frames (re-read each from SD,
+     * using the actual saved file number src_pos[i] rather than the
+     * compact index). */
     for (int i = 0; i < num_cams; i++) {
         char path[80];
-        snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, i + 1);
+        snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, src_pos[i]);
         FILE *f = fopen(path, "rb");
         if (!f) { ESP_LOGW(TAG, "Cannot reopen %s", path); continue; }
         fseek(f, 0, SEEK_END);
@@ -1842,7 +1865,7 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         ret = gif_encoder_pass1_add_frame_from_buffer(enc, data, sz, &crops[i]);
         heap_caps_free(data);
         if (ret != ESP_OK)
-            ESP_LOGW(TAG, "Pass 1 failed for pos %d", i+1);
+            ESP_LOGW(TAG, "Pass 1 failed for pos %d", src_pos[i]);
     }
     ret = gif_encoder_pass1_finalize(enc);
     if (ret != ESP_OK) goto cleanup_enc;
@@ -1876,7 +1899,7 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         long start_pos = gif_encoder_get_file_pos(enc);
 
         char path[80];
-        snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, i + 1);
+        snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, src_pos[i]);
         FILE *ff = fopen(path, "rb");
         if (!ff) { ESP_LOGW(TAG, "Cannot reopen %s", path); continue; }
         fseek(ff, 0, SEEK_END);
@@ -2058,14 +2081,18 @@ static bool bg_camera_page_active(void)
             p == UI_PAGE_AI_DETECT);
 }
 
-/* Pages where a ~7 MB encode can safely run without destabilizing the
- * LCD SPI DMA or the gallery's canvas cache. See encode_should_defer()
- * in app_pimslo.c for the rationale — this mirrors that check for the
- * bg-worker's own encode path. */
+/* Pages where a ~7 MB bg encode can safely run. Camera-type pages are
+ * hard-excluded (viewfinder owns 7 MB). MAIN is excluded because camera
+ * is one click away. GIFS is INCLUDED because that's where the user
+ * naturally sits waiting for their captures to encode — the bg worker
+ * calls app_gifs_stop() + app_gifs_flush_cache() before the 7 MB alloc
+ * (see bg_worker_task), so the gallery's canvas cache is reclaimed and
+ * playback resumes automatically after the async scan. */
 static bool bg_encode_safe_page(void)
 {
     ui_page_t p = ui_extra_get_current_page();
-    return (p == UI_PAGE_ALBUM ||
+    return (p == UI_PAGE_GIFS ||
+            p == UI_PAGE_ALBUM ||
             p == UI_PAGE_USB_DISK ||
             p == UI_PAGE_SETTINGS);
 }
@@ -2187,6 +2214,10 @@ static bool bg_find_jpeg_only(char *out_capture_dir, size_t cap)
         char pos1[MAX_PATH_LEN + 16];
         snprintf(pos1, sizeof(pos1), "%s/pos1.jpg", capture_dir);
         if (stat(pos1, &st) != 0) continue;  /* no source frames */
+
+        /* Skip dirs we've already failed on this session (e.g. capture
+         * only saved pos1.jpg — pimslo needs ≥2 for any GIF). */
+        if (bg_is_blacklisted(capture_dir)) continue;
 
         strncpy(out_capture_dir, capture_dir, cap - 1);
         out_capture_dir[cap - 1] = 0;
@@ -2321,16 +2352,29 @@ static void bg_worker_task(void *arg)
         }
 
         /* Priority 2: encode stale PIMSLO captures. ~7 MB scaled_buf, so
-         * only run while the user is on a page that isn't holding heavy
-         * display / gallery buffers. Safe: ALBUM / USB / SETTINGS. Also
-         * gated on gallery-opened-once. */
+         * only run while the user is on a safe page (GIFS / ALBUM /
+         * USB / SETTINGS). Gated on gallery-opened-once. */
         if (s_gallery_ever_opened &&
             bg_encode_safe_page() &&
             bg_find_jpeg_only(path, sizeof(path))) {
             ESP_LOGI(TAG, "BG: encoding PIMSLO from %s", path);
-            /* app_gifs_encode_pimslo_from_dir handles freeing/restoring
-             * camera buffers and calling app_gifs_scan() on finish. */
-            app_gifs_encode_pimslo_from_dir(path, 150, 0.05f);
+            /* Stop gallery playback + flush its canvas cache (up to
+             * ~3.5 MB of PSRAM) before the encoder's 7 MB alloc. The
+             * lv_async_call scan at the end of app_gifs_encode_pimslo_from_dir
+             * auto-restarts playback on whatever entry the user is
+             * parked on. */
+            app_gifs_stop();
+            app_gifs_flush_cache();
+            esp_err_t r = app_gifs_encode_pimslo_from_dir(path, 150, 0.05f);
+            if (r != ESP_OK) {
+                /* Encode failed (missing pos files, OOM, etc) — blacklist
+                 * the capture dir so we don't spin on the same stale
+                 * entry forever. The same BG worker blacklist is used for
+                 * both pre-render and encode paths. */
+                ESP_LOGW(TAG, "BG: encode failed 0x%x — blacklisting %s",
+                          r, path);
+                bg_blacklist_add(path);
+            }
             continue;
         }
 

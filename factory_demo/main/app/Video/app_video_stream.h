@@ -78,6 +78,16 @@ void app_video_stream_free_buffers(void);
  */
 esp_err_t app_video_stream_realloc_buffers(void);
 
+/**
+ * @brief True once the camera sensor has produced CAMERA_INIT_FRAMES
+ *        frames of viewfinder output after the most recent free +
+ *        realloc cycle. False during the ~2-4 s warm-up window.
+ *        UI code (saving overlay) uses this to keep feedback visible
+ *        through the warm-up instead of flipping to a static last
+ *        frame for several seconds.
+ */
+bool app_video_stream_is_camera_initialized(void);
+
 /* Photo and video control */
 /**
  * @brief Take a photo with the current settings

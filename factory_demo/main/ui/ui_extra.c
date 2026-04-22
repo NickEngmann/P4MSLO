@@ -649,6 +649,16 @@ static void saving_timer_cb(lv_timer_t *timer)
     bool on_camera = (page == UI_PAGE_CAMERA ||
                       page == UI_PAGE_INTERVAL_CAM ||
                       page == UI_PAGE_VIDEO_MODE);
+
+    /* Show the overlay ONLY when the pimslo capture task is actually
+     * busy. Previously we also kept it up through the camera sensor's
+     * 50-frame warm-up so the user didn't see a static last-frame after
+     * the capture window closed — but the warm-up also happens on the
+     * very first enter into the camera page after a cold boot, where
+     * there is no capture at all. Showing "saving" in that case is
+     * confusing. If the user wants to see warm-up feedback we should
+     * add a distinct "starting camera..." overlay rather than reusing
+     * the saving one. */
     bool should_show = on_camera && app_pimslo_is_capturing();
 
     bool currently_hidden = lv_obj_has_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
@@ -2453,7 +2463,12 @@ void ui_extra_init(void)
     lv_obj_align(saving_label, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(saving_label, "saving");
     lv_obj_add_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
-    saving_timer = lv_timer_create(saving_timer_cb, 300, NULL);
+    /* Poll every 100 ms so the overlay appears immediately when the
+     * capture flag flips and animates smoothly (was 300 ms — user
+     * noticed the lag on trigger press). The label update itself is
+     * cheap; the real work comes from what the capture task is doing
+     * on Core 0. */
+    saving_timer = lv_timer_create(saving_timer_cb, 100, NULL);
 
     /* The GIFs "Delete?" modal is created lazily in
      * ui_extra_redirect_to_gifs_page() the first time the gallery page is

@@ -30,6 +30,12 @@ esp_err_t app_pimslo_init(void);
  * @brief Request an SPI capture of all 4 cameras
  *
  * Non-blocking — gives a binary semaphore that wakes the capture task.
+ * Also flips the "is_capturing" flag IMMEDIATELY so the saving overlay
+ * can start animating in the same LVGL tick as the button press,
+ * instead of waiting for the capture task to schedule + grab the
+ * semaphore (observed ~500 ms lag). The capture task clears the flag
+ * once the full cycle (SPI + save) is done.
+ *
  * Safe to call from the camera frame callback (~0ms).
  * If a capture is already in progress, the request is coalesced.
  */

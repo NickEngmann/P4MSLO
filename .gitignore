@@ -14,7 +14,7 @@ test/simulator/lv_drivers/
 *.swp
 *.swo
 *~
-
+debug_gifs/
 # OS files
 .DS_Store
 Thumbs.db

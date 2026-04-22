@@ -235,20 +235,25 @@ static void pimslo_capture_task(void *param)
 
 /* ---- GIF Encode Queue Task (Core 1, persistent) ---- */
 
-/* Pages whose viewfinder owns ~7 MB of PSRAM, or whose display path is
- * sensitive to the encoder's memory footprint. GIF encoding needs ~7 MB
- * for its scaled_buf; if it fires while the LCD's SPI master is trying
- * to allocate its DMA buffer mid-frame, the LCD transmit fails and the
- * LVGL task hangs (taskLVGL watchdog). So we defer encodes on every
- * page the user can actively see the display on, and resume as soon as
- * the user navigates off it.
+/* Defer encoding only when there's an actual memory / display conflict.
+ * The encoder needs ~7 MB contiguous PSRAM for its scaled_buf and runs
+ * on Core 1; the LCD draws on Core 0. They coexist fine as long as
+ * nothing else is holding big contiguous blocks.
  *
- * Gallery (GIFS) is in this list because the canvas cache slots + the
- * active playback canvas + LVGL's display buffer already eat into the
- * available contiguous PSRAM — adding a 7 MB encode on top pushes the
- * LCD SPI DMA alloc over the edge. Encodes therefore run only when the
- * user is on ALBUM / USB / SETTINGS, where the display traffic is low
- * and the UI isn't holding heavy canvas buffers. */
+ * Defer on:
+ *   - CAMERA / INTERVAL_CAM / VIDEO_MODE / AI_DETECT: viewfinder owns
+ *     ~7 MB scaled_buf — absolute collision.
+ *   - MAIN: camera is one click away; user clicking CAMERA while encode
+ *     runs would see a failed viewfinder alloc.
+ *
+ * Allow on GIFS (the PIMSLO gallery): previously deferred, but that
+ * blocks the expected UX of "take photo → go to ALBUM → watch it show
+ * up as a GIF." The pimslo encode task now calls app_gifs_stop() +
+ * app_gifs_flush_cache() before the 7 MB alloc, so the gallery's ~3.5
+ * MB canvas cache is reclaimed. Playback auto-resumes via the
+ * lv_async_call scan when the encode finishes.
+ *
+ * USB DISK / SETTINGS are fine — low display pressure. */
 static bool encode_should_defer(void)
 {
     ui_page_t p = ui_extra_get_current_page();
@@ -256,11 +261,9 @@ static bool encode_should_defer(void)
         p == UI_PAGE_INTERVAL_CAM ||
         p == UI_PAGE_VIDEO_MODE ||
         p == UI_PAGE_AI_DETECT ||
-        p == UI_PAGE_MAIN ||
-        p == UI_PAGE_GIFS) return true;
+        p == UI_PAGE_MAIN) return true;
     if (!app_gifs_gallery_ever_opened()) return true;
     if (app_gifs_is_encoding()) return true;  /* album encoder uses same PSRAM */
-    if (app_gifs_is_playing()) return true;   /* gallery playback holds canvas buffers */
     return false;
 }
 
@@ -287,6 +290,15 @@ static void pimslo_encode_queue_task(void *param)
         }
 
         s_encoding = true;
+
+        /* If the user is on the gallery right now, pause playback and
+         * flush the canvas cache — that's ~3.5 MB of PSRAM we need back
+         * for the encoder's 7 MB scaled_buf. The gallery will re-open
+         * its cache the next time play_current runs, which happens
+         * automatically via the lv_async_call scan we issue when the
+         * encode finishes. Safe no-op when user isn't on the gallery. */
+        app_gifs_stop();
+        app_gifs_flush_cache();
 
         char dir_path[64];
         snprintf(dir_path, sizeof(dir_path), "%s/P4M%04d",
@@ -352,6 +364,14 @@ esp_err_t app_pimslo_init(void)
 
 void app_pimslo_request_capture(void)
 {
+    /* Flip the capturing flag RIGHT NOW so the "saving..." overlay lights
+     * up in the same LVGL tick as the button press. Without this the
+     * overlay waited until pimslo_capture_task picked up the semaphore
+     * (observed lag: ~500ms-1s) — during which time take_and_save_photo
+     * was already freeing viewfinder PSRAM, so the user saw a blank
+     * canvas with no feedback. The capture task clears this flag after
+     * the full SPI + save cycle. */
+    s_capturing = true;
     if (s_capture_sem) {
         xSemaphoreGive(s_capture_sem);
     }

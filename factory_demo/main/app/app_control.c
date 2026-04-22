@@ -87,39 +87,48 @@ static void btn_handler(void *arg, void *data)
 /* Helper function to handle knob rotation */
 static void handle_knob_rotation(int direction, void (*action_camera)(void), void (*action_main)(void), void (*action_settings)(void))
 {
-    if (ui_extra_get_current_page() == UI_PAGE_ALBUM || 
+    /* Only the legacy P4-photo album and USB disk page ignore knob
+     * rotation (those have their own button-driven nav). The PIMSLO
+     * gallery (GIFS) uses the knob to move between entries. */
+    if (ui_extra_get_current_page() == UI_PAGE_ALBUM ||
         ui_extra_get_current_page() == UI_PAGE_USB_DISK) {
         return;
     }
 
     int64_t current_time = esp_timer_get_time() / 1000;  // get current time in milliseconds
-    
+
     // Check for timeout or direction change
     if (current_time - knob_last_time > knob_timeout_ms || knob_last_direction == -direction) {
         // Timeout or direction change, reset counter
         knob_step_counter = 0;
         knob_last_direction = direction;
     }
-    
+
     // Increment step counter
     knob_step_counter++;
     knob_last_time = current_time;
-    
+
     // Trigger action when accumulated steps reach threshold
     if (knob_step_counter >= knob_step_threshold) {
         knob_step_counter = 0;  // Reset counter
-        
+
         ESP_LOGD(TAG, "Continuous rotation detected: %d steps, value %d", knob_step_counter, direction);
-        
+
         bsp_display_lock(0);
-        if (ui_extra_get_current_page() == UI_PAGE_CAMERA || 
-            ui_extra_get_current_page() == UI_PAGE_INTERVAL_CAM || 
-            ui_extra_get_current_page() == UI_PAGE_VIDEO_MODE ||
-            ui_extra_get_current_page() == UI_PAGE_AI_DETECT) {
+        ui_page_t p = ui_extra_get_current_page();
+        if (p == UI_PAGE_CAMERA ||
+            p == UI_PAGE_INTERVAL_CAM ||
+            p == UI_PAGE_VIDEO_MODE ||
+            p == UI_PAGE_AI_DETECT) {
             action_camera();
-        } else if (ui_extra_get_current_page() == UI_PAGE_MAIN) {
+        } else if (p == UI_PAGE_MAIN || p == UI_PAGE_GIFS) {
+            /* GIFS (ALBUM in the UI) uses the same up/down semantics as
+             * MAIN — knob right rotates to the previous entry, knob left
+             * to the next. The caller passes ui_extra_btn_up / btn_down
+             * as the `action_main` callback, which on UI_PAGE_GIFS
+             * advances the gallery and starts auto-play. */
             action_main();
-        } else if (ui_extra_get_current_page() == UI_PAGE_SETTINGS) {
+        } else if (p == UI_PAGE_SETTINGS) {
             action_settings();
         }
         bsp_display_unlock();

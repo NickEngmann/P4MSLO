@@ -803,8 +803,14 @@ static void serial_cmd_task(void *param)
 
 esp_err_t app_serial_cmd_init(void)
 {
+    /* 16 KB stack. 8 KB sufficed under -Og, but switching main to -O2
+     * bloats stack frames enough (inlined locals) that snprintf deep
+     * inside a redirect path (video_stream_free_buffers -> snprintf
+     * call chain) overflows and triggers a stack-protection fault
+     * (MCAUSE=0x1b, panic in _svfprintf_r). 16 KB gives us headroom
+     * without affecting normal operation — typical usage is <4 KB. */
     BaseType_t ret = xTaskCreatePinnedToCore(
-        serial_cmd_task, "serial_cmd", 8192, NULL, 3, NULL, 0);
+        serial_cmd_task, "serial_cmd", 16384, NULL, 3, NULL, 0);
 
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create serial command task");

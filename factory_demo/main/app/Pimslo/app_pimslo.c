@@ -453,13 +453,19 @@ esp_err_t app_pimslo_save_preview_from_latest_photo(uint16_t num)
     if (!dir) return ESP_ERR_NOT_FOUND;
 
     uint32_t best_num = 0;
-    char best_name[32] = {0};
+    /* pic_NNNN.jpg is 12 chars + terminator, but be generous. 64 here
+     * also appeases GCC -O2 -Wformat-truncation which flags a 32-byte
+     * dest holding a %s of up to 255 POSIX-dirent bytes. */
+    char best_name[64] = {0};
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         uint32_t n = 0;
         if (sscanf(entry->d_name, "pic_%lu.jpg", &n) == 1 && n > best_num) {
             best_num = n;
-            strncpy(best_name, entry->d_name, sizeof(best_name) - 1);
+            /* Bounded copy — %.Ns tells the compiler the max input
+             * length so it won't warn about truncation. */
+            snprintf(best_name, sizeof(best_name), "%.*s",
+                      (int)(sizeof(best_name) - 1), entry->d_name);
         }
     }
     closedir(dir);
@@ -471,7 +477,7 @@ esp_err_t app_pimslo_save_preview_from_latest_photo(uint16_t num)
 
     mkdir(PIMSLO_PREVIEW_DIR, 0755);
 
-    char src[80], dst[80];
+    char src[128], dst[80];
     snprintf(src, sizeof(src), "%s/%s", P4_PHOTO_DIR, best_name);
     snprintf(dst, sizeof(dst), "%s/P4M%04u.jpg", PIMSLO_PREVIEW_DIR, num);
 

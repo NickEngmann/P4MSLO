@@ -2316,8 +2316,7 @@ static bool bg_find_unprocessed_gif(char *out, size_t cap)
         if (small_file_exists(gif_path)) continue;
         if (bg_is_blacklisted(gif_path)) continue;
 
-        strncpy(out, gif_path, cap - 1);
-        out[cap - 1] = 0;
+        snprintf(out, cap, "%s", gif_path);
         found = true;
         break;
     }
@@ -2358,8 +2357,7 @@ static bool bg_find_jpeg_only(char *out_capture_dir, size_t cap)
          * only saved pos1.jpg — pimslo needs ≥2 for any GIF). */
         if (bg_is_blacklisted(capture_dir)) continue;
 
-        strncpy(out_capture_dir, capture_dir, cap - 1);
-        out_capture_dir[cap - 1] = 0;
+        snprintf(out_capture_dir, cap, "%s", capture_dir);
         found = true;
         break;
     }

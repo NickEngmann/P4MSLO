@@ -1,0 +1,41 @@
+Guard the knob callback registration on knob_handle being created.
+
+Upstream esp_lvgl_port unconditionally calls iot_knob_register_cb(knob_handle, ...)
+after an `if (encoder_a_b != NULL) { knob_handle = iot_knob_create(...); }`
+block. When encoder_a_b is NULL the knob handle stays uninitialized and
+the register_cb dereferences garbage. GCC -O2 catches this with
+-Wmaybe-uninitialized which is -Werror in ESP-IDF builds.
+
+Apply to:  factory_demo/managed_components/espressif__esp_lvgl_port/
+           src/lvgl8/esp_lvgl_port_knob.c
+
+Usage:
+  cd factory_demo/managed_components/espressif__esp_lvgl_port
+  patch -p1 < ../../patches/0001-esp_lvgl_port-knob-uninit.patch
+
+--- a/src/lvgl8/esp_lvgl_port_knob.c
++++ b/src/lvgl8/esp_lvgl_port_knob.c
+@@ -53,15 +53,18 @@ lv_indev_t *lvgl_port_add_encoder(const lvgl_port_encoder_cfg_t *encoder_cfg)
+     }
+
+-    /* Encoder_a/b */
++    /* Encoder_a/b. Upstream bug (P4MSLO local patch): callbacks were
++     * registered unconditionally, dereferencing knob_handle even when
++     * encoder_a_b was NULL (knob never created). GCC -O2 catches this
++     * with -Wmaybe-uninitialized → -Werror. Guard the cb registration
++     * so the callbacks only run when the knob handle exists. Revert
++     * if/when upstream ships a fix. */
++    encoder_ctx->knob_handle = NULL;
+     if (encoder_cfg->encoder_a_b != NULL) {
+         encoder_ctx->knob_handle = iot_knob_create(encoder_cfg->encoder_a_b);
+         ESP_GOTO_ON_FALSE(encoder_ctx->knob_handle, ESP_ERR_NO_MEM, err, TAG, "Not enough memory for knob create!");
++        ESP_ERROR_CHECK(iot_knob_register_cb(encoder_ctx->knob_handle, KNOB_LEFT,  lvgl_port_encoder_left_handler,  encoder_ctx));
++        ESP_ERROR_CHECK(iot_knob_register_cb(encoder_ctx->knob_handle, KNOB_RIGHT, lvgl_port_encoder_right_handler, encoder_ctx));
+     }
+-
+-    ESP_ERROR_CHECK(iot_knob_register_cb(encoder_ctx->knob_handle, KNOB_LEFT, lvgl_port_encoder_left_handler, encoder_ctx));
+-    ESP_ERROR_CHECK(iot_knob_register_cb(encoder_ctx->knob_handle, KNOB_RIGHT, lvgl_port_encoder_right_handler,
+-                                         encoder_ctx));
+
+     /* Encoder Enter */
+     if (encoder_cfg->encoder_enter != NULL) {

@@ -50,9 +50,23 @@ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=400
 
-# -O2 (CONFIG_COMPILER_OPTIMIZATION_PERF) is deferred: the managed
-# component espressif__esp_lvgl_port has a false-positive
-# -Wmaybe-uninitialized that becomes -Werror under -O2 and we can't
-# easily patch a managed component. When the component ships a fix,
-# flip this on for a meaningful speedup in the tjpgd + GIF encoder
-# tight loops.
+# -O2 (CONFIG_COMPILER_OPTIMIZATION_PERF) is where we *want* to be, but
+# setting it globally causes taskLVGL to spin forever on
+# draw_buf->flushing during the first frame: the SPI flush-ready
+# callback chain (SPI ISR → esp_lcd → esp_lvgl_port →
+# lv_disp_flush_ready) has some -O2 miscompilation we could not
+# isolate after forcing LVGL, esp_lvgl_port, esp_lcd, AND
+# esp_driver_spi back to -Og — some other component in the chain
+# still breaks. Rather than chase it further we keep ESP-IDF at -Og
+# (the safe default) and opt individual performance-critical
+# application targets into -O2 via target_compile_options in
+# factory_demo/CMakeLists.txt. That gets us most of the speed win
+# (GIF encode, JPEG decode, PIMSLO pipeline) without booting into a
+# hung LVGL task.
+CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
+#
+# -march Zb extensions (zba/zbb/zbc/zbs) for LZW speedups — DOES NOT
+# APPLY. The ESP32-P4X HP core implements rv32imafc_zicsr_zifencei
+# _xesppie; the Zb extensions would emit instructions the hardware
+# doesn't have. Toolchain supports Zb (GCC 14 -march=help lists
+# zba/zbb/...) but the silicon doesn't.

@@ -22,7 +22,11 @@ static const char *TAG = "app_video";
 
 #define MAX_BUFFER_COUNT                (6)
 #define MIN_BUFFER_COUNT                (2)
-#define VIDEO_TASK_STACK_SIZE           (4 * 1024)
+/* 8 KB. Was 4 KB — bumped after switching main to -O2: inlined stack
+ * frames in frame-callback chains (photo-save helpers, PIMSLO request
+ * path) overflowed the 4 KB stack with a stack-protection fault
+ * (MCAUSE=0x1b, panic in _svfprintf_r). 8 KB leaves plenty of room. */
+#define VIDEO_TASK_STACK_SIZE           (8 * 1024)
 #define VIDEO_TASK_PRIORITY             (6)
 
 typedef struct {

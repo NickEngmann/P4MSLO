@@ -1478,7 +1478,11 @@ void ui_extra_goto_page(ui_page_t page)
             ui_extra_redirect_to_ai_detect_page();
             break;
         case UI_PAGE_GIFS:
-            app_gifs_scan();
+            /* Don't pre-scan here — ui_extra_redirect_to_gifs_page()
+             * calls app_gifs_scan() internally. Calling it twice was
+             * wasteful and, more importantly, leaves s_ctx.entries in
+             * a half-freed state between the two calls where a racing
+             * background worker could read a freed pointer. */
             ui_extra_redirect_to_gifs_page();
             break;
         default:

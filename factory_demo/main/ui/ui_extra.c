@@ -77,6 +77,24 @@ static lv_obj_t  *saving_label  = NULL;
 static lv_timer_t *saving_timer = NULL;
 static int       saving_dot_step = 0;
 
+/* Delete-confirmation modal for the GIFs gallery. Mirrors the album's
+ * ui_PanelImageScreenAlbumDelete in layout but opens / confirms via the
+ * ENCODER (BSP_BUTTON_ED — the same physical button that takes photos
+ * in the camera app). The MENU button (BSP_BUTTON_1) always just exits
+ * the gallery, so the user has a guaranteed way back even if the modal
+ * is open.
+ *
+ * Selection tracking is a plain boolean rather than LV_STATE_FOCUSED so
+ * there's zero chance of LVGL's focus machinery racing the initial
+ * state. Styles are applied directly based on `delete_yes_selected`. */
+static lv_obj_t *ui_PanelGifsDelete         = NULL;
+static lv_obj_t *ui_PanelGifsDeleteTitle    = NULL;
+static lv_obj_t *ui_BtnGifsDeleteYes        = NULL;
+static lv_obj_t *ui_BtnGifsDeleteNo         = NULL;
+static lv_obj_t *ui_LblGifsDeleteYes        = NULL;
+static lv_obj_t *ui_LblGifsDeleteNo         = NULL;
+static bool       delete_yes_selected       = false;
+
 // UI settings
 static uint16_t magnification_factor = DEFAULT_MAGNIFICATION_FACTOR;
 static uint16_t interval_time = DEFAULT_INTERVAL_TIME;
@@ -650,6 +668,107 @@ static void saving_timer_cb(lv_timer_t *timer)
     }
 }
 
+/* ---- GIFs delete-modal helpers ---------------------------------- */
+
+/* Apply the highlight to whichever button is currently selected. Uses
+ * direct bg_opa writes to LV_STATE_DEFAULT so LVGL's focus-state
+ * machinery can't interfere. */
+static void gifs_delete_apply_selection(void)
+{
+    if (!ui_BtnGifsDeleteYes || !ui_BtnGifsDeleteNo) return;
+    lv_obj_set_style_bg_color(ui_BtnGifsDeleteYes, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(ui_BtnGifsDeleteNo,  lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(ui_BtnGifsDeleteYes, delete_yes_selected ? 150 : 0, 0);
+    lv_obj_set_style_bg_opa(ui_BtnGifsDeleteNo,  delete_yes_selected ? 0   : 150, 0);
+}
+
+/* Create the modal as a child of ui_ScreenGifs. Must be called AFTER
+ * ui_ScreenGifs is created (SquareLine screen init is lazy). One-shot:
+ * guarded by ui_PanelGifsDelete != NULL. */
+static void gifs_delete_modal_ensure_created(void)
+{
+    if (ui_PanelGifsDelete != NULL) return;
+    if (ui_ScreenGifs == NULL) return;       /* screen not yet initialized */
+
+    /* 181×185 rounded-grey panel with "Delete?" title and two YES/NO
+     * buttons stacked vertically. Visual style matches the album's
+     * ui_PanelImageScreenAlbumDelete. */
+    ui_PanelGifsDelete = lv_obj_create(ui_ScreenGifs);
+    lv_obj_set_width(ui_PanelGifsDelete, 181);
+    lv_obj_set_height(ui_PanelGifsDelete, 185);
+    lv_obj_align(ui_PanelGifsDelete, LV_ALIGN_CENTER, -13, 4);
+    lv_obj_clear_flag(ui_PanelGifsDelete, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(ui_PanelGifsDelete, 30, 0);
+    lv_obj_set_style_bg_color(ui_PanelGifsDelete, lv_color_hex(0xC9C9C9), 0);
+    lv_obj_set_style_bg_opa(ui_PanelGifsDelete, 180, 0);
+    lv_obj_set_style_border_opa(ui_PanelGifsDelete, 0, 0);
+    lv_obj_add_flag(ui_PanelGifsDelete, LV_OBJ_FLAG_HIDDEN);
+
+    ui_PanelGifsDeleteTitle = lv_label_create(ui_PanelGifsDelete);
+    lv_obj_align(ui_PanelGifsDeleteTitle, LV_ALIGN_CENTER, 0, -55);
+    lv_label_set_text(ui_PanelGifsDeleteTitle, "Delete?");
+    lv_obj_set_style_text_color(ui_PanelGifsDeleteTitle, lv_color_black(), 0);
+    lv_obj_set_style_text_font(ui_PanelGifsDeleteTitle, &lv_font_montserrat_20, 0);
+
+    ui_BtnGifsDeleteYes = lv_btn_create(ui_PanelGifsDelete);
+    lv_obj_set_size(ui_BtnGifsDeleteYes, 140, 30);
+    lv_obj_align(ui_BtnGifsDeleteYes, LV_ALIGN_CENTER, 0, -5);
+    lv_obj_clear_flag(ui_BtnGifsDeleteYes, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ui_BtnGifsDeleteYes, LV_OBJ_FLAG_CLICKABLE);
+
+    ui_LblGifsDeleteYes = lv_label_create(ui_BtnGifsDeleteYes);
+    lv_obj_align(ui_LblGifsDeleteYes, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(ui_LblGifsDeleteYes, "YES");
+    lv_obj_set_style_text_color(ui_LblGifsDeleteYes, lv_color_hex(0xFF0202), 0);
+    lv_obj_set_style_text_font(ui_LblGifsDeleteYes, &lv_font_montserrat_16, 0);
+
+    ui_BtnGifsDeleteNo = lv_btn_create(ui_PanelGifsDelete);
+    lv_obj_set_size(ui_BtnGifsDeleteNo, 140, 30);
+    lv_obj_align(ui_BtnGifsDeleteNo, LV_ALIGN_CENTER, 0, 38);
+    lv_obj_clear_flag(ui_BtnGifsDeleteNo, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ui_BtnGifsDeleteNo, LV_OBJ_FLAG_CLICKABLE);
+
+    ui_LblGifsDeleteNo = lv_label_create(ui_BtnGifsDeleteNo);
+    lv_obj_align(ui_LblGifsDeleteNo, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(ui_LblGifsDeleteNo, "NO");
+    lv_obj_set_style_text_color(ui_LblGifsDeleteNo, lv_color_black(), 0);
+    lv_obj_set_style_text_font(ui_LblGifsDeleteNo, &lv_font_montserrat_16, 0);
+}
+
+static bool gifs_delete_modal_open(void)
+{
+    return ui_PanelGifsDelete != NULL &&
+           !lv_obj_has_flag(ui_PanelGifsDelete, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void gifs_delete_modal_show(void)
+{
+    gifs_delete_modal_ensure_created();
+    if (!ui_PanelGifsDelete) return;
+    /* Default to NO (safer — accidental double-press doesn't delete). */
+    delete_yes_selected = false;
+    gifs_delete_apply_selection();
+    lv_obj_clear_flag(ui_PanelGifsDelete, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ui_PanelGifsDelete);
+}
+
+static void gifs_delete_modal_hide(void)
+{
+    if (!ui_PanelGifsDelete) return;
+    lv_obj_add_flag(ui_PanelGifsDelete, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void gifs_delete_modal_toggle_focus(void)
+{
+    delete_yes_selected = !delete_yes_selected;
+    gifs_delete_apply_selection();
+}
+
+static bool gifs_delete_modal_yes_focused(void)
+{
+    return delete_yes_selected;
+}
+
 /**
  * @brief Popup timer callback
  * @param timer Timer object
@@ -977,6 +1096,9 @@ static void ui_extra_leaving_main(void)
      * gallery anymore; camera / video / encoder paths need that PSRAM. */
     app_gifs_stop();
     app_gifs_flush_cache();
+    /* Hide the delete modal if the user was in the middle of confirming
+     * when they navigated away, so it doesn't reappear on re-entry. */
+    gifs_delete_modal_hide();
     /* Let the background worker resume — user no longer holds the
      * gallery's decoder / PSRAM. */
     app_gifs_set_gallery_open(false);
@@ -1749,11 +1871,17 @@ void ui_extra_btn_up(void)
             break;
 
         case UI_PAGE_GIFS:
-            app_gifs_prev();
-            /* Auto-play the just-selected entry (GIF or JPEG preview).
-             * No "press to play" step — navigation is preview-as-you-go,
-             * like scrubbing through videos in a gallery. */
-            if (app_gifs_get_count() > 0) app_gifs_play_current();
+            if (gifs_delete_modal_open()) {
+                /* Modal is up — up/down toggles YES/NO focus, same as the
+                 * album's delete modal behavior. */
+                gifs_delete_modal_toggle_focus();
+            } else {
+                app_gifs_prev();
+                /* Auto-play the just-selected entry (GIF or JPEG preview).
+                 * No "press to play" step — navigation is preview-as-you-go,
+                 * like scrubbing through videos in a gallery. */
+                if (app_gifs_get_count() > 0) app_gifs_play_current();
+            }
             break;
 
         default:
@@ -1838,9 +1966,13 @@ void ui_extra_btn_down(void)
             break;
 
         case UI_PAGE_GIFS:
-            app_gifs_next();
-            /* Auto-play the just-selected entry — see btn_up comment. */
-            if (app_gifs_get_count() > 0) app_gifs_play_current();
+            if (gifs_delete_modal_open()) {
+                gifs_delete_modal_toggle_focus();
+            } else {
+                app_gifs_next();
+                /* Auto-play the just-selected entry — see btn_up comment. */
+                if (app_gifs_get_count() > 0) app_gifs_play_current();
+            }
             break;
 
         default:
@@ -2062,8 +2194,27 @@ void ui_extra_btn_menu(void)
             break;    
         
         case UI_PAGE_GIFS:
-            app_gifs_stop();
-            ui_extra_goto_page(UI_PAGE_MAIN);
+            /* Menu button on the gallery, mirroring the album's two-button
+             * confirm model:
+             *   - modal CLOSED → exit to main (standard "back" semantics)
+             *   - modal OPEN   → act as the SELECTOR: YES deletes,
+             *                    NO cancels and closes the modal
+             *
+             * The encoder / trigger button is the one that OPENS the
+             * modal (see btn_encoder below). Either button can then
+             * confirm the selection — same as album. */
+            if (gifs_delete_modal_open()) {
+                if (gifs_delete_modal_yes_focused()) {
+                    app_gifs_delete_current();
+                }
+                gifs_delete_modal_hide();
+                if (app_gifs_get_count() > 0) {
+                    app_gifs_play_current();
+                }
+            } else {
+                app_gifs_stop();
+                ui_extra_goto_page(UI_PAGE_MAIN);
+            }
             break;
 
         default:
@@ -2232,13 +2383,25 @@ void ui_extra_btn_encoder(void)
             break;
 
         case UI_PAGE_GIFS:
-            if (app_gifs_is_playing()) {
-                app_gifs_stop();
-            } else if (app_gifs_get_count() > 0) {
-                app_gifs_play_current();
-            } else if (!app_gifs_is_encoding()) {
-                /* No GIFs exist — create one from album photos */
-                app_gifs_create_from_album(300, 4);
+            /* Encoder/trigger on the gallery: same button that takes
+             * photos in the camera app. First press opens the delete
+             * modal; second press confirms (YES → delete, NO → cancel).
+             * The menu button is the always-available exit. Empty
+             * gallery → nothing to delete, no-op. */
+            if (app_gifs_get_count() == 0) break;
+
+            if (!gifs_delete_modal_open()) {
+                app_gifs_stop();        /* pause playback while modal visible */
+                gifs_delete_modal_show();
+            } else {
+                bool did_delete = gifs_delete_modal_yes_focused();
+                if (did_delete) {
+                    app_gifs_delete_current();
+                }
+                gifs_delete_modal_hide();
+                if (app_gifs_get_count() > 0) {
+                    app_gifs_play_current();
+                }
             }
             break;
 
@@ -2291,6 +2454,11 @@ void ui_extra_init(void)
     lv_label_set_text(saving_label, "saving");
     lv_obj_add_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
     saving_timer = lv_timer_create(saving_timer_cb, 300, NULL);
+
+    /* The GIFs "Delete?" modal is created lazily in
+     * ui_extra_redirect_to_gifs_page() the first time the gallery page is
+     * entered — its parent ui_ScreenGifs is a lazy-init SquareLine screen
+     * that doesn't exist yet at ui_extra_init time. */
 
     // reset flag
     is_camera_settings_panel_active = false;

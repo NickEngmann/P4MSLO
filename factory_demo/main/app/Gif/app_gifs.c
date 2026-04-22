@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -1302,6 +1303,106 @@ esp_err_t app_gifs_prev(void)
     if (s_ctx.count == 0) return ESP_FAIL;
     app_gifs_stop();
     s_ctx.current_index = (s_ctx.current_index + s_ctx.count - 1) % s_ctx.count;
+    return ESP_OK;
+}
+
+esp_err_t app_gifs_delete_current(void)
+{
+    if (s_ctx.count == 0 || s_ctx.current_index < 0 ||
+        s_ctx.current_index >= s_ctx.count) {
+        return ESP_FAIL;
+    }
+
+    gallery_entry_t *ent = &s_ctx.entries[s_ctx.current_index];
+    int deleted_index = s_ctx.current_index;
+
+    /* Stop playback + drop any cache slot for this entry. Slot_free will
+     * no-op if no slot was ever allocated. */
+    app_gifs_stop();
+    if (ent->gif_path) {
+        gif_cache_slot_t *slot = slot_find(ent->gif_path);
+        if (slot) slot_free(slot);
+    }
+
+    /* Extract the PIMSLO stem from whichever path we have. Same stem is
+     * used across .gif / .p4ms / .jpg — that's how the scan merges them. */
+    char stem[32] = {0};
+    const char *primary = entry_primary_path(ent);
+    if (primary) {
+        const char *slash = strrchr(primary, '/');
+        const char *base = slash ? slash + 1 : primary;
+        extract_pimslo_stem(base, stem, sizeof(stem));
+    }
+
+    int freed = 0;
+
+    /* 1. Delete the animated .gif if we have it. */
+    if (ent->gif_path) {
+        if (unlink(ent->gif_path) == 0) {
+            ESP_LOGI(TAG, "Deleted %s", ent->gif_path);
+            freed++;
+        } else {
+            ESP_LOGW(TAG, "unlink(%s) failed", ent->gif_path);
+        }
+    }
+
+    /* 2. Delete the JPEG preview if attached. */
+    if (ent->jpeg_path) {
+        if (unlink(ent->jpeg_path) == 0) {
+            ESP_LOGI(TAG, "Deleted %s", ent->jpeg_path);
+            freed++;
+        } else {
+            ESP_LOGW(TAG, "unlink(%s) failed", ent->jpeg_path);
+        }
+    }
+
+    /* 3. Delete the .p4ms prerendered file (path derived from stem) —
+     * and also any stray preview/gif that wasn't attached to this entry
+     * but shares the stem (e.g. if scan hadn't re-merged yet). */
+    if (stem[0]) {
+        char path[MAX_PATH_LEN];
+
+        snprintf(path, sizeof(path), "%s/%s.p4ms", P4MS_DIR, stem);
+        if (unlink(path) == 0) {
+            ESP_LOGI(TAG, "Deleted %s", path);
+            freed++;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s/%s.gif",
+                 BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, stem);
+        if (!ent->gif_path && unlink(path) == 0) {
+            ESP_LOGI(TAG, "Deleted %s (orphan)", path);
+            freed++;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s.jpg", PIMSLO_PREVIEW_DIR, stem);
+        if (!ent->jpeg_path && unlink(path) == 0) {
+            ESP_LOGI(TAG, "Deleted %s (orphan)", path);
+            freed++;
+        }
+    }
+
+    ESP_LOGI(TAG, "Deleted gallery entry #%d (stem=%s, %d file(s))",
+             deleted_index, stem[0] ? stem : "<unknown>", freed);
+
+    /* Rescan. current_index is preserved-by-path in app_gifs_scan; since
+     * our current entry's files are gone it won't match — scan falls back
+     * to index 0, but we want to land on "next entry after the deleted
+     * one" for continuity. Clear primary-path memory by zeroing then
+     * call scan, then re-seat the index ourselves. */
+    app_gifs_scan();
+
+    if (s_ctx.count > 0) {
+        /* Clamp to [0, count-1]. If the deleted index was not the last,
+         * staying at the same numeric index lands on what used to be the
+         * next one. If it was the last, fall back one. */
+        int new_idx = deleted_index;
+        if (new_idx >= s_ctx.count) new_idx = s_ctx.count - 1;
+        s_ctx.current_index = new_idx;
+    } else {
+        s_ctx.current_index = 0;
+    }
+
     return ESP_OK;
 }
 

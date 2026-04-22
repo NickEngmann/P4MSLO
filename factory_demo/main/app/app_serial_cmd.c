@@ -170,7 +170,13 @@ static void cmd_btn(const char *which)
     if (strcmp(which, "up") == 0)          ui_extra_btn_up();
     else if (strcmp(which, "down") == 0)   ui_extra_btn_down();
     else if (strcmp(which, "encoder") == 0) ui_extra_btn_encoder();
-    else if (strcmp(which, "menu") == 0)   ui_extra_btn_menu();
+    /* "menu" and "trigger" are aliases — both refer to the physical
+     * trigger/photo button at the top of the P4-EYE body. "menu" is
+     * the historical name from the BSP; "trigger" is the user-facing
+     * name. They drive ui_extra_btn_menu() which: takes a photo on
+     * camera pages, opens/confirms the delete modal on the gallery. */
+    else if (strcmp(which, "menu") == 0)    ui_extra_btn_menu();
+    else if (strcmp(which, "trigger") == 0) ui_extra_btn_menu();
     else if (strcmp(which, "left") == 0)   ui_extra_btn_left();
     else if (strcmp(which, "right") == 0)  ui_extra_btn_right();
     else {
@@ -712,6 +718,9 @@ static void dispatch_command(char *line)
         cmd_btn("encoder");
     } else if (strcmp(line, "btn_menu") == 0) {
         cmd_btn("menu");
+    } else if (strcmp(line, "btn_trigger") == 0) {
+        /* Clearer alias for the physical trigger/photo button. */
+        cmd_btn("trigger");
     } else if (strcmp(line, "btn_left") == 0) {
         cmd_btn("left");
     } else if (strcmp(line, "btn_right") == 0) {

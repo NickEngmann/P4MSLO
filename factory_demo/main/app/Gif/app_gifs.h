@@ -41,6 +41,21 @@ esp_err_t app_gifs_next(void);
 /** @brief Navigate to previous GIF */
 esp_err_t app_gifs_prev(void);
 
+/**
+ * @brief Delete the currently-viewed gallery entry.
+ *
+ * Removes every on-disk file associated with the PIMSLO capture:
+ *   - /sdcard/p4mslo_gifs/<stem>.gif   (the animated GIF, if it exists)
+ *   - /sdcard/p4mslo_small/<stem>.p4ms (the prerendered 240×240 version)
+ *   - /sdcard/p4mslo_previews/<stem>.jpg (the P4 preview still)
+ *
+ * Stops playback, drops the cached canvas slot, and rescans the gallery.
+ * After deletion current_index will land on the entry that was after
+ * the deleted one (or the new last entry if the deleted one was last).
+ * Safe to call from LVGL context.
+ */
+esp_err_t app_gifs_delete_current(void);
+
 /** @brief Start playback of the current GIF */
 esp_err_t app_gifs_play_current(void);
 

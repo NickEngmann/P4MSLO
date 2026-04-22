@@ -188,10 +188,32 @@ static void pimslo_capture_task(void *param)
 
         esp_err_t ret = spi_camera_capture_all(jpeg_bufs, jpeg_sizes, &capture_ms);
 
-        /* Save JPEGs to the capture directory */
-        int saved = 0;
+        /* Count usable SPI results up front — we don't want to save
+         * anything if we can't build at least a 2-frame PIMSLO. */
+        int usable = 0;
         for (int i = 0; i < 4; i++) {
-            if (jpeg_bufs[i] && jpeg_sizes[i] > 0) {
+            if (jpeg_bufs[i] && jpeg_sizes[i] > 0) usable++;
+        }
+
+        int saved = 0;
+        if (usable >= 2) {
+            /* Save JPEGs to the capture directory. Validate JPEG SOI/EOI
+             * markers before committing — truncated or corrupted data
+             * would otherwise break the encoder at a much later stage. */
+            for (int i = 0; i < 4; i++) {
+                if (!jpeg_bufs[i] || jpeg_sizes[i] < 4) {
+                    if (jpeg_bufs[i]) free(jpeg_bufs[i]);
+                    continue;
+                }
+                bool has_soi = jpeg_bufs[i][0] == 0xFF && jpeg_bufs[i][1] == 0xD8;
+                bool has_eoi = jpeg_bufs[i][jpeg_sizes[i] - 2] == 0xFF &&
+                               jpeg_bufs[i][jpeg_sizes[i] - 1] == 0xD9;
+                if (!has_soi || !has_eoi) {
+                    ESP_LOGW(TAG, "  pos%d: corrupted JPEG (SOI=%d EOI=%d, %zu bytes) — dropped",
+                             i + 1, has_soi, has_eoi, jpeg_sizes[i]);
+                    free(jpeg_bufs[i]);
+                    continue;
+                }
                 char path[80];
                 snprintf(path, sizeof(path), "%s/pos%d.jpg", dir_path, i + 1);
                 FILE *f = fopen(path, "wb");
@@ -203,10 +225,16 @@ static void pimslo_capture_task(void *param)
                 }
                 free(jpeg_bufs[i]);
             }
+        } else {
+            /* Too few cameras responded — don't save anything. Release
+             * whatever SPI buffers were produced. */
+            for (int i = 0; i < 4; i++) {
+                if (jpeg_bufs[i]) free(jpeg_bufs[i]);
+            }
         }
 
-        ESP_LOGI(TAG, "Capture %03d: %d/4 cameras in %lums",
-                 num, saved, (unsigned long)capture_ms);
+        ESP_LOGI(TAG, "Capture %03d: %d/4 cameras in %lums (usable=%d)",
+                 num, saved, (unsigned long)capture_ms, usable);
 
         /* Enqueue GIF encode job if we got enough cameras. The GIF encoder
          * runs later — it defers until the user navigates off the camera
@@ -220,7 +248,19 @@ static void pimslo_capture_task(void *param)
                          num, (int)uxQueueMessagesWaiting(s_gif_queue));
             }
         } else {
-            ESP_LOGW(TAG, "Capture %03d: only %d cameras — skipping GIF", num, saved);
+            /* Failed capture — tear down everything we wrote so the
+             * gallery doesn't show a permanently-"PROCESSING" orphan. */
+            ESP_LOGW(TAG, "Capture %03d: only %d cameras — skipping GIF + cleaning up", num, saved);
+            /* Remove preview JPEG and any pos*.jpg that did get written. */
+            char prev[80];
+            snprintf(prev, sizeof(prev), "%s/P4M%04u.jpg", PIMSLO_PREVIEW_DIR, num);
+            unlink(prev);
+            for (int i = 0; i < 4; i++) {
+                char p[80];
+                snprintf(p, sizeof(p), "%s/pos%d.jpg", dir_path, i + 1);
+                unlink(p);
+            }
+            rmdir(dir_path);
         }
 
         /* Always restore viewfinder now. The user should be able to take

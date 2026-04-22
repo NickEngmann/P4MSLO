@@ -1267,10 +1267,39 @@ esp_err_t app_gifs_scan(void)
                 /* Attach preview to existing GIF entry. */
                 s_ctx.entries[existing].jpeg_path = strdup(jpeg_path);
             } else if (existing < 0) {
-                /* New JPEG-only entry (GIF encode still pending). */
-                gallery_entry_t *e = &s_ctx.entries[s_ctx.count++];
-                e->type = GALLERY_ENTRY_JPEG;
-                e->jpeg_path = strdup(jpeg_path);
+                /* New JPEG-only entry (GIF encode still pending). Only
+                 * add if the capture dir actually has at least 2 usable
+                 * pos*.jpg files — otherwise the encode can never run
+                 * and the gallery entry would be stuck as PROCESSING
+                 * forever. In that case, auto-clean the orphan preview. */
+                char capture_dir[MAX_PATH_LEN];
+                snprintf(capture_dir, sizeof(capture_dir),
+                         "/sdcard/p4mslo/%s", stem);
+                int pos_count = 0;
+                for (int k = 1; k <= 4; k++) {
+                    char p[MAX_PATH_LEN + 16];
+                    snprintf(p, sizeof(p), "%s/pos%d.jpg", capture_dir, k);
+                    struct stat st;
+                    if (stat(p, &st) == 0 && st.st_size > 4) pos_count++;
+                }
+                if (pos_count >= 2) {
+                    gallery_entry_t *e = &s_ctx.entries[s_ctx.count++];
+                    e->type = GALLERY_ENTRY_JPEG;
+                    e->jpeg_path = strdup(jpeg_path);
+                } else {
+                    ESP_LOGW(TAG, "Cleaning orphan preview %s "
+                                   "(capture has only %d/4 pos files)",
+                              jpeg_path, pos_count);
+                    unlink(jpeg_path);
+                    /* Also wipe any leftover partial capture dir. */
+                    for (int k = 1; k <= 4; k++) {
+                        char p[MAX_PATH_LEN + 16];
+                        snprintf(p, sizeof(p), "%s/pos%d.jpg",
+                                 capture_dir, k);
+                        unlink(p);
+                    }
+                    rmdir(capture_dir);
+                }
             }
         }
         closedir(pdir);

@@ -569,7 +569,13 @@ lv_disp_t *bsp_display_start(void)
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = {
             .task_priority = CONFIG_BSP_DISPLAY_LVGL_TASK_PRIORITY,
-            .task_stack = 4096,
+            /* 8 KB: lv_async_call callbacks from background tasks end up
+             * on this stack. app_gifs_scan + app_gifs_play_current (which
+             * opens a JPEG preview via tjpgd with a 32 KB work buffer in
+             * PSRAM plus ~2 KB of path/FILE state) overflowed 4 KB →
+             * taskLVGL stack-protection fault. 8 KB gives comfortable
+             * headroom for scan + play_current chaining. */
+            .task_stack = 8192,
             .task_affinity = 0,
             .timer_period_ms = LVGL_TICK_PERIOD_MS,
             .task_max_sleep_ms = LVGL_MAX_SLEEP_MS,

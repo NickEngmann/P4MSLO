@@ -26,6 +26,7 @@
 #include "driver/usb_serial_jtag_vfs.h"
 
 #include "ui_extra.h"
+#include "app_video_stream.h"
 #include "app_gifs.h"
 #include "app_pimslo.h"
 #include "app_p4_net.h"
@@ -520,11 +521,22 @@ static void dispatch_command(char *line)
                         (unsigned long)capture_ms, saved);
         }
     } else if (strcmp(line, "photo_btn") == 0) {
-        /* Simulate a photo-button press: kicks the PIMSLO capture
-         * semaphore so the capture task runs SPI → save → encode in
-         * the background, same as the hardware photo button. */
-        app_pimslo_request_capture();
-        cmd_respond("ok photo_btn (capture queued)");
+        /* Simulate the physical trigger press on the camera page:
+         * fires app_video_stream_take_photo() which sets is_take_photo,
+         * and the next frame callback executes the full path — flash
+         * pulse, screen-dim feedback, P4 JPEG save AND the SPI pimslo
+         * capture request. Previously this command only called
+         * app_pimslo_request_capture() which bypassed the visual
+         * feedback and the P4 photo save. Now tests exercise the same
+         * path a user gets from pressing the trigger. */
+        if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
+            app_video_stream_take_photo();
+            cmd_respond("ok photo_btn (take_photo scheduled)");
+        } else {
+            /* Off-camera: pimslo request only; no P4 photo. */
+            app_pimslo_request_capture();
+            cmd_respond("ok photo_btn (capture queued, no viewfinder)");
+        }
     } else if (strcmp(line, "pimslo") == 0) {
         /* Create PIMSLO GIF from /sdcard/pimslo/pos{1-4}.jpg */
         int delay = 150;

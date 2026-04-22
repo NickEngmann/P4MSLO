@@ -91,9 +91,22 @@ void app_main(void)
     ESP_LOGI(TAG, "Initialize the application control module");
     ESP_ERROR_CHECK(app_control_init());
 
-    // Initialize the video streaming application
+    /* Initialize the video streaming application.
+     *
+     * app_video_stream_init talks to the P4-EYE's built-in MIPI-CSI
+     * camera (OV2710) over SCCB/I2C. If the camera's ribbon cable is
+     * loose or its rail is down, the SCCB probe fails. Previously this
+     * path used ESP_ERROR_CHECK → abort → reboot loop. That's too
+     * aggressive: the rest of the device (gallery, settings, SPI rig)
+     * is still useful without the P4 viewfinder. Log and continue; the
+     * UI will just show a black camera canvas. */
     ESP_LOGI(TAG, "Initialize the video streaming application");
-    ESP_ERROR_CHECK(app_video_stream_init(i2c_handle));
+    esp_err_t video_ret = app_video_stream_init(i2c_handle);
+    if (video_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Video stream init FAILED (0x%x) — camera viewfinder "
+                      "will be unavailable. Check the MIPI-CSI ribbon to the "
+                      "P4-EYE camera sensor. Continuing boot.", video_ret);
+    }
     
     // Initialize PIMSLO background capture + GIF pipeline
     ESP_LOGI(TAG, "Initialize PIMSLO subsystem");

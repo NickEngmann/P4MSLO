@@ -153,8 +153,10 @@ static const PageMapping page_map[] = {
     {"CAMERA", UI_PAGE_CAMERA},
     {"INTERVAL CAM", UI_PAGE_INTERVAL_CAM},
     {"VIDEO MODE", UI_PAGE_VIDEO_MODE},
-    {"GIFS", UI_PAGE_GIFS},
-    {"ALBUM", UI_PAGE_ALBUM},
+    /* "ALBUM" now routes to the PIMSLO gallery (UI_PAGE_GIFS). The
+     * legacy P4-photo album (UI_PAGE_ALBUM) still exists in the enum
+     * but is no longer exposed from the main menu. */
+    {"ALBUM", UI_PAGE_GIFS},
     {"USB DISK", UI_PAGE_USB_DISK},
     {"SETTINGS", UI_PAGE_SETTINGS},
     {NULL, -1}
@@ -945,20 +947,18 @@ static void lv_scroll_create(void)
     lv_obj_align(info_label, LV_ALIGN_CENTER, 3, 50);
     lv_label_set_text(info_label, "");  
 
+    /* Menu entries in display order. "ALBUM" is the PIMSLO gallery
+     * (GIFs + p4ms) — the legacy P4-photo album was removed. ALBUM sits
+     * right after CAMERA so users can quickly review recent captures. */
     const char* btn_texts[] = {
-        "CAMERA", "INTERVAL CAM", "VIDEO MODE", "GIFS",
-        "ALBUM", "USB DISK", "SETTINGS"
+        "CAMERA", "ALBUM", "INTERVAL CAM", "VIDEO MODE",
+        "USB DISK", "SETTINGS"
     };
-
-    // Define the image source for each button. AI DETECT is no longer
-    // exposed as a menu entry (feature deprioritized), but UI_PAGE_AI_DETECT
-    // remains in the enum to keep existing guards/checks compiling.
     const void* img_srcs[] = {
         &ui_img_camera_big_png,
+        &ui_img_album_big_png,     /* ALBUM (PIMSLO gallery) */
         &ui_img_interval_big_png,
         &ui_img_video_big_png,
-        &ui_img_gifs_big_png,
-        &ui_img_album_big_png,
         &ui_img_usb_big_png,
         &ui_img_settings_big_png,
     };

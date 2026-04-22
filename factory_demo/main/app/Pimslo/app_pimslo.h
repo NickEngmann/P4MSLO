@@ -52,6 +52,14 @@ int app_pimslo_get_queue_depth(void);
 bool app_pimslo_is_encoding(void);
 
 /**
+ * @brief Capture number (1-based) currently being encoded, or 0 if the
+ *        encoder is idle. Used by the gallery to show a "PROCESSING"
+ *        badge on that specific entry and "QUEUED" on the other
+ *        JPEG-only entries still waiting their turn.
+ */
+uint16_t app_pimslo_encoding_capture_num(void);
+
+/**
  * @brief Check if an SPI capture + save is currently running on the
  * capture task. True between the semaphore-take and the end of the
  * capture + JPEG-save cycle. Use from background workers that need to

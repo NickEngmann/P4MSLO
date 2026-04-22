@@ -1109,6 +1109,9 @@ static void ui_extra_leaving_main(void)
     /* Hide the delete modal if the user was in the middle of confirming
      * when they navigated away, so it doesn't reappear on re-entry. */
     gifs_delete_modal_hide();
+    /* Hide the empty-album / SD-error overlay so other pages don't see
+     * it leaked into their layout. Refreshed on next gallery entry. */
+    app_gifs_refresh_empty_overlay();    /* no-op when count>0 */
     /* Let the background worker resume — user no longer holds the
      * gallery's decoder / PSRAM. */
     app_gifs_set_gallery_open(false);
@@ -1267,9 +1270,16 @@ static void ui_extra_redirect_to_gifs_page(void)
             } else {
                 app_gifs_play_current();
             }
+        } else {
+            /* Empty gallery — surface the "Album empty" overlay instead
+             * of leaving the user staring at a blank canvas. */
+            app_gifs_refresh_empty_overlay();
         }
     } else {
         lv_obj_clear_flag(ui_PanelGifsPopupSDWarning, LV_OBJ_FLAG_HIDDEN);
+        /* Also surface the SD-error overlay on the canvas itself so
+         * it's unambiguous why nothing is showing. */
+        app_gifs_refresh_empty_overlay();
     }
 }
 

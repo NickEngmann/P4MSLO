@@ -13,6 +13,7 @@
 #include "driver/jpeg_decode.h"
 #include "app_pimslo.h"
 #include "ui_extra.h"
+/* ui_extra_get_sd_card_mounted lives in ui_extra.h already (above). */
 #include "ui/ui.h"
 
 #include <stdio.h>
@@ -185,8 +186,16 @@ typedef struct {
     /* Shown in the center of the screen ONLY when the current entry is
      * a JPEG preview (i.e. the GIF encode is still queued or running).
      * Tells the user the image is a still frame and a full PIMSLO GIF
-     * will replace it once encoding finishes. Hidden for GIF entries. */
+     * will replace it once encoding finishes. Text is "PROCESSING"
+     * when this specific entry is actively being encoded right now,
+     * "QUEUED" if it's waiting in the queue. Hidden for GIF entries. */
     lv_obj_t *processing_label;
+
+    /* Shown when the gallery has zero entries. Also used to surface an
+     * SD-card error state so the user isn't left wondering why their
+     * photos aren't showing up. Single label, text swapped based on
+     * reason. */
+    lv_obj_t *empty_label;
 
     /* Centered "loading..." overlay shown during a GIF's first loop,
      * while the decoder is populating the frame-offset map + canvas
@@ -220,10 +229,40 @@ static void scan_async_cb(void *arg)
 {
     (void)arg;
     app_gifs_scan();
-    if (ui_extra_get_current_page() == UI_PAGE_GIFS &&
-        app_gifs_get_count() > 0) {
-        app_gifs_play_current();
+    if (ui_extra_get_current_page() == UI_PAGE_GIFS) {
+        if (app_gifs_get_count() > 0) {
+            app_gifs_play_current();
+        } else {
+            /* Nothing to play — make sure the empty-state overlay is
+             * up to date (e.g. after deleting the last entry). */
+            app_gifs_refresh_empty_overlay();
+        }
     }
+}
+
+/* Toggle the empty-album / SD-error label visibility based on the
+ * current entry count and SD state. Safe to call from any task — uses
+ * bsp_display_lock internally. */
+void app_gifs_refresh_empty_overlay(void)
+{
+    if (!s_ctx.empty_label) return;
+    bool sd_ok = ui_extra_get_sd_card_mounted();
+    bool empty = (s_ctx.count == 0);
+    bsp_display_lock(0);
+    if (!sd_ok) {
+        lv_label_set_text(s_ctx.empty_label,
+                          "SD card\nnot detected\n\nInsert a card\nand reboot");
+        lv_obj_clear_flag(s_ctx.empty_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_ctx.empty_label);
+    } else if (empty) {
+        lv_label_set_text(s_ctx.empty_label,
+                          "Album empty\n\nTake a photo\nfrom the camera");
+        lv_obj_clear_flag(s_ctx.empty_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_ctx.empty_label);
+    } else {
+        lv_obj_add_flag(s_ctx.empty_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    bsp_display_unlock();
 }
 
 static bool is_gif_file(const char *name)
@@ -1111,9 +1150,9 @@ esp_err_t app_gifs_init(lv_obj_t *canvas)
     /* Hidden until the first play_current() updates its text. */
     lv_obj_add_flag(s_ctx.name_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* Center "PROCESSING" badge for JPEG-preview entries — a static
-     * still frame with this overlay tells the user the captured burst
-     * hasn't finished encoding into a GIF yet. Hidden on GIF entries. */
+    /* Center "PROCESSING"/"QUEUED" badge for JPEG-preview entries.
+     * The text is set each time play_current runs: "PROCESSING" while
+     * this specific capture is being encoded, "QUEUED" otherwise. */
     s_ctx.processing_label = lv_label_create(ui_ScreenGifs);
     lv_obj_set_style_bg_color(s_ctx.processing_label, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(s_ctx.processing_label, LV_OPA_70, 0);
@@ -1124,6 +1163,21 @@ esp_err_t app_gifs_init(lv_obj_t *canvas)
     lv_obj_align(s_ctx.processing_label, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(s_ctx.processing_label, "PROCESSING");
     lv_obj_add_flag(s_ctx.processing_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* Empty-album overlay — shown whenever the gallery count is 0.
+     * Text is updated contextually (empty vs SD error) right before
+     * it's made visible. */
+    s_ctx.empty_label = lv_label_create(ui_ScreenGifs);
+    lv_obj_set_style_bg_color(s_ctx.empty_label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_ctx.empty_label, LV_OPA_70, 0);
+    lv_obj_set_style_text_color(s_ctx.empty_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_ctx.empty_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(s_ctx.empty_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_all(s_ctx.empty_label, 12, 0);
+    lv_obj_set_style_radius(s_ctx.empty_label, 8, 0);
+    lv_obj_align(s_ctx.empty_label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(s_ctx.empty_label, "Album empty");
+    lv_obj_add_flag(s_ctx.empty_label, LV_OBJ_FLAG_HIDDEN);
 
     /* Center "loading..." badge, styled like the PROCESSING one but
      * smaller and dimmer since it's a transient state. Shown only
@@ -1305,17 +1359,41 @@ esp_err_t app_gifs_scan(void)
         closedir(pdir);
     }
 
-    /* Restore the previously-viewed entry by path match. If the path no
-     * longer exists (e.g. GIF was deleted) fall back to index 0. */
+    /* Restore the previously-viewed entry. Match on PIMSLO stem, not
+     * exact path — when a JPEG-only entry gets its encode completed,
+     * its primary path flips from P4M0007.jpg to P4M0007.gif, and a
+     * strict path compare would bounce the user back to index 0. The
+     * stem (P4M0007) is stable across that transition. */
     s_ctx.current_index = 0;
     if (preserved_path[0]) {
+        const char *slash = strrchr(preserved_path, '/');
+        const char *base = slash ? slash + 1 : preserved_path;
+        char preserved_stem[32] = "";
+        extract_pimslo_stem(base, preserved_stem, sizeof(preserved_stem));
+
+        int fallback_idx = -1;
         for (int i = 0; i < s_ctx.count; i++) {
             const char *p = entry_primary_path(&s_ctx.entries[i]);
-            if (p && strcmp(p, preserved_path) == 0) {
+            if (!p) continue;
+            /* Exact match always wins */
+            if (strcmp(p, preserved_path) == 0) {
                 s_ctx.current_index = i;
+                fallback_idx = -1;
                 break;
             }
+            /* Stem match = the JPEG promoted to a GIF; record it as
+             * fallback in case no exact match exists. */
+            if (preserved_stem[0]) {
+                const char *s2 = strrchr(p, '/');
+                const char *b2 = s2 ? s2 + 1 : p;
+                char cand_stem[32];
+                if (extract_pimslo_stem(b2, cand_stem, sizeof(cand_stem)) &&
+                    strcmp(preserved_stem, cand_stem) == 0) {
+                    fallback_idx = i;
+                }
+            }
         }
+        if (fallback_idx >= 0) s_ctx.current_index = fallback_idx;
     }
 
     ESP_LOGI(TAG, "Gallery scan: %d entries, current=%d (preserved_path=%s)",
@@ -1547,9 +1625,24 @@ static esp_err_t show_jpeg(const char *path)
 esp_err_t app_gifs_play_current(void)
 {
     if (s_ctx.count == 0 || !s_ctx.canvas_buffer) {
-        ESP_LOGE(TAG, "Cannot play: count=%d canvas=%p",
-                 s_ctx.count, s_ctx.canvas_buffer);
+        /* Nothing to play — surface the empty-album (or SD-error)
+         * overlay. Also clear any per-entry badges that might be
+         * showing from a stale state. */
+        if (s_ctx.processing_label) {
+            bsp_display_lock(0);
+            lv_obj_add_flag(s_ctx.processing_label, LV_OBJ_FLAG_HIDDEN);
+            bsp_display_unlock();
+        }
+        app_gifs_refresh_empty_overlay();
         return ESP_FAIL;
+    }
+
+    /* There IS something to play — make sure the empty-album overlay
+     * is hidden regardless of prior state. */
+    if (s_ctx.empty_label) {
+        bsp_display_lock(0);
+        lv_obj_add_flag(s_ctx.empty_label, LV_OBJ_FLAG_HIDDEN);
+        bsp_display_unlock();
     }
 
     app_gifs_stop();
@@ -1574,6 +1667,23 @@ esp_err_t app_gifs_play_current(void)
     }
     if (s_ctx.processing_label) {
         if (ent->type == GALLERY_ENTRY_JPEG) {
+            /* Is THIS entry the one currently being encoded? */
+            char stem[32] = {0};
+            if (ent->jpeg_path) {
+                const char *slash = strrchr(ent->jpeg_path, '/');
+                const char *base = slash ? slash + 1 : ent->jpeg_path;
+                extract_pimslo_stem(base, stem, sizeof(stem));
+            }
+            uint16_t encoding_num = app_pimslo_encoding_capture_num();
+            char encoding_stem[16] = {0};
+            if (encoding_num > 0) {
+                snprintf(encoding_stem, sizeof(encoding_stem),
+                         "P4M%04u", (unsigned)encoding_num);
+            }
+            bool is_processing = (encoding_num > 0 &&
+                                   strcmp(stem, encoding_stem) == 0);
+            lv_label_set_text(s_ctx.processing_label,
+                              is_processing ? "PROCESSING" : "QUEUED");
             lv_obj_clear_flag(s_ctx.processing_label, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(s_ctx.processing_label);
         } else {

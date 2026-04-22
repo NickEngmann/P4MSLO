@@ -27,13 +27,17 @@ import _lib
 LOG = _lib.log_path(__file__)
 
 
-def find_ts(txt, pattern):
-    """Return ms-timestamp of the first line matching `pattern`, or None."""
+def find_ts(txt, pattern, after_ts=0):
+    """Return ms-timestamp of the first line matching `pattern` whose
+    own timestamp is >= after_ts. Lets tests find the event AFTER the
+    moment of interest, instead of a stale one earlier in the log."""
     for line in txt.splitlines():
         if re.search(pattern, line):
             m = re.match(r'\s*[IEWD]\s*\((\d+)\)', line)
             if m:
-                return int(m.group(1))
+                ts = int(m.group(1))
+                if ts >= after_ts:
+                    return ts
     return None
 
 
@@ -64,13 +68,17 @@ def main():
         txt = f.read()
     c = _lib.summarize(txt)
 
-    # Extract key timestamps
+    # All subsequent events must follow the photo_btn press; otherwise
+    # we'd pick up stale events from the menu_goto camera at test start.
     t_press = find_ts(txt, r"Command: 'photo_btn'")
-    t_pimslo_start = find_ts(txt, r"pimslo: Saved P4 preview")
-    t_trigger = find_ts(txt, r"spi_cam: Trigger sent")
-    t_capture_done = find_ts(txt, r"Capture \d+: \d/4 cameras in")
-    t_realloc_done = find_ts(txt, r'Camera buffers reallocated')
-    t_cam_live = find_ts(txt, r'Camera initialized after \d+ frames')
+    after = (t_press or 0) + 1
+    t_pimslo_start = find_ts(txt, r"pimslo: Saved P4 preview", after)
+    t_trigger = find_ts(txt, r"spi_cam: Trigger sent", after)
+    t_capture_done = find_ts(txt, r"Capture \d+: \d/4 cameras in", after)
+    t_realloc_done = find_ts(txt, r'Camera buffers reallocated',
+                              (t_capture_done or after))
+    t_cam_live = find_ts(txt, r'Camera initialized after \d+ frames',
+                          (t_realloc_done or after))
 
     def ms(a, b):
         if a is None or b is None:
@@ -105,12 +113,16 @@ def main():
         sys.exit(0 if (c['watchdogs'] == 0 and c['panics'] == 0) else 1)
 
     limits = {
-        'W1': (w1, 500, 'capture task wake-up lag'),
+        # photo_btn now mirrors the physical trigger: it goes through
+        # take_and_save_photo (P4 JPEG encode + SD write, ~1-3 s) BEFORE
+        # app_pimslo_request_capture runs. So W1 is P4 save time, not
+        # a "wake-up" anymore. Allow up to 5 s.
+        'W1': (w1, 5000, 'P4 photo save + pimslo task wake-up'),
         'W2a': (w2_trigger, 2000, 'pimslo pre-trigger overhead'),
         'W2b': (w2_capture, 15000, 'SPI transfer of up to 4 JPEGs with retries'),
         'W3': (w3_realloc, 1500, 'viewfinder PSRAM realloc'),
         'W4': (w4_live, 3000, 'camera sensor re-init'),
-        'TOTAL': (total, 25000, 'full button-press → viewfinder-live cycle'),
+        'TOTAL': (total, 30000, 'full button-press → viewfinder-live cycle'),
     }
     passed = c['watchdogs'] == 0 and c['panics'] == 0
     print()

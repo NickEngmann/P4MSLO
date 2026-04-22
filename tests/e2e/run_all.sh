@@ -21,6 +21,7 @@ TESTS=(
     07_gallery_edge_cases.py
     04_gallery_knob_nav.py
     05_bg_encode_while_on_gallery.py
+    09_gallery_empty_and_states.py
 )
 
 total=${#TESTS[@]}

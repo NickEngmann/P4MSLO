@@ -72,6 +72,14 @@ void app_gifs_stop(void);
  */
 void app_gifs_flush_cache(void);
 
+/**
+ * @brief Refresh the center "Album empty" / "SD card not detected"
+ *        overlay based on the current SD state and gallery count.
+ *        Called automatically on scan; also callable manually e.g.
+ *        from the delete path when the gallery drops to zero.
+ */
+void app_gifs_refresh_empty_overlay(void);
+
 /** @brief Check if currently playing */
 bool app_gifs_is_playing(void);
 

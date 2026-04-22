@@ -2,8 +2,10 @@
 # Espressif IoT Development Framework (ESP-IDF) 6.0.0 Project Minimal Configuration
 #
 CONFIG_IDF_TARGET="esp32p4"
-CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-CONFIG_ESP32P4_REV_MIN_100=y
+# Chip-rev range: ESP32-P4X v3.1 is the target now. Setting SELECTS_REV_LESS_V3=n
+# + REV_MIN_301=y makes the bootloader accept v3.01+ chips (was v1.0-v1.99).
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n
+CONFIG_ESP32P4_REV_MIN_301=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_SD_HOST_SDMMC_ISR_CACHE_SAFE=y
@@ -40,3 +42,17 @@ CONFIG_LV_FONT_MONTSERRAT_18=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# ---- P4X v3.1 post-migration optimizations ----
+# CPU @ 400 MHz — the v3.1 max (was capped at 360 MHz on v1.x). Already
+# defaults once REV_MIN_301=y is set; explicit here so nobody downshifts
+# it accidentally.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=400
+
+# -O2 (CONFIG_COMPILER_OPTIMIZATION_PERF) is deferred: the managed
+# component espressif__esp_lvgl_port has a false-positive
+# -Wmaybe-uninitialized that becomes -Werror under -O2 and we can't
+# easily patch a managed component. When the component ships a fix,
+# flip this on for a meaningful speedup in the tjpgd + GIF encoder
+# tight loops.

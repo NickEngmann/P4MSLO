@@ -110,7 +110,8 @@ def summarize(txt):
         'watchdogs': txt.count('task_wdt'),
         'panics': txt.count('Guru Meditation'),
         'ping_pong': txt.count('CMD>pong'),
-        'photo_btn': txt.count('photo_btn (capture queued)'),
+        'photo_btn': (txt.count('photo_btn (take_photo scheduled)') +
+                       txt.count('photo_btn (capture queued')),
         'captures': re.findall(r'Capture \d+: (\d)/4 cameras', txt),
         'p4ms_saved': txt.count('Direct-JPEG .p4ms saved'),
         'gifs_saved': txt.count('PIMSLO GIF saved to'),

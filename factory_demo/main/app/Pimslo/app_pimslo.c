@@ -44,6 +44,10 @@ static SemaphoreHandle_t s_capture_sem = NULL;
 static QueueHandle_t     s_gif_queue   = NULL;
 static uint16_t          s_next_capture_num = 1;
 static bool              s_encoding = false;
+/* Which capture is currently being encoded (valid only while s_encoding).
+ * Exposed so the gallery can distinguish between an entry that's
+ * actively in the encoder vs one still sitting in the queue. */
+static volatile uint16_t s_encoding_num = 0;
 static volatile bool     s_capturing = false;
 static bool              s_initialized = false;
 
@@ -330,6 +334,7 @@ static void pimslo_encode_queue_task(void *param)
         }
 
         s_encoding = true;
+        s_encoding_num = job.capture_num;
 
         /* If the user is on the gallery right now, pause playback and
          * flush the canvas cache — that's ~3.5 MB of PSRAM we need back
@@ -369,6 +374,7 @@ static void pimslo_encode_queue_task(void *param)
         }
 
         s_encoding = false;
+        s_encoding_num = 0;
     }
 }
 
@@ -426,6 +432,11 @@ int app_pimslo_get_queue_depth(void)
 bool app_pimslo_is_encoding(void)
 {
     return s_encoding;
+}
+
+uint16_t app_pimslo_encoding_capture_num(void)
+{
+    return s_encoding ? s_encoding_num : 0;
 }
 
 bool app_pimslo_is_capturing(void)

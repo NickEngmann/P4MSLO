@@ -24,6 +24,7 @@
 #include "app_video_utils.h"
 #include "app_video_photo.h"
 #include "app_pimslo.h"
+#include "spi_camera.h"
 #include "app_video_record.h"
 #include "app_ai_detect.h"
 #include "app_qma6100.h"
@@ -723,16 +724,37 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
             // Reset photo flag and take a photo
             camera_state.flags.is_take_photo = false;
 
+            /* Phase 5 overlap: fire the shared GPIO34 trigger RIGHT NOW
+             * so the 4 S3 cameras start their ~600 ms capture in
+             * parallel with the P4's ~1.8 s JPEG-encode + SD-write
+             * below. Must run on *this* task (video-stream, prio 6) —
+             * the pimslo capture task is prio 5 and wouldn't preempt
+             * us, so deferring the trigger to that task would just
+             * delay it until after take_and_save_photo completes and
+             * defeat the parallelism. The trigger pulse itself is
+             * ~100 ms of vTaskDelay inside spi_camera_send_trigger.
+             *
+             * spi_camera_init() is also called from app_pimslo_init()
+             * on boot so send_trigger here is always a lightweight
+             * GPIO toggle — no SPI-bus allocation on the 4 KB
+             * video-stream task stack. */
+            bool trigger_sent = false;
+            if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
+                if (spi_camera_send_trigger() == ESP_OK) {
+                    trigger_sent = true;
+                }
+            }
+
             take_and_save_photo(camera_buf, camera_buf_hes, camera_buf_ves);
 
-            /* Trigger PIMSLO SPI capture in the background (non-blocking).
-             * The pimslo capture task is also responsible for copying the
-             * just-saved P4 photo into PIMSLO_PREVIEW_DIR so the gallery
-             * has a placeholder while the GIF encodes — it's done there
-             * instead of here because this frame callback runs on the
-             * 4 KB video-stream task stack, and the preview copy uses a
-             * large file-I/O buffer that would overflow it. */
-            if (ui_extra_get_current_page() == UI_PAGE_CAMERA) {
+            /* Now kick the pimslo task — it'll call
+             * spi_camera_capture_all_after_trigger() which skips the
+             * (already-done) first trigger + post-trigger wait, so the
+             * S3 JPEGs should already be sitting in the slaves' PSRAM
+             * ready for immediate polling + transfer. The preview copy
+             * + pos*.jpg saves happen on the pimslo task (8 KB stack),
+             * which has room for the file-I/O buffer. */
+            if (trigger_sent) {
                 app_pimslo_request_capture();
             }
         }

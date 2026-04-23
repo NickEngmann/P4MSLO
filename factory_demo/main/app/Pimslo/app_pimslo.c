@@ -146,11 +146,28 @@ static void pimslo_capture_task(void *param)
         uint16_t num = s_next_capture_num++;
         save_capture_counter();
 
+        /* ── Overlap mode (Phase 5) ──
+         * The video-stream task already fired the GPIO34 trigger on
+         * this same photo press (via spi_camera_send_trigger) BEFORE
+         * calling take_and_save_photo. So by the time we're here:
+         *   - S3 cameras have been capturing for ~1.5-2 s (plenty of
+         *     time for exposure + JPEG encode) and their JPEGs are
+         *     waiting in PSRAM.
+         *   - P4 photo save is already committed to SD.
+         * We just need to poll + transfer the JPEGs. Use the
+         * _after_trigger variant so we skip the redundant second
+         * trigger pulse and the ~500 ms post-trigger wait.
+         *
+         * If the trigger was NOT pre-fired (e.g. serial-only
+         * request_capture off the camera page), the first retry below
+         * will send a fresh trigger and recover normally. */
+        spi_camera_init();
+
         /* Save the P4 photo we just took as the gallery preview for this
-         * capture number. Safe to do here (instead of in the video-stream
-         * frame callback) because the photo's `take_and_save_photo` call
-         * already flushed to SD before the caller gave us this semaphore,
-         * and this task has an 8KB stack for the file-copy buffer. */
+         * capture number. Uses this task's 8 KB stack for the file-copy
+         * buffer. (On the camera path, the P4 file is already on SD.
+         * On the serial-off-camera path there's no P4 photo, so this
+         * save is a no-op.) */
         app_pimslo_save_preview_from_latest_photo(num);
 
         /* Create capture directory */
@@ -159,10 +176,7 @@ static void pimslo_capture_task(void *param)
         snprintf(dir_path, sizeof(dir_path), "%s/P4M%04d", PIMSLO_BASE_DIR, num);
         mkdir(dir_path, 0755);
 
-        ESP_LOGI(TAG, "Capture %03d: triggering SPI cameras...", num);
-
-        /* Initialize SPI (idempotent) and capture from all cameras */
-        spi_camera_init();
+        ESP_LOGI(TAG, "Capture %03d: polling S3 cameras (trigger already sent)...", num);
 
         /* Free the viewfinder / photo buffers so the ~4×600KB SPI JPEG
          * transfer buffers have room to allocate. On the CAMERA page the
@@ -190,7 +204,11 @@ static void pimslo_capture_task(void *param)
         size_t jpeg_sizes[4] = {0};
         uint32_t capture_ms = 0;
 
-        esp_err_t ret = spi_camera_capture_all(jpeg_bufs, jpeg_sizes, &capture_ms);
+        /* Receive only — trigger was sent earlier, overlapped with
+         * the P4 photo save. If any camera fails, capture_all_impl's
+         * retry logic will send a fresh trigger on attempt 1+ as
+         * normal. */
+        esp_err_t ret = spi_camera_capture_all_after_trigger(jpeg_bufs, jpeg_sizes, &capture_ms);
 
         /* Count usable SPI results up front — we don't want to save
          * anything if we can't build at least a 2-frame PIMSLO. */
@@ -389,6 +407,12 @@ esp_err_t app_pimslo_init(void)
 
     s_capture_sem = xSemaphoreCreateBinary();
     if (!s_capture_sem) return ESP_ERR_NO_MEM;
+
+    /* Initialize the SPI master bus + 4 camera device handles up front
+     * so the video-stream task's photo-button callback can call
+     * spi_camera_send_trigger() without paying init cost on its small
+     * 4 KB stack. Idempotent — safe even if this module is re-init'd. */
+    spi_camera_init();
 
     s_gif_queue = xQueueCreate(PIMSLO_QUEUE_DEPTH, sizeof(pimslo_gif_job_t));
     if (!s_gif_queue) return ESP_ERR_NO_MEM;

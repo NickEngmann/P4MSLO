@@ -451,8 +451,28 @@ esp_err_t spi_camera_query_status(int camera_idx, uint8_t *status_byte)
     return ESP_OK;
 }
 
-esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
-                                  uint32_t *total_ms)
+/* Internal: drive the GPIO34 pulse. Not a wait — just the edges. The
+ * S3 slaves interpret any falling edge on this pin as "capture now". */
+static void send_trigger_pulse(void)
+{
+    gpio_set_level(GPIO_NUM_34, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(GPIO_NUM_34, 1);
+}
+
+esp_err_t spi_camera_send_trigger(void)
+{
+    if (!s_initialized) {
+        esp_err_t ret = spi_camera_init();
+        if (ret != ESP_OK) return ret;
+    }
+    send_trigger_pulse();
+    ESP_LOGI(TAG, "Trigger sent (early, parallel with P4 photo save)");
+    return ESP_OK;
+}
+
+static esp_err_t capture_all_impl(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
+                                   uint32_t *total_ms, bool pre_triggered)
 {
     if (!s_initialized) {
         esp_err_t ret = spi_camera_init();
@@ -476,15 +496,28 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
             }
         }
 
-        /* Trigger all cameras simultaneously via GPIO34 */
-        gpio_set_level(GPIO_NUM_34, 0);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        gpio_set_level(GPIO_NUM_34, 1);
-        ESP_LOGI(TAG, "Trigger sent (attempt %d), waiting for captures...", attempt + 1);
-        /* Fast mode shaves the post-trigger wait. 300ms is enough for OV5640
-         * capture completion; the default 500ms included a comfortable margin
-         * that we trade away in fast mode for ~200ms quicker bursts. */
-        vTaskDelay(pdMS_TO_TICKS(s_fast_mode ? 300 : 500));
+        /* Trigger all cameras simultaneously via GPIO34 — unless the
+         * caller already fired the trigger early (overlap mode) and
+         * this is the first attempt, in which case the S3 cameras are
+         * already past the capture stage and waiting for us to poll. */
+        if (!(pre_triggered && attempt == 0)) {
+            send_trigger_pulse();
+        }
+        ESP_LOGI(TAG, "Trigger %s (attempt %d), waiting for captures...",
+                 (pre_triggered && attempt == 0) ? "skipped — pre-triggered" : "sent",
+                 attempt + 1);
+        /* Normal post-trigger wait: 300 ms in fast mode, 500 ms otherwise.
+         * In pre-triggered mode the bulk of this wait overlapped with the
+         * P4 photo save — but we still do a short 150 ms grace here so
+         * slower cameras (observed: positions 3 & 4 with larger JPEGs)
+         * have a margin to finish their encode. Without this, attempt 0
+         * polled cams 3/4 before they were ready, falling into the retry
+         * path and wiping the 1-2 s the overlap was supposed to save. */
+        if (pre_triggered && attempt == 0) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(s_fast_mode ? 300 : 500));
+        }
 
         /* Receive from each camera sequentially, one at a time.
          * Add delay between cameras to let the bus fully settle. */
@@ -529,6 +562,19 @@ esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
              success_count, SPI_CAM_COUNT, (unsigned long)*total_ms);
 
     return (success_count >= 2) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
+                                  uint32_t *total_ms)
+{
+    return capture_all_impl(jpeg_bufs, jpeg_sizes, total_ms, false);
+}
+
+esp_err_t spi_camera_capture_all_after_trigger(uint8_t *jpeg_bufs[4],
+                                                size_t jpeg_sizes[4],
+                                                uint32_t *total_ms)
+{
+    return capture_all_impl(jpeg_bufs, jpeg_sizes, total_ms, true);
 }
 
 /* ---- Phase 4: exposure sync + autofocus ---- */

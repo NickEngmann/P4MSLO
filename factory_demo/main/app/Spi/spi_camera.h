@@ -58,6 +58,32 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
 esp_err_t spi_camera_capture_all(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
                                   uint32_t *total_ms);
 
+/**
+ * @brief Fire the shared GPIO34 trigger pulse ONLY. No SPI transfer, no
+ *        waiting, no allocations — just the pin toggle. Cameras start
+ *        capturing in parallel and hold the JPEG in their own PSRAM
+ *        until polled.
+ *
+ * Meant to be called early (e.g. as soon as the photo button is pressed)
+ * so the S3 capture time (~600 ms) overlaps with the P4's own JPEG
+ * encode + SD save. The caller must then call
+ * spi_camera_capture_all_after_trigger() instead of the normal
+ * spi_camera_capture_all() so the trigger is not re-sent.
+ *
+ * @return ESP_OK unless SPI init failed
+ */
+esp_err_t spi_camera_send_trigger(void);
+
+/**
+ * @brief Same as spi_camera_capture_all but skips the first trigger
+ *        pulse because the caller already sent it via
+ *        spi_camera_send_trigger(). Retries on failure still fire
+ *        their own triggers as usual.
+ */
+esp_err_t spi_camera_capture_all_after_trigger(uint8_t *jpeg_bufs[4],
+                                                size_t jpeg_sizes[4],
+                                                uint32_t *total_ms);
+
 /** Control commands — must match esp32s3/src/spi/SPISlave.h. The 10× burst
  *  retry pattern in spi_camera_send_control() makes the 0x01–0x0F range
  *  reliable (the scan on the slave side picks up at least one intact byte). */

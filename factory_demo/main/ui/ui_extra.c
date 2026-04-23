@@ -65,8 +65,6 @@ static bool is_ui_init = false;
 static lv_obj_t *ui_PanelHomeBackground = NULL;
 
 // AI Detection Mode variables
-static ai_detect_mode_t current_ai_detect_mode = AI_DETECT_PEDESTRIAN;
-static lv_obj_t *ai_mode_label = NULL;
 
 /* Centered "saving..." overlay on the camera screen. Shown while the
  * PIMSLO capture task is busy (GPIO34 trigger → SPI transfer × 4 → SD
@@ -173,8 +171,6 @@ static void ui_extra_redirect_to_settings_page(void);
 static void ui_extra_redirect_to_gifs_page(void);
 static void ui_extra_clear_popup_window(void);
 static void ui_extra_focus_on_picture_delete(void);
-static void ui_extra_update_ai_detect_mode_label(void);
-static void ui_extra_change_ai_detect_mode(ai_detect_mode_t mode);
 
 /*-------------------------------------------------*/
 /* Settings Management Functions                    */
@@ -829,10 +825,6 @@ static void pop_up_timer_callback(lv_timer_t * timer)
         lv_obj_clear_flag(ui_ImageCanvasDown, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(ui_ImageCanvasMenu, LV_OBJ_FLAG_HIDDEN);
         
-        // Show AI mode label after popup disappears
-        if (ai_mode_label != NULL) {
-            lv_obj_clear_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
-        }
     }
 
     if(lv_popup_timer){
@@ -1038,10 +1030,6 @@ void ui_extra_clear_page(void)
     lv_obj_add_flag(scroll_cont, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(info_label, LV_OBJ_FLAG_HIDDEN);
     
-    // Hide AI mode label if it exists
-    if (ai_mode_label != NULL) {
-        lv_obj_add_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
-    }
 }
 
 /**
@@ -1072,11 +1060,6 @@ static void ui_extra_clear_popup_window(void)
             lv_obj_add_flag(ui_PanelCanvasPopupIntervalTimerWarning, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(ui_PanelCanvasPopupIntervalTimerWarningEnd, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(ui_PanelCanvasPopupAICamera, LV_OBJ_FLAG_HIDDEN);
-            
-            // Make sure AI mode label is visible when in AI detect page and popup is cleared
-            if (current_page == UI_PAGE_AI_DETECT && ai_mode_label != NULL) {
-                lv_obj_clear_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
-            }
     }
 }
 
@@ -1348,80 +1331,11 @@ static void ui_extra_redirect_to_settings_page(void)
 /**
  * @brief Redirect to AI detect page
  */
-static void ui_extra_redirect_to_ai_detect_page(void)
-{
-    ui_extra_leaving_main();
-    app_video_stream_realloc_buffers();  /* viewfinder + AI detection buffers */
-    current_page = UI_PAGE_AI_DETECT;
-
-    ui_extra_clear_page();
-
-    // Create AI mode label if it doesn't exist
-    if (ai_mode_label == NULL) {
-        ai_mode_label = lv_label_create(ui_ScreenCamera);
-        lv_obj_set_style_text_font(ai_mode_label, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(ai_mode_label, lv_color_hex(0xFF0000), 0);
-        lv_obj_set_style_bg_color(ai_mode_label, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_bg_opa(ai_mode_label, LV_OPA_70, 0);
-        lv_obj_set_style_radius(ai_mode_label, 5, 0);
-        lv_obj_set_style_pad_all(ai_mode_label, 5, 0);
-        // Position the label at the left bottom corner
-        lv_obj_align(ai_mode_label, LV_ALIGN_BOTTOM_LEFT, 10, -10);
-    }
-    
-    // Initially hide AI mode label when popup is shown
-    lv_obj_add_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
-    
-    // Update label text (it will be shown when popup disappears)
-    ui_extra_update_ai_detect_mode_label();
-    
-    // Show popup
-    lv_obj_clear_flag(ui_PanelCanvasPopupAICamera, LV_OBJ_FLAG_HIDDEN);
-    if(!lv_popup_timer){
-        lv_popup_timer = lv_timer_create(pop_up_timer_callback, 5000, ui_PanelCanvasPopupAICamera);
-    }
-}
-
-/**
- * @brief Update AI detection mode label
- */
-static void ui_extra_update_ai_detect_mode_label(void)
-{
-    if (ai_mode_label == NULL) {
-        return;
-    }
-    
-    if (current_ai_detect_mode == AI_DETECT_PEDESTRIAN) {
-        lv_label_set_text(ai_mode_label, "Mode: Pedestrian");
-    } else {
-        lv_label_set_text(ai_mode_label, "Mode: Face");
-    }
-}
-
-/**
- * @brief Change AI detection mode
- * @param mode New AI detection mode
- */
-static void ui_extra_change_ai_detect_mode(ai_detect_mode_t mode)
-{
-    if (mode >= AI_DETECT_MODE_MAX) {
-        mode = 0;
-    }
-    
-    current_ai_detect_mode = mode;
-    
-    // Update label text
-    ui_extra_update_ai_detect_mode_label();
-    
-    // Ensure label is visible if popup is not visible
-    if (ai_mode_label != NULL && lv_obj_has_flag(ui_PanelCanvasPopupAICamera, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_clear_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
-    }
-    
-    // Log the mode change (mode value is only used for UI display)
-    ESP_LOGI(TAG, "Changed AI detection mode display to %s", 
-             (current_ai_detect_mode == AI_DETECT_PEDESTRIAN) ? "pedestrian" : "face");
-}
+/* AI detect page + mode switching fully removed — the detection
+ * models were never loaded and the page was hidden from the menu.
+ * The UI_PAGE_AI_DETECT enum value and ai_detect_mode_t type were
+ * deleted along with the coco_detect / human_face_detect /
+ * pedestrian_detect / esp_painter components. */
 
 /**
  * @brief Toggle focus between YES and NO in picture delete dialog
@@ -1473,9 +1387,6 @@ void ui_extra_goto_page(ui_page_t page)
             break;
         case UI_PAGE_SETTINGS:
             ui_extra_redirect_to_settings_page();
-            break;
-        case UI_PAGE_AI_DETECT:
-            ui_extra_redirect_to_ai_detect_page();
             break;
         case UI_PAGE_GIFS:
             /* Don't pre-scan here — ui_extra_redirect_to_gifs_page()
@@ -1688,29 +1599,6 @@ bool ui_extra_get_usb_disk_mounted(void)
 }
 
 /**
- * @brief Get current AI detection mode
- * 
- * @details Returns the current AI detection mode that will be displayed
- *          in the UI. This can be either pedestrian detection (AI_DETECT_PEDESTRIAN)
- *          or face detection (AI_DETECT_FACE).
- * 
- * @return Current AI detection mode value
- */
-ai_detect_mode_t ui_extra_get_ai_detect_mode(void)
-{
-    return current_ai_detect_mode;
-}
-
-/**
- * @brief Set AI detection mode
- * @param mode New AI detection mode
- */
-void ui_extra_set_ai_detect_mode(ai_detect_mode_t mode)
-{
-    ui_extra_change_ai_detect_mode(mode);
-}
-
-/**
  * @brief Get gyroscope enabled status
  * @return True if gyroscope is enabled, false otherwise
  */
@@ -1900,15 +1788,6 @@ void ui_extra_btn_up(void)
             }
             break;
             
-        case UI_PAGE_AI_DETECT:
-            // Switch to previous AI detection mode (cycle back to the last if at first)
-            if (current_ai_detect_mode == AI_DETECT_PEDESTRIAN) {
-                ui_extra_change_ai_detect_mode(AI_DETECT_FACE);
-            } else {
-                ui_extra_change_ai_detect_mode(AI_DETECT_PEDESTRIAN);
-            }
-            break;
-
         case UI_PAGE_GIFS:
             if (gifs_delete_modal_open()) {
                 /* Modal is up — up/down toggles YES/NO focus, same as the
@@ -1995,15 +1874,6 @@ void ui_extra_btn_down(void)
             }
             break;
             
-        case UI_PAGE_AI_DETECT:
-            // Switch to next AI detection mode (cycle to the first if at last)
-            if (current_ai_detect_mode == AI_DETECT_FACE) {
-                ui_extra_change_ai_detect_mode(AI_DETECT_PEDESTRIAN);
-            } else {
-                ui_extra_change_ai_detect_mode(AI_DETECT_FACE);
-            }
-            break;
-
         case UI_PAGE_GIFS:
             if (gifs_delete_modal_open()) {
                 gifs_delete_modal_toggle_focus();
@@ -2189,8 +2059,6 @@ void ui_extra_btn_menu(void)
                     app_video_stream_set_flash_light(false);
                 }
 
-                app_album_enable_coco_od(strcmp(current_settings.od, "On") == 0);
-
                 lv_obj_add_flag(ui_PanelCameraSettings, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_add_flag(ui_PanelSettings, LV_OBJ_FLAG_HIDDEN);
 
@@ -2262,11 +2130,6 @@ void ui_extra_btn_menu(void)
             ui_extra_popup_camera_sd_space_warning_end();
             if(lv_interval_timer) {
                 lv_timer_ready(lv_interval_timer);
-            }
-
-            // Hide AI mode label when leaving AI detect page
-            if (current_page == UI_PAGE_AI_DETECT && ai_mode_label != NULL) {
-                lv_obj_add_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
             }
             break;
     }
@@ -2507,10 +2370,6 @@ void ui_extra_init(void)
     // reset flag
     is_camera_settings_panel_active = false;
 
-    // Initialize AI detection mode
-    current_ai_detect_mode = AI_DETECT_PEDESTRIAN;
-    ai_mode_label = NULL;
-
     // load settings
     settings_info_t settings;
     uint16_t loaded_interval_time;
@@ -2583,10 +2442,8 @@ void ui_extra_init(void)
             app_video_stream_set_flash_light(false);
         }
 
-        app_album_enable_coco_od(strcmp(current_settings.od, "On") == 0);
-
         app_video_stream_set_photo_resolution_by_string(current_settings.resolution);
-        
+
         // Update interval time and magnification
         interval_time = loaded_interval_time;
         magnification_factor = loaded_magnification;
@@ -2616,10 +2473,8 @@ void ui_extra_init(void)
             app_video_stream_set_flash_light(false);
         }
 
-        app_album_enable_coco_od(strcmp(current_settings.od, "On") == 0);
-
         app_video_stream_set_photo_resolution_by_string(current_settings.resolution);
-        
+
         // Use default interval time and magnification
         interval_time = loaded_interval_time;
         magnification_factor = loaded_magnification;

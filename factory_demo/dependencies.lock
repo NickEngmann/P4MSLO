@@ -50,7 +50,7 @@ dependencies:
       type: service
     version: 0.5.3
   espressif/eppp_link:
-    component_hash: 9472e6825f4bb71eca2b39cf1bc92659c1ac60bfd7416560ad033a7dd8641b17
+    component_hash: 04f7f31868b8ae6014c96132740a192d09611a6e46aaa7038c865ffc7e26b38f
     dependencies:
     - name: espressif/esp_serial_slave_link
       registry_url: https://components.espressif.com
@@ -62,24 +62,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 1.1.4
-  espressif/esp-dl:
-    component_hash: c9802baa3fb502f663dd76c557121efe2e5f308f4e27eb778500164c399c6c93
-    dependencies:
-    - name: espressif/esp_new_jpeg
-      registry_url: https://components.espressif.com
-      require: private
-      version: ==0.6.1
-    - name: idf
-      require: private
-      version: '>=5.3'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32s3
-    - esp32p4
-    version: 3.1.3
+    version: 1.1.5
   espressif/esp_audio_codec:
     component_hash: 04c2f0d5eca207cdfabd3aafc50ef4bca53532115ddf7689e5cfabd00eb88b02
     dependencies:
@@ -111,7 +94,7 @@ dependencies:
     - esp32p4
     version: 1.0.0
   espressif/esp_codec_dev:
-    component_hash: 54870f7a66dd93367b4153dedb22299efadf8b7b2ead322cdebc7c92a542fa35
+    component_hash: f4f3f142bac5768248a2a2b73552b136809769146b2fe0c42a175670a3938c5e
     dependencies:
     - name: idf
       require: private
@@ -119,7 +102,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.5.7
+    version: 1.5.8
   espressif/esp_h264:
     component_hash: 7196ad6b905ac748adbfc56351fafbf294c502e0f02da983204437fa152182dd
     dependencies:
@@ -131,7 +114,7 @@ dependencies:
       type: service
     version: 1.0.3
   espressif/esp_hosted:
-    component_hash: e23eb702781c804a62909e5394da0641a2bff9adccec6673a7bff60ce8c8b756
+    component_hash: d1f01fbe9b7ee867e1c330754fe46cb550375e27edf2159e9b670f29bd36b682
     dependencies:
     - name: idf
       require: private
@@ -139,7 +122,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 2.12.3
+    version: 2.12.6
   espressif/esp_ipa:
     component_hash: 854ba797f5cd5a49b739e2126287683605ed68f474a3a931b32d56dee2353d59
     dependencies:
@@ -180,22 +163,6 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.1.3
-  espressif/esp_new_jpeg:
-    component_hash: e6af208a875abd0ecfc0213d3751a11b504b463ebde6930f24096047925fa5c1
-    dependencies: []
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    targets:
-    - esp32
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    - esp32c2
-    - esp32c3
-    - esp32c5
-    - esp32c6
-    version: 0.6.1
   espressif/esp_sccb_intf:
     component_hash: c071b189e49f40940722aea01a5489f873385cc39cd5b14012341135b85d1a9d
     dependencies:
@@ -293,7 +260,7 @@ dependencies:
       type: service
     version: 1.0.2
   espressif/mdns:
-    component_hash: 1ebe3bd675bb9d1c58f52bc0b609b32f74e572b01c328f9e61282040c775495c
+    component_hash: 8bcf12e37c58c1d584aef32a02b92548124c7a3a9fcf548d3235c844a035e0f0
     dependencies:
     - name: idf
       require: private
@@ -301,7 +268,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.11.0
+    version: 1.11.1
   espressif/qma6100p:
     component_hash: b1215da35b176fa7cf713c42d5b1860d9b4379aa15c2f8a0ca29038619858e38
     dependencies:
@@ -359,7 +326,6 @@ dependencies:
     version: 8.4.0
 direct_dependencies:
 - esp32_p4_eye
-- espressif/esp-dl
 - espressif/esp_audio_codec
 - espressif/esp_h264
 - espressif/esp_muxer
@@ -368,6 +334,6 @@ direct_dependencies:
 - espressif/mdns
 - espressif/qma6100p
 - idf
-manifest_hash: b0e6b1bcf86b9218ea626be90d286023ff09bb3534ea0a2075e1b2ed8037be2c
+manifest_hash: 3a500aa85c05c3da9f8ccaf80997aa212ebfe183aa146a617f0c02da54676ce9
 target: esp32p4
 version: 2.0.0

@@ -152,7 +152,6 @@ static void cmd_menu_goto(const char *arg)
     else if (strcmp(arg, "album") == 0)      page = UI_PAGE_ALBUM;
     else if (strcmp(arg, "usb") == 0)        page = UI_PAGE_USB_DISK;
     else if (strcmp(arg, "settings") == 0)   page = UI_PAGE_SETTINGS;
-    else if (strcmp(arg, "ai_detect") == 0)  page = UI_PAGE_AI_DETECT;
     else if (strcmp(arg, "gifs") == 0)       page = UI_PAGE_GIFS;
     else {
         cmd_respond("error: unknown page '%s'", arg);

@@ -19,7 +19,6 @@
 #include "app_video_stream.h"
 #include "app_video_utils.h"
 
-#include "app_ai_detect.h"
 
 static const char *TAG = "app_album";
 
@@ -57,8 +56,6 @@ static const uint32_t MIN_FREE_SPACE = 5 * 1024 * 1024; // 5MB
 
 static const uint32_t album_res[PHOTO_RESOLUTION_MAX] = {480, 640, 960};
 static photo_resolution_t current_album_resolution = PHOTO_RESOLUTION_1080P; // default 1080P
-
-static bool enable_coco_od = false;
 
 static bool is_valid_image_file(const char *filename) {
     // check file extension
@@ -575,10 +572,8 @@ static esp_err_t app_album_display_current_image(void) {
         return ESP_FAIL;
     }
     
-    // Set canvas buffer with decoded image
-    if (enable_coco_od) {
-        app_coco_od_detect(album_ctx.canvas_buffer, album_ctx.canvas_width, album_ctx.canvas_height);
-    }
+    // Set canvas buffer with decoded image. (COCO object-detection
+    // overlay was removed along with the app_ai_detect module.)
     bsp_display_lock(0);
     lv_canvas_set_buffer(album_ctx.canvas, album_ctx.canvas_buffer, 
                          album_ctx.canvas_width, album_ctx.canvas_height, 
@@ -788,11 +783,6 @@ esp_err_t app_album_delete_current_image(void) {
     }
     
     return app_album_display_current_image();
-}
-
-esp_err_t app_album_enable_coco_od(bool enable) {
-    enable_coco_od = enable;
-    return ESP_OK;
 }
 
 // Initialize album functionality

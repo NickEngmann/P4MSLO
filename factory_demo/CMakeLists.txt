@@ -30,15 +30,10 @@ set(COMPONENTS main)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(factory_demo VERSION 1.0.0)
 
-# Suppress warnings only for esp-dl component
-idf_component_get_property(esp_dl_lib espressif__esp-dl COMPONENT_LIB)
-if(esp_dl_lib)
-    target_compile_options(${esp_dl_lib} PRIVATE
-        -Wno-unused-variable
-        -Wno-unused-but-set-variable
-    )
-    message(STATUS "Applied warning suppression to esp-dl component")
-endif()
+# esp-dl warning suppression was here — dropped along with the
+# coco_detect / human_face_detect / pedestrian_detect components
+# when AI detection was removed from this build. If AI ever comes
+# back, restore the target_compile_options block.
 
 # --- Selective -O2 on specific hot-path source files ------------------
 # Global optimization is -Og (set in sdkconfig.defaults). A global -O2

@@ -14,15 +14,6 @@ extern "C" {
 #define DEFAULT_HUE_PERCENT 2
 
 /**
- * @brief AI detection mode enumeration
- */
-typedef enum {
-    AI_DETECT_PEDESTRIAN = 0,  // Pedestrian detection
-    AI_DETECT_FACE,            // Face detection
-    AI_DETECT_MODE_MAX         // Maximum number of modes
-} ai_detect_mode_t;
-
-/**
  * @brief UI page enumeration
  */
 typedef enum {
@@ -33,7 +24,6 @@ typedef enum {
     UI_PAGE_ALBUM,          // Album page
     UI_PAGE_USB_DISK,       // USB disk page
     UI_PAGE_SETTINGS,       // Settings page
-    UI_PAGE_AI_DETECT,      // AI detect page
     UI_PAGE_GIFS,           // GIFs page
     UI_PAGE_MAX             // Page count
 } ui_page_t;
@@ -230,18 +220,6 @@ void ui_extra_popup_camera_sd_space_warning_end(void);
  * @brief Show camera SD space warning popup
  */
 void ui_extra_popup_camera_sd_space_warning(void);
-
-/**
- * @brief Get current AI detection mode (for UI display only)
- * @return Current AI detection mode
- */
-ai_detect_mode_t ui_extra_get_ai_detect_mode(void);
-
-/**
- * @brief Set AI detection mode (for UI display only)
- * @param mode New AI detection mode
- */
-void ui_extra_set_ai_detect_mode(ai_detect_mode_t mode);
 
 /**
  * @brief Get gyroscope enabled status

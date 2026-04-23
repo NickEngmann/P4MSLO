@@ -19,7 +19,6 @@
 #include "app_control.h"
 #include "app_video_stream.h"
 #include "app_storage.h"
-#include "app_ai_detect.h"
 #include "app_qma6100.h"
 #include "app_serial_cmd.h"
 #include "app_pimslo.h"
@@ -59,10 +58,6 @@ void app_main(void)
     i2c_master_bus_handle_t i2c_handle;
     ESP_ERROR_CHECK(bsp_i2c_init());
     bsp_get_i2c_bus_handle(&i2c_handle);
-
-    // AI detection models disabled at boot to save ~10MB PSRAM.
-    // Can be initialized on-demand via app_ai_detect_init() when needed.
-    // ESP_ERROR_CHECK(app_ai_detect_init());
 
     // Initialize the display
     ESP_LOGI(TAG, "Initialize the display");

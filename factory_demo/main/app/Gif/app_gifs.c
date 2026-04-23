@@ -2111,7 +2111,7 @@ cleanup_buffers:
     {
         ui_page_t p = ui_extra_get_current_page();
         if (p == UI_PAGE_CAMERA || p == UI_PAGE_INTERVAL_CAM ||
-            p == UI_PAGE_VIDEO_MODE || p == UI_PAGE_AI_DETECT) {
+            p == UI_PAGE_VIDEO_MODE) {
             app_video_stream_realloc_buffers();
         } else {
             ESP_LOGI(TAG, "Skipping viewfinder realloc — user is off a camera page");
@@ -2216,8 +2216,7 @@ static bool bg_camera_page_active(void)
     ui_page_t p = ui_extra_get_current_page();
     return (p == UI_PAGE_CAMERA ||
             p == UI_PAGE_INTERVAL_CAM ||
-            p == UI_PAGE_VIDEO_MODE ||
-            p == UI_PAGE_AI_DETECT);
+            p == UI_PAGE_VIDEO_MODE);
 }
 
 /* Pages where a ~7 MB bg encode can safely run. Camera-type pages are

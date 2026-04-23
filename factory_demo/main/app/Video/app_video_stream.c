@@ -25,8 +25,13 @@
 #include "app_video_photo.h"
 #include "app_pimslo.h"
 #include "spi_camera.h"
+/* AI detection (human face / pedestrian / COCO) removed. The buffer
+ * init/deinit/process calls in this file were retired along with the
+ * app_ai_detect module — they were allocating ~345 KB of PSRAM that
+ * was never used and caused a heap-corruption race in the capture
+ * pipeline. If AI detection ever returns, the call sites below are
+ * clearly marked. */
 #include "app_video_record.h"
-#include "app_ai_detect.h"
 #include "app_qma6100.h"
 
 /* Constants */
@@ -433,13 +438,6 @@ esp_err_t app_video_stream_init(i2c_master_bus_handle_t i2c_handle)
     }
     ESP_LOGI(TAG, "Allocated shared photo buffer: %lu bytes (%dx%d)", shared_photo_buf_size, SHARED_PHOTO_BUF_WIDTH, SHARED_PHOTO_BUF_HEIGHT);
 
-    // Initialize AI detection buffers
-    ret = app_ai_detection_init_buffers(data_cache_line_size);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize AI detection buffers: 0x%x", ret);
-        goto cleanup;
-    }
-
     // Allocate JPEG buffer
     jpeg_encode_memory_alloc_cfg_t rx_mem_cfg = {
         .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
@@ -533,9 +531,6 @@ cleanup:
             }
         }
         
-        // Clean up AI detection resources
-        app_ai_detection_deinit();
-        
         if (camera_buffer.video_cam_fd >= 0) {
             app_video_close(camera_buffer.video_cam_fd);
         }
@@ -584,9 +579,6 @@ void app_video_stream_free_buffers(void)
         free(camera_buffer.jpg_buf);
         camera_buffer.jpg_buf = NULL;
     }
-
-    /* Free AI detection buffers */
-    app_ai_detection_deinit();
 
     /* Mark the camera as NOT initialized — the caller will eventually
      * realloc buffers, and when that happens the frame callback's init
@@ -645,12 +637,6 @@ esp_err_t app_video_stream_realloc_buffers(void)
         }
     }
 
-    /* Reallocate AI detection buffers */
-    esp_err_t ret = app_ai_detection_init_buffers(data_cache_line_size);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to reallocate AI buffers (non-fatal): 0x%x", ret);
-    }
-
     buffers_freed = false;
     ESP_LOGI(TAG, "Camera buffers reallocated (PSRAM free: %zu)", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return ESP_OK;
@@ -699,19 +685,6 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to process frame: 0x%x", ret);
         return;
-    }
-
-    // Process frame for AI detection if we're on the AI detection page
-    if (camera_state.flags.is_initialized && ui_extra_get_current_page() == UI_PAGE_AI_DETECT) {
-        ret = app_ai_detection_process_frame(
-            camera_buffer.canvas_buf[camera_buf_index],
-            BSP_LCD_H_RES,
-            BSP_LCD_V_RES,
-            ui_extra_get_ai_detect_mode()
-        );
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "AI detection processing failed: 0x%x", ret);
-        }
     }
 
     // Swap RGB565 bytes

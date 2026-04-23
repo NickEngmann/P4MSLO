@@ -118,8 +118,7 @@ static void handle_knob_rotation(int direction, void (*action_camera)(void), voi
         ui_page_t p = ui_extra_get_current_page();
         if (p == UI_PAGE_CAMERA ||
             p == UI_PAGE_INTERVAL_CAM ||
-            p == UI_PAGE_VIDEO_MODE ||
-            p == UI_PAGE_AI_DETECT) {
+            p == UI_PAGE_VIDEO_MODE) {
             action_camera();
         } else if (p == UI_PAGE_MAIN || p == UI_PAGE_GIFS) {
             /* GIFS (ALBUM in the UI) uses the same up/down semantics as

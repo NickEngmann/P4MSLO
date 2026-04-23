@@ -14,6 +14,7 @@ cd "$(dirname "$0")"
 
 TESTS=(
     01_boot_and_liveness.py
+    10_album_open_from_main.py
     02_camera_capture_to_gif.py
     06_capture_timing.py
     08_capture_edge_cases.py

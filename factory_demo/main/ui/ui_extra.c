@@ -1506,7 +1506,22 @@ ui_page_t ui_extra_get_current_page(void)
  */
 ui_page_t ui_extra_get_choosed_page(void)
 {
-    const char * user_data = lv_obj_get_user_data(selected_btn);
+    /* selected_btn is ONLY assigned by the scroll-end callback. On a
+     * fresh boot, no scroll has happened yet so the pointer is still
+     * NULL (its static initializer). If the user presses select on the
+     * main menu before their first scroll lands, we previously
+     * dereferenced NULL and crashed. Fall back to the centered child
+     * at rest, then to CAMERA as the ultimate safe default. Same
+     * guard for user_data — it would be NULL if the object somehow
+     * doesn't have the label-name user_data attached yet. */
+    lv_obj_t *btn = selected_btn;
+    if (!btn && scroll_cont && lv_obj_get_child_cnt(scroll_cont) > 0) {
+        btn = lv_obj_get_child(scroll_cont, 0);
+    }
+    if (!btn) return UI_PAGE_CAMERA;
+
+    const char *user_data = lv_obj_get_user_data(btn);
+    if (!user_data) return UI_PAGE_CAMERA;
 
     for (int i = 0; page_map[i].name != NULL; i++) {
         if (strcmp(user_data, page_map[i].name) == 0) {

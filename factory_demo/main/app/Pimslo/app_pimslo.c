@@ -18,6 +18,7 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"  /* xTaskCreatePinnedToCoreWithCaps */
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include <stdio.h>
@@ -501,9 +502,24 @@ esp_err_t app_pimslo_init(void)
      * Runs concurrently with the GIF encoder task on the same core but
      * doesn't contend heavily since save is I/O-bound and encode is
      * CPU-bound. 6 KB stack: fwrite + its buffered I/O path needs more
-     * than 4 KB (observed stack-protect fault at 4 KB in prior attempt). */
-    ret = xTaskCreatePinnedToCore(
-        pimslo_save_task, "pimslo_save", 6144, NULL, 4, NULL, 1);
+     * than 4 KB (observed stack-protect fault at 4 KB in prior attempt).
+     *
+     * Stack placed in PSRAM (xTaskCreatePinnedToCoreWithCaps +
+     * MALLOC_CAP_SPIRAM). The P4-EYE has a very tight DMA-capable
+     * internal RAM budget — only ~32 KB reserved by esp_psram at boot,
+     * most of which goes to FreeRTOS TCBs / SPI master scratch / etc.
+     * When this task's 6 KB stack was in internal RAM (the default),
+     * the LCD SPI driver's per-flush priv TX scratch allocation
+     * started failing ("setup_dma_priv_buffer: Failed to allocate priv
+     * TX buffer"), because LVGL's canvas buffer sits in PSRAM and the
+     * LCD SPI device doesn't set SPI_TRANS_DMA_USE_PSRAM, so every
+     * flush demands a fresh DMA-internal copy. Symptom: button presses
+     * register internally but the screen stops refreshing. Moving the
+     * stack to PSRAM is safe here because this task never runs from
+     * an ISR context; all it does is fwrite + ESP_LOGI. */
+    ret = xTaskCreatePinnedToCoreWithCaps(
+        pimslo_save_task, "pimslo_save", 6144, NULL, 4, NULL, 1,
+        MALLOC_CAP_SPIRAM);
     if (ret != pdPASS) return ESP_FAIL;
 
     /* GIF encode queue task on Core 1 (CPU bound — dithering + LZW) */

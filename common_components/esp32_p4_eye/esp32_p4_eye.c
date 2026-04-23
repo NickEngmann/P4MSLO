@@ -545,6 +545,33 @@ static lv_disp_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
         .panel_handle = panel_handle,
         .buffer_size = cfg->buffer_size,
         .double_buffer = cfg->double_buffer,
+        /* trans_size: dedicated DMA-internal staging buffer (in pixels;
+         * RGB565 → 2 bytes each) that esp_lvgl_port_disp allocates ONCE
+         * at init and reuses forever. With this set, the LVGL PSRAM
+         * draw buffer is memcpy'd through the staging buffer on the
+         * LVGL task, and what ultimately reaches the LCD SPI master is
+         * an already-DMA-capable (internal-RAM) pointer. That bypasses
+         * the ESP-IDF SPI master's per-transaction "copy PSRAM source
+         * into freshly-allocated DMA-internal priv TX scratch" path
+         * (see setup_dma_priv_buffer in esp_driver_spi).
+         *
+         * Why this matters on this board: the P4-EYE's DMA-capable
+         * internal pool is tight (~32 KB reserved by esp_psram at
+         * boot, largest-free-block ~2 KB post-init). The per-flush
+         * priv-buffer allocation was failing ("setup_dma_priv_buffer:
+         * Failed to allocate priv TX buffer" → panel_st7789_draw_
+         * bitmap errors out, LVGL's draw_buf->flushing flag never
+         * gets cleared, lv_refr.c:709 busy-waits forever). Symptom:
+         * the screen stops refreshing after the first button press;
+         * LVGL state updates internally but the user sees a frozen UI.
+         *
+         * 960 pixels = 4 horizontal lines × 240 px = 1920 bytes. One
+         * small, permanent allocation from the DMA-internal pool at
+         * boot, reused for every flush — no fragmentation pressure,
+         * no recovery dependency. The extra in-LVGL memcpy is cheap
+         * (240×240×2 = 115 KB from PSRAM to internal RAM) next to the
+         * 16 MHz ST7789 pixel clock which is the real bottleneck. */
+        .trans_size = BSP_LCD_H_RES * 4,
         .hres = BSP_LCD_H_RES,
         .vres = BSP_LCD_V_RES,
         .monochrome = false,

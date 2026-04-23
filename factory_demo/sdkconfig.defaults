@@ -29,6 +29,12 @@ CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+# Don't watchdog IDLE1. The gif_bg background worker (app_gifs.c) runs
+# CPU-bound LZW frame decode on Core 1 that can legitimately hold the
+# core for > 5 s on a single frame. Core 0 still has its idle watchdog
+# (CHECK_IDLE_TASK_CPU0 defaults to y) so we still catch stuck LVGL /
+# video-stream tasks.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 CONFIG_SPI_FLASH_SUPPORT_GD_CHIP=n
 # COCO / esp-painter Kconfig entries were here — dropped when the AI
 # detection components (coco_detect / human_face_detect /

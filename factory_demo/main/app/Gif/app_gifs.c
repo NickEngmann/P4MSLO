@@ -150,6 +150,17 @@ static gif_cache_slot_t g_gif_cache[MAX_CACHED_GIFS];
 static volatile bool s_gallery_open = false;
 static volatile bool s_bg_abort_current = false;
 
+/* Timestamp (ms) of the last gallery-nav call (app_gifs_next / _prev).
+ * bg_worker uses this to throttle: a new ~50-second PIMSLO encode must
+ * not start while the user is actively scrubbing through entries,
+ * otherwise the encode's 7 MB PSRAM + JPEG-decoder + SD-I/O load
+ * stalls gallery playback for ~50 s and knob nav feels locked up.
+ * After NAV_QUIET_MS of no nav, bg_worker is free to start new work.
+ * 15 s is long enough to comfortably cover a human scrubbing through
+ * 5-10 entries — anyone actively browsing won't trip bg work. */
+static volatile uint32_t s_last_nav_ms = 0;
+#define NAV_QUIET_MS 15000
+
 typedef struct {
     lv_obj_t *canvas;
     uint16_t *canvas_buffer;       /* 240x240 for display (decode target) */
@@ -1408,6 +1419,8 @@ int app_gifs_get_current_index(void) { return s_ctx.current_index; }
 esp_err_t app_gifs_next(void)
 {
     if (s_ctx.count == 0) return ESP_FAIL;
+    s_last_nav_ms = esp_log_timestamp();
+    s_bg_abort_current = true;    /* nudge bg_worker to pack it up */
     app_gifs_stop();
     s_ctx.current_index = (s_ctx.current_index + 1) % s_ctx.count;
     /* No display_gif_info() here — the UI auto-calls app_gifs_play_current()
@@ -1420,6 +1433,8 @@ esp_err_t app_gifs_next(void)
 esp_err_t app_gifs_prev(void)
 {
     if (s_ctx.count == 0) return ESP_FAIL;
+    s_last_nav_ms = esp_log_timestamp();
+    s_bg_abort_current = true;    /* nudge bg_worker to pack it up */
     app_gifs_stop();
     s_ctx.current_index = (s_ctx.current_index + s_ctx.count - 1) % s_ctx.count;
     return ESP_OK;
@@ -1853,6 +1868,16 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     int delay_cs = (frame_delay_ms > 0 ? frame_delay_ms : 150) / 10;
     float strength = (parallax > 0.0f && parallax <= 1.0f) ? parallax : 0.05f;
 
+    /* Fast-path abort: the caller (bg_worker) may have flipped
+     * s_bg_abort_current between deciding to start us and us actually
+     * running. Honor that before we claim is_encoding + the 7 MB
+     * PSRAM scaled buffer. Gallery knob nav sets this flag (see
+     * app_gifs_next / _prev) so new encodes don't fire into the face
+     * of an actively-navigating user. */
+    if (s_bg_abort_current) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     s_ctx.is_encoding = true;
 
     /* Read JPEGs from the capture directory — support 2-4 cameras */
@@ -1867,6 +1892,17 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     int src_pos[MAX_PIMSLO_CAMS] = {0};
 
     for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {
+        /* Per-JPEG abort check: the user can flip s_bg_abort_current
+         * at any time (gallery nav, new capture arrived, etc). Stop
+         * here before we burn 5 more seconds on SD I/O + PSRAM alloc
+         * for the next pos.jpg. */
+        if (s_bg_abort_current) {
+            ret = ESP_ERR_INVALID_STATE;
+            ESP_LOGI(TAG, "Encode aborted mid-load (%d/%d cams loaded)",
+                     num_cams, MAX_PIMSLO_CAMS);
+            goto cleanup;
+        }
+
         char path[80];
         snprintf(path, sizeof(path), "%s/pos%d.jpg", capture_dir, i + 1);
         FILE *f = fopen(path, "rb");
@@ -1886,6 +1922,16 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         src_pos[num_cams] = i + 1;      /* 1-indexed original position */
         ESP_LOGI(TAG, "Loaded %s: %zu bytes", path, jpeg_size[num_cams]);
         num_cams++;
+    }
+
+    /* Second gate: after all JPEGs are loaded, before we claim the
+     * HW JPEG decoder and allocate the 7 MB scaled_buf. Nav that
+     * happened during the SD reads gets its grace period here. */
+    if (s_bg_abort_current) {
+        ret = ESP_ERR_INVALID_STATE;
+        ESP_LOGI(TAG, "Encode aborted pre-palette (all JPEGs loaded, %d cams)",
+                 num_cams);
+        goto cleanup;
     }
 
     if (num_cams < 2) {
@@ -2198,6 +2244,14 @@ void app_gifs_set_gallery_open(bool open)
     if (open) {
         s_bg_abort_current = true;
         s_gallery_ever_opened = true;
+        /* Treat the open event itself as a nav. Without this, bg_worker
+         * sees the gallery as "open but idle" the instant the user
+         * lands on it (no nav yet) and happily starts a ~50 s PIMSLO
+         * encode before the user can press a single button. Their
+         * first knob press then has to wait out the whole encode.
+         * Pretending the user just nav'd gives them NAV_QUIET_MS to
+         * actually start nav'ing before heavy bg work kicks in. */
+        s_last_nav_ms = esp_log_timestamp();
     }
 }
 
@@ -2229,8 +2283,16 @@ static bool bg_camera_page_active(void)
 static bool bg_encode_safe_page(void)
 {
     ui_page_t p = ui_extra_get_current_page();
-    return (p == UI_PAGE_GIFS ||
-            p == UI_PAGE_ALBUM ||
+    /* UI_PAGE_GIFS intentionally omitted. An in-gallery encode takes
+     * ~50 s and pins the JPEG decoder + 7 MB of PSRAM + SD I/O, which
+     * stalls every gallery nav the user tries during the window
+     * (regression: knob presses feel dead for tens of seconds). Users
+     * who want stale captures to catch up only need to leave the
+     * gallery — any of the other idle pages (ALBUM / USB_DISK /
+     * SETTINGS) triggers the bg encoder. Pre-rendering of .p4ms
+     * previews, which is fast (~10 s per GIF, interruptible), still
+     * runs unconditionally — that's a different bg path. */
+    return (p == UI_PAGE_ALBUM ||
             p == UI_PAGE_USB_DISK ||
             p == UI_PAGE_SETTINGS);
 }
@@ -2251,6 +2313,16 @@ static bool bg_should_yield(void)
     if (app_pimslo_is_capturing()) return true;
     if (app_pimslo_get_queue_depth() > 0) return true;
     if (bg_camera_page_active()) return true;
+
+    /* Recently-navigating guard: if the user just pressed up/down on
+     * the gallery (within NAV_QUIET_MS), don't pick up new background
+     * work yet. A GIF encode holds the JPEG decoder + 7 MB of PSRAM
+     * for ~50 s; starting one while the user is still scrubbing
+     * through entries locks gallery playback completely. The in-flight
+     * bg render (if any) already got a s_bg_abort_current nudge from
+     * app_gifs_next/_prev so it'll unwind quickly on its own. */
+    if (s_last_nav_ms != 0 &&
+        (esp_log_timestamp() - s_last_nav_ms) < NAV_QUIET_MS) return true;
 
     size_t contig = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     if (contig < 5 * 1024 * 1024) return true;
@@ -2390,6 +2462,26 @@ static esp_err_t bg_render_p4ms_from_gif(const char *gif_path)
 
     s_bg_abort_current = false;
     while (1) {
+        /* Pacing delay between frames. Two jobs:
+         *   1. Give IDLE1 on Core 1 actual run time (otherwise the
+         *      task-watchdog fires every 5 s complaining about IDLE1
+         *      being starved — bg_worker at prio 2 is the only
+         *      non-idle task on Core 1 and LZW frame decode is a tight
+         *      CPU loop that never blocks on I/O).
+         *   2. Leave breathing room for foreground gallery nav.
+         *      `ui_extra_btn_down` on the gifs page calls
+         *      `app_gifs_play_current`, which opens the GIF decoder
+         *      inside the LVGL display lock. If bg_worker is in the
+         *      middle of its own frame decode (~700 ms for a large
+         *      GIF), the foreground's check-for-abort→see-it-set path
+         *      takes up to one full frame to reach the yield point,
+         *      and knob nav feels sluggish on the test rig.
+         * 100 ms costs us almost nothing — pre-rendering a full GIF
+         * already takes 5-10 s of decode work, and the user won't
+         * notice the extra 700 ms total over a whole render — but it
+         * halves the worst-case foreground latency. */
+        vTaskDelay(pdMS_TO_TICKS(100));
+
         /* Preempt if the foreground claimed a decoder or PIMSLO started
          * capturing/encoding. Does NOT check PSRAM threshold — our own
          * decoder is part of what's using it. */

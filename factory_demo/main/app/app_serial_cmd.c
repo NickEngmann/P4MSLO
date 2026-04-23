@@ -119,9 +119,12 @@ static void cmd_gpio_read(const char *arg)
 static void cmd_status(void)
 {
     ui_page_t page = ui_extra_get_current_page();
+    /* Kept in sync with ui_page_t in ui_extra.h. UI_PAGE_AI_DETECT was
+     * removed in the AI-stripping commit so there is no "AI_DETECT"
+     * entry — index 7 is GIFS directly. */
     const char *page_names[] = {
         "MAIN", "CAMERA", "INTERVAL_CAM", "VIDEO_MODE",
-        "ALBUM", "USB_DISK", "SETTINGS", "AI_DETECT", "GIFS"
+        "ALBUM", "USB_DISK", "SETTINGS", "GIFS"
     };
     const char *page_name = (page < UI_PAGE_MAX) ? page_names[page] : "UNKNOWN";
 
@@ -720,6 +723,13 @@ static void dispatch_command(char *line)
         cmd_respond("ok cam_status");
     } else if (strcmp(line, "status") == 0) {
         cmd_status();
+    } else if (strcmp(line, "heap_caps") == 0) {
+        size_t dma_int_free  = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        size_t dma_int_large = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        size_t int_free      = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        size_t int_large     = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        cmd_respond("heap_caps dma_int=%zu (largest=%zu) int=%zu (largest=%zu)",
+                    dma_int_free, dma_int_large, int_free, int_large);
     } else if (strcmp(line, "menu_goto") == 0) {
         cmd_menu_goto(arg ? arg : "main");
     } else if (strcmp(line, "btn_up") == 0) {

@@ -286,15 +286,33 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
 
     uint32_t t_start = esp_log_timestamp();
 
-    WORD_ALIGNED_ATTR uint8_t *chunk_tx = heap_caps_calloc(1, SPI_CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    WORD_ALIGNED_ATTR uint8_t *chunk_rx = heap_caps_malloc(SPI_CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-
-    if (!chunk_tx || !chunk_rx) {
-        ESP_LOGE(TAG, "OOM for SPI chunk buffers");
-        free(raw);
-        if (chunk_tx) free(chunk_tx);
-        if (chunk_rx) free(chunk_rx);
-        return ESP_ERR_NO_MEM;
+    /* Receive-only transaction: tx_buffer=NULL makes the SPI master
+     * drive zeros on MOSI during each chunk. Previously we allocated
+     * a zero-filled 4 KB chunk_tx to pass along with chunk_rx; that
+     * doubled our DMA-capable internal RAM requirement (2 × 4 KB) and
+     * was the direct cause of "OOM for SPI chunk buffers" on this
+     * board — the DMA-internal pool's largest free block post-boot
+     * is ~2-4 KB after the LCD trans_size buffer is claimed. The
+     * slave ignores MOSI during the DATA phase anyway; we only care
+     * about the JPEG bytes it puts on MISO.
+     *
+     * Single 4 KB rx buffer, allocated ONCE at first use and held
+     * forever. No per-call heap churn, so runtime fragmentation
+     * never re-exposes the OOM. Serialized by design: all callers
+     * run on the pimslo capture task or the serial-command task,
+     * never both concurrently. */
+    static uint8_t *chunk_rx = NULL;
+    if (!chunk_rx) {
+        chunk_rx = heap_caps_malloc(SPI_CHUNK_SIZE,
+                                    MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!chunk_rx) {
+            ESP_LOGE(TAG, "OOM for SPI chunk rx buffer (permanent %d B, "
+                          "largest DMA-internal=%zu)",
+                     SPI_CHUNK_SIZE,
+                     heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+            free(raw);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     size_t offset = 0;
@@ -307,7 +325,7 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
     while (remaining > 0) {
         size_t chunk = remaining > SPI_CHUNK_SIZE ? SPI_CHUNK_SIZE : remaining;
 
-        ret = spi_xfer_cam(camera_idx, chunk_tx, chunk_rx, chunk);
+        ret = spi_xfer_cam(camera_idx, NULL, chunk_rx, chunk);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "SPI read failed at offset %zu", offset);
             break;
@@ -318,8 +336,7 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
         remaining -= chunk;
     }
 
-    free(chunk_tx);
-    free(chunk_rx);
+    /* chunk_rx is kept live — see the one-time alloc above. */
 
     uint32_t elapsed = esp_log_timestamp() - t_start;
 

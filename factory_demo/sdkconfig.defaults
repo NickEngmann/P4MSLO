@@ -16,7 +16,15 @@ CONFIG_SPIRAM_MEMTEST=n
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=5584
-CONFIG_ESP_TIMER_TASK_STACK_SIZE=4584
+# ESP_TIMER_TASK_STACK_SIZE — bumped 4584 → 8192. The default 4.5 KB
+# overflows when an ESP-IDF log from an esp_timer callback fires with
+# a large format string: newlib's _svfprintf_r / __ssprint_r puts a
+# ~1.5 KB printf buffer on the stack. Captured fault on the user's
+# P4X: `Guru Meditation ... Stack protection fault` in task `esp_timer`
+# with SP=0x4ff89b30 sitting 4 bytes below the 4584-byte bounds, MEPC
+# inside __ssprint_r at vfprintf.c:268. 8 KB gives plenty of headroom
+# for any ESP-IDF / managed-component timer callback to emit logs.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=8192
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y

@@ -598,11 +598,44 @@ esp_err_t bsp_display_enter_sleep(void)
     return ESP_OK;
 }
 
+/* LVGL busy-waits on `draw_buf->flushing` at lv_refr.c:709 whenever a
+ * previous flush hasn't completed yet. Under heavy gallery canvas
+ * updates we've seen this stay stuck at 1 for minutes — the
+ * on_color_trans_done ISR callback occasionally appears to be coalesced
+ * or missed, and the task_wdt fires on taskLVGL. That manifests to the
+ * user as "album crashes when opened".
+ *
+ * Defensive workaround: install a `wait_cb` that pings the task
+ * watchdog and yields the CPU while the busy-wait spins. It doesn't
+ * fix the underlying missed callback, but it keeps the task watchdog
+ * happy and lets FreeRTOS schedule the SPI completion callback (which
+ * runs on a different task path in some builds) so the deadlock
+ * resolves instead of reboot-looping. */
+static void bsp_display_lvgl_wait_cb(lv_disp_drv_t *drv)
+{
+    (void)drv;
+    /* Delay one tick (1 ms with CONFIG_FREERTOS_HZ=1000). taskYIELD
+     * only releases to same-priority peers; vTaskDelay unconditionally
+     * lets lower-priority tasks (including IDLE0) run, which resets
+     * the CPU idle watchdog and avoids the task_wdt flood the user
+     * sees as "album crashes" when the SPI flush-ready callback gets
+     * delayed. 1 ms also bounds the busy-wait polling rate at 1 kHz —
+     * vs. millions of polls/sec under the raw busy-loop. */
+    vTaskDelay(1);
+}
+
 lv_disp_t *bsp_display_start_with_config(const bsp_display_cfg_t *cfg)
 {
     assert(cfg != NULL);
     BSP_ERROR_CHECK_RETURN_NULL(lvgl_port_init(&cfg->lvgl_port_cfg));
     BSP_NULL_CHECK(disp = bsp_display_lcd_init(cfg), NULL);
+
+    /* Install the busy-wait yielder. Must be done AFTER lvgl_port_add_disp
+     * has set up the driver — we're just filling in a field LVGL checks
+     * from inside refr_area_part's flushing-wait loop. */
+    if (disp && disp->driver) {
+        disp->driver->wait_cb = bsp_display_lvgl_wait_cb;
+    }
 
     return disp;
 }

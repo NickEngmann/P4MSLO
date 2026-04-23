@@ -55,10 +55,14 @@ endif()
 # pumping them to -O2 is safe. tjpgd decode drops from ~2.2 s → ~1.7 s
 # per 2560x1920 frame under just this change.
 set(P4MSLO_O2_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_tjpgd.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_encoder.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_decoder.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_tjpgd.c      # JPEG decode
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_encoder.c    # LZW encode
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_decoder.c    # LZW decode
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_lzw.c        # LZW core
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_quantize.c   # palette quant
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Spi/spi_camera.c     # SPI RX polling
 )
 set_source_files_properties(${P4MSLO_O2_SOURCES}
     PROPERTIES COMPILE_OPTIONS "-O2")
-message(STATUS "Selective -O2 on 3 hot-path GIF/JPEG source files")
+list(LENGTH P4MSLO_O2_SOURCES n_o2)
+message(STATUS "Selective -O2 on ${n_o2} hot-path source files")

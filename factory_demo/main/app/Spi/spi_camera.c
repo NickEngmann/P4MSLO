@@ -29,7 +29,14 @@ static const char *TAG = "spi_cam";
 #define SPI_CHUNK_SIZE    4096
 
 /* Maximum retries per camera for corrupted transfers */
-#define SPI_MAX_RETRIES   4
+/* Was 4. Lowered to 1 because observed retry behaviour on this rig is
+ * binary: if cams 1-2 respond on the first attempt, they almost always
+ * do, and cams 3-4 that miss the first trigger keep missing later
+ * ones too (S3-side timing issue). More retries mostly just multiply
+ * the wait — 1 retry + initial = 2 attempts keeps trigger-purgatory
+ * bounded (~12s worst case instead of ~30s) while still recovering
+ * transient single-camera misses. */
+#define SPI_MAX_RETRIES   1
 
 /* Slave prepends this preamble to every JPEG stream so the master can skip
  * any stale IDLE-header bytes that leaked in before the slave processed

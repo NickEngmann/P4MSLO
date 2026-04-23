@@ -607,35 +607,42 @@ esp_err_t app_video_stream_realloc_buffers(void)
 
     ESP_LOGI(TAG, "Reallocating camera buffers...");
 
-    /* Reallocate scaled camera buffer */
-    camera_buffer.scaled_camera_buf = heap_caps_aligned_calloc(
-        data_cache_line_size, 1,
-        PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1080P * 2,
-        MALLOC_CAP_SPIRAM);
+    /* Reallocate scaled camera buffer (skip if a previous partial
+     * realloc already owns it — recoverable re-entry). */
     if (!camera_buffer.scaled_camera_buf) {
-        ESP_LOGE(TAG, "Failed to reallocate scaled camera buffer");
-        return ESP_ERR_NO_MEM;
+        camera_buffer.scaled_camera_buf = heap_caps_aligned_calloc(
+            data_cache_line_size, 1,
+            PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1080P * 2,
+            MALLOC_CAP_SPIRAM);
+        if (!camera_buffer.scaled_camera_buf) {
+            ESP_LOGW(TAG, "scaled_camera_buf realloc failed (PSRAM fragmented) — will retry");
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     /* Reallocate shared photo buffer */
-    uint32_t shared_size = SHARED_PHOTO_BUF_WIDTH * SHARED_PHOTO_BUF_HEIGHT * 2;
-    camera_buffer.shared_photo_buf = heap_caps_aligned_calloc(
-        data_cache_line_size, 1, shared_size, MALLOC_CAP_SPIRAM);
     if (!camera_buffer.shared_photo_buf) {
-        ESP_LOGE(TAG, "Failed to reallocate shared photo buffer");
-        return ESP_ERR_NO_MEM;
+        uint32_t shared_size = SHARED_PHOTO_BUF_WIDTH * SHARED_PHOTO_BUF_HEIGHT * 2;
+        camera_buffer.shared_photo_buf = heap_caps_aligned_calloc(
+            data_cache_line_size, 1, shared_size, MALLOC_CAP_SPIRAM);
+        if (!camera_buffer.shared_photo_buf) {
+            ESP_LOGW(TAG, "shared_photo_buf realloc failed — will retry");
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     /* Reallocate JPEG encode buffer */
-    jpeg_encode_memory_alloc_cfg_t rx_mem_cfg = {
-        .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
-    };
-    camera_buffer.jpg_buf = (uint8_t*)jpeg_alloc_encoder_mem(
-        PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1088P * 2 / JPEG_COMPRESSION_RATIO,
-        &rx_mem_cfg, &camera_buffer.rx_buffer_size);
     if (!camera_buffer.jpg_buf) {
-        ESP_LOGE(TAG, "Failed to reallocate JPEG buffer");
-        return ESP_ERR_NO_MEM;
+        jpeg_encode_memory_alloc_cfg_t rx_mem_cfg = {
+            .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
+        };
+        camera_buffer.jpg_buf = (uint8_t*)jpeg_alloc_encoder_mem(
+            PHOTO_WIDTH_1080P * PHOTO_HEIGHT_1088P * 2 / JPEG_COMPRESSION_RATIO,
+            &rx_mem_cfg, &camera_buffer.rx_buffer_size);
+        if (!camera_buffer.jpg_buf) {
+            ESP_LOGW(TAG, "jpg_buf realloc failed — will retry");
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     /* Reallocate AI detection buffers */

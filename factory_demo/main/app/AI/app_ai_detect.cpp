@@ -119,7 +119,17 @@ esp_err_t app_ai_detect_init(void)
 esp_err_t app_ai_detection_init_buffers(size_t cache_line_size)
 {
     esp_err_t ret = ESP_OK;
-    
+
+    /* Idempotent: if realloc is called twice without a free in
+     * between (pimslo capture task + save task both try to realloc
+     * after a capture), we would otherwise overwrite ai_buffers[]
+     * pointers with fresh allocations and leak the old ones — which
+     * corrupts the TLSF bookkeeping and eventually crashes on the
+     * next free. Bail out cleanly instead. */
+    if (ai_buffers.ai_buffers_initialized) {
+        return ESP_OK;
+    }
+
     // Calculate buffer size with alignment
     ai_buffers.ai_buffer_size = ALIGN_UP(BSP_LCD_H_RES * BSP_LCD_V_RES * 2, cache_line_size);
     

@@ -163,12 +163,10 @@ static void pimslo_capture_task(void *param)
          * will send a fresh trigger and recover normally. */
         spi_camera_init();
 
-        /* Save the P4 photo we just took as the gallery preview for this
-         * capture number. Uses this task's 8 KB stack for the file-copy
-         * buffer. (On the camera path, the P4 file is already on SD.
-         * On the serial-off-camera path there's no P4 photo, so this
-         * save is a no-op.) */
-        app_pimslo_save_preview_from_latest_photo(num);
+        /* NB: the preview-JPEG copy (P4 latest photo → P4M<num>.jpg) is
+         * handled later on the save task. Keeping it out of this task
+         * shaves ~2 s of SD-I/O off the time the user's "saving"
+         * overlay stays up. */
 
         /* Create capture directory */
         char dir_path[64];
@@ -210,8 +208,8 @@ static void pimslo_capture_task(void *param)
          * normal. */
         esp_err_t ret = spi_camera_capture_all_after_trigger(jpeg_bufs, jpeg_sizes, &capture_ms);
 
-        /* Count usable SPI results up front — we don't want to save
-         * anything if we can't build at least a 2-frame PIMSLO. */
+        /* Count usable SPI results up front — we don't want to enqueue a
+         * save job if we can't build at least a 2-frame PIMSLO. */
         int usable = 0;
         for (int i = 0; i < 4; i++) {
             if (jpeg_bufs[i] && jpeg_sizes[i] > 0) usable++;
@@ -219,9 +217,13 @@ static void pimslo_capture_task(void *param)
 
         int saved = 0;
         if (usable >= 2) {
-            /* Save JPEGs to the capture directory. Validate JPEG SOI/EOI
-             * markers before committing — truncated or corrupted data
-             * would otherwise break the encoder at a much later stage. */
+            /* Save pos*.jpg inline. Decoupling saves to a separate task
+             * was tried and introduced a heap-corruption race (ai_buffer
+             * pointers getting trashed between the save task freeing its
+             * buffers and this task's realloc). Back to inline: saves
+             * take ~10-15 s on this rig's SD card + user's 900 KB JPEGs,
+             * during which the overlay stays up but the sequence is
+             * crash-safe. */
             for (int i = 0; i < 4; i++) {
                 if (!jpeg_bufs[i] || jpeg_sizes[i] < 4) {
                     if (jpeg_bufs[i]) free(jpeg_bufs[i]);
@@ -247,33 +249,32 @@ static void pimslo_capture_task(void *param)
                 }
                 free(jpeg_bufs[i]);
             }
+
+            /* Save the P4 photo as the gallery preview now that it's
+             * flushed to SD. Uses this task's 8 KB stack. */
+            app_pimslo_save_preview_from_latest_photo(num);
         } else {
-            /* Too few cameras responded — don't save anything. Release
-             * whatever SPI buffers were produced. */
             for (int i = 0; i < 4; i++) {
                 if (jpeg_bufs[i]) free(jpeg_bufs[i]);
             }
         }
 
-        ESP_LOGI(TAG, "Capture %03d: %d/4 cameras in %lums (usable=%d)",
+        ESP_LOGI(TAG, "Capture %03d: %d/4 cameras saved in %lums total (usable=%d)",
                  num, saved, (unsigned long)capture_ms, usable);
 
-        /* Enqueue GIF encode job if we got enough cameras. The GIF encoder
-         * runs later — it defers until the user navigates off the camera
-         * page so the viewfinder stays live between captures. */
+        /* Enqueue GIF encode job if we have enough cameras. Encoder
+         * defers until the user leaves the camera page. */
         if (saved >= 2) {
             pimslo_gif_job_t job = { .capture_num = num };
             if (xQueueSend(s_gif_queue, &job, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "GIF queue full — dropping P4M%04d", num);
             } else {
-                ESP_LOGI(TAG, "Queued GIF encode for P4M%04d (queue: %d, deferred until off-camera)",
+                ESP_LOGI(TAG, "Queued GIF encode for P4M%04d (queue: %d)",
                          num, (int)uxQueueMessagesWaiting(s_gif_queue));
             }
         } else {
-            /* Failed capture — tear down everything we wrote so the
-             * gallery doesn't show a permanently-"PROCESSING" orphan. */
-            ESP_LOGW(TAG, "Capture %03d: only %d cameras — skipping GIF + cleaning up", num, saved);
-            /* Remove preview JPEG and any pos*.jpg that did get written. */
+            /* Failed capture — clean up orphan files */
+            ESP_LOGW(TAG, "Capture %03d: only %d cameras — cleaning up", num, saved);
             char prev[80];
             snprintf(prev, sizeof(prev), "%s/P4M%04u.jpg", PIMSLO_PREVIEW_DIR, num);
             unlink(prev);
@@ -285,10 +286,8 @@ static void pimslo_capture_task(void *param)
             rmdir(dir_path);
         }
 
-        /* Always restore viewfinder now. The user should be able to take
-         * another photo within ~3-4 s. The encoder task, when it eventually
-         * runs, will free+realloc the viewfinder on its own — but only
-         * once the user has left a camera page, so the freeze is invisible. */
+        /* All SPI buffers freed above — PSRAM is defragged and the
+         * viewfinder + photo buffers can come back. */
         app_video_stream_realloc_buffers();
 
         s_capturing = false;

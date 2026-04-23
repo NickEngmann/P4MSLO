@@ -34,6 +34,23 @@
 
 static const char *TAG = "app_gifs";
 
+/* Compile-time switch for per-step timing in the gallery play_current /
+ * show_jpeg hot paths. Off by default (zero overhead — the compiler
+ * elides the esp_log_timestamp() calls and the ESP_LOGI lines). Flip
+ * to 1 when investigating a slow-load regression. Don't confuse with
+ * ESP_LOG_DEBUG — that gates the log line only; the timestamp calls
+ * still execute, which would taint the measurements. */
+#ifndef APP_GIFS_TIMING
+#define APP_GIFS_TIMING 0
+#endif
+#if APP_GIFS_TIMING
+#define TIMING_MARK(name)   uint32_t name = esp_log_timestamp()
+#define TIMING_LOG(...)     ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define TIMING_MARK(name)   ((void)0)
+#define TIMING_LOG(...)     ((void)0)
+#endif
+
 #define MAX_PATH_LEN  512
 #define MAX_GIF_FILES 64
 #define MAX_FRAME_CACHE 12   /* unique frames we'll cache per GIF — plenty
@@ -1542,9 +1559,22 @@ esp_err_t app_gifs_delete_current(void)
 
 /* Decode a full-size JPEG into the 240×240 canvas buffer via tjpgd.
  * Used for entries that don't yet have a GIF (the PIMSLO encode is still
- * running or was interrupted). Static image, no animation. */
+ * running or was interrupted). Static image, no animation.
+ *
+ * tjpgd reads the source JPEG via `jpeg_in_cb` in many SMALL chunks
+ * (marker scans are typically 2-8 bytes, entropy-coded data in ~512 B
+ * bursts). Serving those directly from fread() incurs a full FATFS
+ * round-trip per call — caught a 14.9 s decode for a 200 KB 1920×1080
+ * preview JPEG on this board because of that. The fix is to slurp the
+ * whole JPEG into PSRAM up front and have the callback just memcpy
+ * from the in-memory buffer. Mirrors what the PIMSLO encoder already
+ * does (`app_gifs_encode_pimslo_from_dir` heap_caps_mallocs each
+ * pos*.jpg). Observed post-fix decode: ~300 ms for the same 1920x1080
+ * preview. */
 typedef struct {
-    FILE *fp;
+    const uint8_t *src;   /* full JPEG bytes, memory-resident */
+    size_t src_len;
+    size_t src_pos;
     uint16_t *canvas;
     int canvas_w, canvas_h;
     int src_w, src_h;  /* learned from the JPEG header via jd_prepare */
@@ -1553,8 +1583,11 @@ typedef struct {
 static size_t jpeg_in_cb(JDEC *jd, uint8_t *buf, size_t len)
 {
     jpeg_ctx_t *c = (jpeg_ctx_t *)jd->device;
-    if (buf) return fread(buf, 1, len, c->fp);
-    return (size_t)(fseek(c->fp, (long)len, SEEK_CUR) == 0 ? len : 0);
+    size_t avail = (c->src_pos < c->src_len) ? (c->src_len - c->src_pos) : 0;
+    if (len > avail) len = avail;
+    if (buf) memcpy(buf, c->src + c->src_pos, len);
+    c->src_pos += len;
+    return len;
 }
 
 static int jpeg_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
@@ -1564,28 +1597,57 @@ static int jpeg_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
     int bw = rect->right - rect->left + 1;
     int bh = rect->bottom - rect->top + 1;
 
-    /* Nearest-neighbor downscale. Emit every source pixel into its
-     * out_x/out_y slot (last-write-wins). The earlier "skip unless this
-     * is the first src mapping to out" short-circuit was wrong for
-     * non-integer scale ratios — it missed output cells entirely, which
-     * showed as vertical dark-blue bars on the JPEG preview. */
-    for (int by = 0; by < bh; by++) {
-        int src_y = rect->top + by;
-        int out_y = (src_y * c->canvas_h) / c->src_h;
-        if (out_y < 0 || out_y >= c->canvas_h) continue;
+    /* Nearest-neighbor downscale. Source-row scan: only step through
+     * the rows we actually need. For each output row in this MCU,
+     * compute the nearest source row once, then for each output column
+     * that falls inside the MCU pluck that one source pixel. This is
+     * O(canvas_cells_hit) instead of O(MCU_bw * MCU_bh), which at
+     * 1920×1080 source → 240×240 canvas is 64x fewer iterations.
+     *
+     * The earlier per-source-pixel loop did the divides in the inner
+     * loop (bw × bh times per MCU), and with scale=0 tjpgd emits every
+     * MCU at native resolution — ~8100 MCUs × 256 pixels × 2 divides =
+     * over 4 million integer divides per frame on a ~1920×1080 JPEG.
+     * On this Core-0 task that was clocking 14-20 s per preview. */
+    const int src_y_start = rect->top;
+    const int src_y_end   = rect->bottom;         /* inclusive */
+    const int src_x_start = rect->left;
+    const int src_x_end   = rect->right;          /* inclusive */
+    const int sw = c->src_w;
+    const int sh = c->src_h;
+    const int cw = c->canvas_w;
+    const int ch = c->canvas_h;
 
-        for (int bx = 0; bx < bw; bx++) {
-            int src_x = rect->left + bx;
-            int out_x = (src_x * c->canvas_w) / c->src_w;
-            if (out_x < 0 || out_x >= c->canvas_w) continue;
+    /* Output rows whose nearest source falls inside this MCU:
+     *   out_y s.t.  src_y_start <= out_y * sh / ch <= src_y_end
+     * i.e. out_y in [ceil(src_y_start*ch/sh), floor(src_y_end*ch/sh)]. */
+    int out_y_lo = (src_y_start * ch + sh - 1) / sh;
+    int out_y_hi = (src_y_end   * ch) / sh;
+    if (out_y_lo < 0) out_y_lo = 0;
+    if (out_y_hi >= ch) out_y_hi = ch - 1;
 
-            const uint8_t *px = &src[(by * bw + bx) * 3];
+    int out_x_lo = (src_x_start * cw + sw - 1) / sw;
+    int out_x_hi = (src_x_end   * cw) / sw;
+    if (out_x_lo < 0) out_x_lo = 0;
+    if (out_x_hi >= cw) out_x_hi = cw - 1;
+
+    for (int out_y = out_y_lo; out_y <= out_y_hi; out_y++) {
+        int src_y = (out_y * sh) / ch;
+        int by = src_y - src_y_start;
+        if (by < 0 || by >= bh) continue;
+        uint16_t *dst_row = &c->canvas[out_y * cw];
+        const uint8_t *src_row = &src[by * bw * 3];
+        for (int out_x = out_x_lo; out_x <= out_x_hi; out_x++) {
+            int src_x = (out_x * sw) / cw;
+            int bx = src_x - src_x_start;
+            if (bx < 0 || bx >= bw) continue;
+            const uint8_t *px = &src_row[bx * 3];
             /* Byte-swapped RGB565 for LV_COLOR_16_SWAP (matches the GIF
              * decoder output format so the canvas renders identically). */
             uint16_t pxl = ((px[0] >> 3) << 11)
                          | ((px[1] >> 2) << 5)
                          |  (px[2] >> 3);
-            c->canvas[out_y * c->canvas_w + out_x] = (pxl >> 8) | (pxl << 8);
+            dst_row[out_x] = (pxl >> 8) | (pxl << 8);
         }
     }
     return 1;
@@ -1596,32 +1658,81 @@ static esp_err_t show_jpeg(const char *path)
     FILE *fp = fopen(path, "rb");
     if (!fp) return ESP_FAIL;
 
+    /* Slurp whole file into PSRAM before handing to tjpgd. tjpgd's
+     * in_cb pattern is extremely fread-unfriendly (thousands of small
+     * marker / MCU reads), and an SD-backed fread per call dwarfs the
+     * actual decode work. See comment on jpeg_ctx_t for the diagnosis. */
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return ESP_FAIL; }
+
+    uint8_t *jpeg_buf = heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM);
+    if (!jpeg_buf) { fclose(fp); return ESP_ERR_NO_MEM; }
+    size_t got = fread(jpeg_buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (got != (size_t)sz) {
+        heap_caps_free(jpeg_buf);
+        return ESP_FAIL;
+    }
+
     /* Reasonable working buffer size for tjpgd's LUT + state. */
     static uint8_t tjpgd_work[32768] __attribute__((aligned(4)));
 
     jpeg_ctx_t ctx = {
-        .fp = fp,
+        .src = jpeg_buf,
+        .src_len = (size_t)sz,
+        .src_pos = 0,
         .canvas = s_ctx.canvas_buffer,
         .canvas_w = s_ctx.canvas_width,
         .canvas_h = s_ctx.canvas_height,
     };
 
     JDEC jd;
+    TIMING_MARK(t_prep0);
     JRESULT r = gif_jd_prepare(&jd, jpeg_in_cb, tjpgd_work, sizeof(tjpgd_work), &ctx);
+    TIMING_MARK(t_prep1);
     if (r != JDR_OK) {
         ESP_LOGE(TAG, "JPEG header parse failed for %s (jdr=%d)", path, r);
-        fclose(fp);
+        heap_caps_free(jpeg_buf);
         return ESP_FAIL;
     }
-    ctx.src_w = jd.width;
-    ctx.src_h = jd.height;
+
+    /* Pick a tjpgd scale that gets the JPEG close to (but not below)
+     * the canvas size. scale=0→1:1, scale=1→1:2, scale=2→1:4, scale=3→1:8.
+     * tjpgd skips most of the DCT work at higher scales, and the
+     * hand-rolled nearest-neighbor step in jpeg_out_cb has much less
+     * work when the tjpgd output is already close to canvas size.
+     * Measured 1920×1080 preview decode on this board: ~10 s at
+     * scale 0 with a naive per-src-pixel downscale → ~650 ms at
+     * scale 2 (1920/4 = 480 px out, still > canvas so one more
+     * tier of nearest-neighbor in out_cb). */
+    uint8_t scale = 0;
+    while (scale < 3 &&
+           (int)jd.width  >> (scale + 1) >= s_ctx.canvas_width &&
+           (int)jd.height >> (scale + 1) >= s_ctx.canvas_height) {
+        scale++;
+    }
+    /* After scale selection, the effective source dimensions tjpgd
+     * emits are (jd.width >> scale, jd.height >> scale). The RECT
+     * coordinates in jpeg_out_cb are in this scaled space, so our
+     * downscale math needs the scaled numbers. */
+    ctx.src_w = (int)jd.width  >> scale;
+    ctx.src_h = (int)jd.height >> scale;
 
     /* Clear canvas before decode so untouched areas don't show stale data. */
     memset(s_ctx.canvas_buffer, 0x10,
            s_ctx.canvas_width * s_ctx.canvas_height * 2);
 
-    r = gif_jd_decomp(&jd, jpeg_out_cb, 0);
-    fclose(fp);
+    TIMING_MARK(t_dec0);
+    r = gif_jd_decomp(&jd, jpeg_out_cb, scale);
+    TIMING_MARK(t_dec1);
+    TIMING_LOG("show_jpeg(%ux%u scale=%d → %dx%d): prep=%lums decode=%lums",
+               (unsigned)jd.width, (unsigned)jd.height, (int)scale,
+               ctx.src_w, ctx.src_h,
+               (unsigned long)(t_prep1 - t_prep0),
+               (unsigned long)(t_dec1 - t_dec0));
+    heap_caps_free(jpeg_buf);
     if (r != JDR_OK) {
         ESP_LOGE(TAG, "JPEG decode failed (jdr=%d)", r);
         return ESP_FAIL;
@@ -1719,7 +1830,10 @@ esp_err_t app_gifs_play_current(void)
      * The playback timer will overwrite the JPEG with the first GIF
      * frame as soon as the decoder produces it. */
     if (ent->jpeg_path) {
+        TIMING_MARK(tj0);
         esp_err_t jret = show_jpeg(ent->jpeg_path);
+        TIMING_LOG("play_current: show_jpeg took %lums",
+                   (unsigned long)(esp_log_timestamp() - tj0));
         if (jret != ESP_OK) {
             ESP_LOGW(TAG, "JPEG preview flash failed: %s", esp_err_to_name(jret));
         }
@@ -1729,7 +1843,10 @@ esp_err_t app_gifs_play_current(void)
      * can mirror decoded frames into it for later replays. Slot is
      * reused on revisits: a GIF already watched once comes back with
      * its canvases in memory, and we skip the decoder entirely. */
+    TIMING_MARK(ts0);
     s_ctx.active_slot = slot_find_or_alloc(ent->gif_path);
+    TIMING_LOG("play_current: slot_find_or_alloc took %lums",
+               (unsigned long)(esp_log_timestamp() - ts0));
     if (!s_ctx.active_slot) {
         ESP_LOGW(TAG, "No cache slot available (all full, eviction failed)");
     }
@@ -1740,7 +1857,10 @@ esp_err_t app_gifs_play_current(void)
     if (s_ctx.active_slot &&
         !s_ctx.active_slot->complete &&
         s_ctx.active_slot->n_frames == 0) {
+        TIMING_MARK(tl0);
         (void)load_small_gif(ent->gif_path, s_ctx.active_slot);
+        TIMING_LOG("play_current: load_small_gif took %lums",
+                   (unsigned long)(esp_log_timestamp() - tl0));
     }
 
     if (s_ctx.active_slot) {

@@ -147,15 +147,22 @@ static void cmd_status(void)
 static void cmd_menu_goto(const char *arg)
 {
     ui_page_t page = UI_PAGE_MAIN;
+    const char *resp_name = NULL;
 
-    if (strcmp(arg, "main") == 0)           page = UI_PAGE_MAIN;
-    else if (strcmp(arg, "camera") == 0)     page = UI_PAGE_CAMERA;
-    else if (strcmp(arg, "interval") == 0)   page = UI_PAGE_INTERVAL_CAM;
-    else if (strcmp(arg, "video") == 0)      page = UI_PAGE_VIDEO_MODE;
-    else if (strcmp(arg, "album") == 0)      page = UI_PAGE_ALBUM;
-    else if (strcmp(arg, "usb") == 0)        page = UI_PAGE_USB_DISK;
-    else if (strcmp(arg, "settings") == 0)   page = UI_PAGE_SETTINGS;
-    else if (strcmp(arg, "gifs") == 0)       page = UI_PAGE_GIFS;
+    /* Response name matches the status command's page_names[] casing
+     * (uppercase) so tests can regex `page=(\w+)` and compare against
+     * `MAIN` etc. without worrying about which command produced the
+     * log line. Previous behaviour echoed the user's argument
+     * verbatim (lowercase) which caused test 07 / 08 to read
+     * `page=main` while they expected `page=MAIN`. */
+    if (strcmp(arg, "main") == 0)            { page = UI_PAGE_MAIN;         resp_name = "MAIN"; }
+    else if (strcmp(arg, "camera") == 0)     { page = UI_PAGE_CAMERA;       resp_name = "CAMERA"; }
+    else if (strcmp(arg, "interval") == 0)   { page = UI_PAGE_INTERVAL_CAM; resp_name = "INTERVAL_CAM"; }
+    else if (strcmp(arg, "video") == 0)      { page = UI_PAGE_VIDEO_MODE;   resp_name = "VIDEO_MODE"; }
+    else if (strcmp(arg, "album") == 0)      { page = UI_PAGE_ALBUM;        resp_name = "ALBUM"; }
+    else if (strcmp(arg, "usb") == 0)        { page = UI_PAGE_USB_DISK;     resp_name = "USB_DISK"; }
+    else if (strcmp(arg, "settings") == 0)   { page = UI_PAGE_SETTINGS;     resp_name = "SETTINGS"; }
+    else if (strcmp(arg, "gifs") == 0)       { page = UI_PAGE_GIFS;         resp_name = "GIFS"; }
     else {
         cmd_respond("error: unknown page '%s'", arg);
         return;
@@ -165,7 +172,7 @@ static void cmd_menu_goto(const char *arg)
     ui_extra_goto_page(page);
     bsp_display_unlock();
 
-    cmd_respond("ok page=%s", arg);
+    cmd_respond("ok page=%s", resp_name);
 }
 
 static void cmd_btn(const char *which)

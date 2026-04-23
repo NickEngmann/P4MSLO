@@ -188,7 +188,14 @@ static esp_err_t poll_and_get_size(int cam_idx, int timeout_ms, uint32_t *out_si
         uint8_t status = rx2[0];
         uint32_t size = rx2[1] | ((uint32_t)rx2[2] << 8) | ((uint32_t)rx2[3] << 16) | ((uint32_t)rx2[4] << 24);
 
-        ESP_LOGI(TAG, "Poll: status=0x%02X size=%lu [%02X %02X %02X %02X %02X]",
+        /* Demoted from INFO to DEBUG. A single camera poll burst can
+         * emit 50-200 of these lines, and e2e test runs on USB-CDC
+         * were saturating the CDC TX buffer (cmd_respond blocks on
+         * full TX → serial_cmd task misses incoming commands, test
+         * 08 would lose a photo_btn in the process). Turn on with
+         * `esp_log_level_set("spi_cam", ESP_LOG_DEBUG)` at runtime
+         * when debugging. */
+        ESP_LOGD(TAG, "Poll: status=0x%02X size=%lu [%02X %02X %02X %02X %02X]",
                  status, (unsigned long)size, rx2[0], rx2[1], rx2[2], rx2[3], rx2[4]);
 
         if (status == STATUS_JPEG_READY && size > 0 && size < 2000000) {

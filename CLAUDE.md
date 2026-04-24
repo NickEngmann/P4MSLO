@@ -81,6 +81,53 @@ Compiles real SquareLine Studio UI code against LVGL 8.3.11 with SDL2 display ba
 - **Config**: `lv_conf.h`, `lv_drv_conf.h`, `sim_config.h`
 - **Screenshot map**: See `docs/simulator-screenshots.md`
 
+## On-Device E2E Tests (`tests/e2e/`)
+
+Two-tier suite that talks to the P4 over `/dev/ttyACMn` via the serial
+command interface. Set `P4MSLO_TEST_PORT=/dev/ttyACMn` when the P4
+enumerates as something other than `/dev/ttyACM0`.
+
+### Fast heartbeat (`run_fast.sh`, ~100 s)
+
+For iterative development. Three tests that together smoke-test the
+full P4 stack.
+
+```bash
+tests/e2e/run_fast.sh
+```
+
+| Test | What it verifies |
+|------|------------------|
+| `01_boot_and_liveness.py` | ping/status/cam_status respond; 0 panics, 0 watchdogs |
+| `12_dma_heap_health.py`   | dma_int largest ≥ 2 KB, psram largest ≥ 8 MB, no "SPI scratch/chunk alloc failed", no "Failed to start BG worker", no video_utils OOM |
+| `11_heartbeat.py`         | Page nav over all 6 menu pages, buttons, one spi_pimslo capture, gallery entry + play, sd_ls, heap health, reset_state |
+
+### Full regression (`run_all.sh`, 10-15 min)
+
+Pre-commit bar. Cheap smokes first, slow bg observation last. Each
+test gets a 300 s hard timeout via `timeout(1)` so a pyserial hang or
+firmware wedge can't hold the whole run hostage.
+
+```bash
+tests/e2e/run_all.sh
+```
+
+Order: `01 → 12 → 10 → 02 → 13 → 06 → 08 → 03 → 07 → 04 → 09 → 05`.
+
+### Test helpers (`_lib.py`)
+
+- `drain(s, dur, fh)` — uses `select.select()` against the fd
+  directly with a hard wall-clock deadline. Bypasses pyserial's
+  internal read loop that has been observed to block for 14+
+  minutes when the USB CDC endpoint goes half-responsive
+  (`core_sys_select` wchan). Returns within `dur + ~200 ms`.
+- `reset_state(s, fh, timeout=15)` — drives `menu_goto main`, polls
+  `status` until `pimslo_queue=0 pimslo_encoding=0 pimslo_capturing=0`.
+  Call this at the top of every test so each one starts from a
+  clean known state — this fixes the test-isolation problem where
+  test 05 would pass solo (260 s) but hang after 9 prior tests left
+  the gallery cache populated and bg encode mid-cycle.
+
 ## CI Pipeline (GitHub Actions)
 
 Three parallel jobs in `.github/workflows/ci.yml`:

@@ -16,6 +16,7 @@ subsequent runs preserve the artifact for debugging.
 """
 import os
 import re
+import select
 import serial
 import time
 
@@ -29,12 +30,32 @@ def open_port(port=DEFAULT_PORT, baud=DEFAULT_BAUD):
 
 
 def drain(s, dur, fh):
-    """Read + record serial output for `dur` seconds."""
+    """Read + record serial output for `dur` seconds.
+
+    Uses `select()` directly against the fd rather than pyserial's
+    `read(8192)` — with the default timeout=0.1 pyserial can still
+    get stuck inside its internal select loop for much longer than
+    `dur` if the USB CDC endpoint on the P4 misbehaves (we've seen
+    14-minute hangs in `core_sys_select` wchan). select() with a
+    hard deadline guarantees this function returns within `dur +
+    ~200 ms` regardless of USB state. If the fd goes bad mid-drain
+    (device hard-reset, USB cable pulled), we return cleanly instead
+    of hanging."""
     t_end = time.time() + dur
-    while time.time() < t_end:
+    fd = s.fileno() if hasattr(s, 'fileno') else s.fd
+    while True:
+        remaining = t_end - time.time()
+        if remaining <= 0:
+            return
         try:
-            d = s.read(8192)
-        except serial.SerialException:
+            ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
+        except (OSError, ValueError):
+            return
+        if not ready:
+            continue
+        try:
+            d = os.read(fd, 8192)
+        except (OSError, serial.SerialException):
             return
         if d:
             fh.write(d.decode('utf-8', 'replace'))
@@ -60,6 +81,39 @@ def do(s, cmd, wait, fh):
     """send() + drain(). Returns nothing — inspect the log at the end."""
     send(s, cmd, fh)
     drain(s, wait, fh)
+
+
+def reset_state(s, fh, timeout=15):
+    """Return the device to a clean known state before the test runs.
+
+    Why: tests that navigate the gallery, leave playback running, or
+    leave bg worker mid-encode can contaminate the next test. Example
+    observed: test 05 passed solo in 260 s but hung for 14+ min when
+    run after tests 1-10 had filled the gallery canvas cache and left
+    a GIF playing. Call this at the top of every test so each starts
+    from page=MAIN with bg worker idle.
+
+    Drives: `menu_goto main` → waits up to `timeout` s for `status` to
+    report pimslo_queue=0 pimslo_encoding=0 pimslo_capturing=0. Returns
+    True if the device quiesced, False on timeout.
+
+    Cost: ~2-3 s when idle, up to `timeout` s if a bg encode is still
+    finishing — so the per-test overhead is small on average."""
+    do(s, 'menu_goto main', 2, fh)
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        do(s, 'status', 1.2, fh)
+        with open(fh.name) as lf:
+            tail = lf.read()[-2000:]
+        m = re.search(
+            r'pimslo_queue=(\d+) pimslo_encoding=(\d+) pimslo_capturing=(\d+)',
+            tail)
+        if m:
+            q, enc, cap = (int(x) for x in m.groups())
+            if q == 0 and enc == 0 and cap == 0:
+                return True
+        time.sleep(0.5)
+    return False
 
 
 def wait_for_idle(s, fh, max_wait=120):

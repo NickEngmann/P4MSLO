@@ -77,16 +77,25 @@ static bool s_fast_mode = false;
  * capture task (or the serial-command task, mutually exclusive). */
 static uint8_t *s_chunk_rx = NULL;
 
-/* Small permanent DMA-internal scratch buffers for status/control
- * transactions. The PIMSLO capture task's stack lives in PSRAM, so
- * any `WORD_ALIGNED_ATTR uint8_t tx[8]` inside a SPI helper ends up
- * in PSRAM too — and the SPI master then has to alloc its own
- * internal priv RX/TX scratch on every transmission. After a few
- * successful camera polls the internal RAM pool fragments enough
- * that `setup_dma_priv_buffer(1206): Failed to allocate priv RX
- * buffer` fires and panics. Claiming these once at init (32 bytes
- * total) keeps the fast-path in DMA-internal permanently. */
-#define SPI_SCRATCH_SIZE 16
+/* Permanent DMA-internal scratch buffers for small status/control
+ * transactions. Sized to exactly one cache line (64 B on ESP32-P4)
+ * because `spi_master.c::setup_dma_priv_buffer` triggers a per-xfer
+ * priv-alloc if EITHER the buffer address OR the transaction length
+ * isn't aligned to `cache_align_int`. A 16-byte scratch was aligned
+ * in address but the transaction length (8 bytes for poll, 4 bytes
+ * for cmd header) isn't 64-aligned, so we still paid the priv-alloc
+ * cost on every small xfer and eventually panicked mid-capture with
+ *   E spi_master: setup_dma_priv_buffer(1206): Failed to allocate
+ *     priv RX buffer
+ *   Guru Meditation (Load access fault), MCAUSE=0x5
+ * Fix: bump scratch to 64 bytes, always issue 64-byte transactions
+ * when the caller's payload is ≤ 64 B. The S3 SPI slave is always
+ * configured with a 4 KB RX buffer and completes on CS-deassert, so
+ * it happily accepts a 64-byte burst and reads only the first 4 or
+ * 8 bytes it cares about. The extra 56 bytes of wire time at 10 MHz
+ * cost ~50 µs per poll — trivially cheaper than the priv-alloc
+ * churn this replaces. */
+#define SPI_SCRATCH_SIZE 64
 static uint8_t *s_scratch_tx = NULL;
 static uint8_t *s_scratch_rx = NULL;
 
@@ -233,34 +242,33 @@ esp_err_t spi_camera_init(void)
 
 /* Full-duplex SPI transaction wrapped in software-CS for camera cam_idx.
  *
- * Small transactions (≤ SPI_SCRATCH_SIZE bytes) get copied through the
- * permanent DMA-internal scratch buffers — otherwise the SPI master
- * would have to `setup_dma_priv_buffer` for PSRAM-stack callers on
- * every transmission, and the 4th capture of a capture-run panics on
- * internal-pool fragmentation. Large chunk receives (SPI_CHUNK_SIZE)
- * already pass DMA-internal pointers via s_chunk_rx, so they skip the
+ * Small transactions (payload ≤ SPI_SCRATCH_SIZE bytes) get copied
+ * through the permanent 64-byte DMA-internal scratch buffers AND the
+ * wire-level transaction is always padded to the full 64 bytes so both
+ * the buffer address and the transfer length are 64-aligned. Without
+ * length-alignment, the SPI master's setup_dma_priv_buffer still
+ * priv-allocs per xfer → pool fragments → panic mid-capture. Large
+ * chunk receives (SPI_CHUNK_SIZE = 4096 B) already pass a naturally
+ * 64-aligned DMA-internal pointer via s_chunk_rx, so they skip the
  * scratch path. */
 static esp_err_t spi_xfer_cam(int cam_idx, const uint8_t *tx, uint8_t *rx, size_t len)
 {
     const uint8_t *real_tx = tx;
     uint8_t *real_rx = rx;
+    size_t wire_len = len;
+
     if (len <= SPI_SCRATCH_SIZE && s_scratch_tx && s_scratch_rx) {
-        if (tx) {
-            memcpy(s_scratch_tx, tx, len);
-            real_tx = s_scratch_tx;
-        } else {
-            memset(s_scratch_tx, 0, len);
-            real_tx = s_scratch_tx;
-        }
-        if (rx) {
-            memset(s_scratch_rx, 0, len);
-            real_rx = s_scratch_rx;
-        }
+        memset(s_scratch_tx, 0, SPI_SCRATCH_SIZE);
+        if (tx) memcpy(s_scratch_tx, tx, len);
+        memset(s_scratch_rx, 0, SPI_SCRATCH_SIZE);
+        real_tx = s_scratch_tx;
+        real_rx = s_scratch_rx;
+        wire_len = SPI_SCRATCH_SIZE;
     }
 
     cs_assert(cam_idx);
     spi_transaction_t trans = {
-        .length = len * 8,
+        .length = wire_len * 8,
         .tx_buffer = real_tx,
         .rx_buffer = real_rx,
     };

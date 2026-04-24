@@ -24,13 +24,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _lib
 
 LOG = _lib.log_path(__file__)
-OBSERVE_SECS = 240  # up to 4 min: enough for 1-3 encodes
+# 150 s = long enough to observe at least one full PIMSLO encode cycle
+# (~50 s) PLUS a couple of .p4ms pre-renders, while still cutting ~90 s
+# off the old 240 s window. Worth the extra seconds over a shorter
+# 60 s observation because bg-encode regressions only fire against a
+# real encoded GIF, not the cheap pre-render path.
+OBSERVE_SECS = 150
 
 
 def main():
     s = _lib.open_port()
     with open(LOG, 'w') as fh:
         _lib.drain(s, 2, fh)
+        _lib.reset_state(s, fh)
         _lib.do(s, 'sd_ls /sdcard/p4mslo_gifs', 3, fh)
         _lib.do(s, 'sd_ls /sdcard/p4mslo_small', 3, fh)
 
@@ -42,7 +48,7 @@ def main():
         t_end = time.time() + OBSERVE_SECS
         last_ping = time.time()
         while time.time() < t_end:
-            _lib.drain(s, 15, fh)
+            _lib.drain(s, 10, fh)
             # Ping every ~30s to prove LVGL is still alive
             if time.time() - last_ping > 30:
                 _lib.do(s, 'ping', 1, fh)

@@ -43,6 +43,7 @@ def main():
         _lib.do(s, 'menu_goto gifs', 6, fh)
         _lib.do(s, 'status', 2, fh)
         _lib.do(s, 'sd_ls /sdcard/p4mslo_small', 3, fh)
+        _lib.do(s, 'sd_ls /sdcard/p4mslo_gifs', 3, fh)
 
         _lib.mark(fh, 'PHASE 2 — open modal; NO default; encoder confirms NO')
         _lib.do(s, 'btn_encoder', 2, fh)
@@ -50,6 +51,7 @@ def main():
         # assert still on gallery, no delete
         _lib.do(s, 'status', 2, fh)
         _lib.do(s, 'sd_ls /sdcard/p4mslo_small', 3, fh)
+        _lib.do(s, 'sd_ls /sdcard/p4mslo_gifs', 3, fh)
 
         _lib.mark(fh, 'PHASE 3 — open modal; btn_up → YES; menu confirms → DELETE')
         _lib.do(s, 'btn_encoder', 2, fh)
@@ -58,7 +60,13 @@ def main():
         time.sleep(3)
         _lib.drain(s, 2, fh)
         _lib.do(s, 'status', 2, fh)
+        # Count p4ms AND gifs — the current gallery entry may be .gif-only
+        # (no .p4ms yet because bg pre-render hasn't run on it). The
+        # delete unlinks whichever files actually exist for that stem,
+        # so we verify the total on-disk file count for this capture
+        # dropped, not that the .p4ms count specifically dropped.
         _lib.do(s, 'sd_ls /sdcard/p4mslo_small', 3, fh)
+        _lib.do(s, 'sd_ls /sdcard/p4mslo_gifs', 3, fh)
 
         _lib.mark(fh, 'PHASE 4 — menu with NO modal open exits to main')
         # Modal should already be closed by PHASE 3's confirm. Verify menu
@@ -71,24 +79,34 @@ def main():
         txt = f.read()
     c = _lib.summarize(txt)
 
-    # Extract sd_ls blocks to count file changes
-    all_blocks = re.findall(
+    # Extract sd_ls blocks for both .p4ms and .gif directories. The
+    # deleted entry may be .gif-only (no .p4ms rendered yet) or the
+    # reverse, so we add the counts for a stable "total capture
+    # files" number that drops by ≥1 across a delete regardless of
+    # which file types were attached.
+    p4ms_blocks = re.findall(
         r'=== sd_ls /sdcard/p4mslo_small ===(.+?)(?====|\Z)', txt, re.DOTALL)
-    counts = [len(re.findall(r'FILE\s+\S+\.p4ms', b)) for b in all_blocks]
+    gif_blocks = re.findall(
+        r'=== sd_ls /sdcard/p4mslo_gifs ===(.+?)(?====|\Z)', txt, re.DOTALL)
+    p4ms_counts = [len(re.findall(r'FILE\s+\S+\.p4ms', b)) for b in p4ms_blocks]
+    gif_counts  = [len(re.findall(r'FILE\s+\S+\.gif',  b)) for b in gif_blocks]
+    totals = [a + b for a, b in zip(p4ms_counts, gif_counts)]
     pages = re.findall(r'page=(\w+)', txt)
 
-    # Expected:
-    #   counts[0] = baseline
-    #   counts[1] = after NO cancel → unchanged (= counts[0])
-    #   counts[2] = after YES delete → -1
-    deleted_dropped = (len(counts) >= 3 and counts[0] == counts[1] and
-                        counts[2] == counts[0] - 1)
+    # Expected total-file counts (p4ms + gif):
+    #   totals[0] = baseline
+    #   totals[1] = after NO cancel → unchanged (= totals[0])
+    #   totals[2] = after YES delete → at least one file fewer
+    deleted_dropped = (len(totals) >= 3 and totals[0] == totals[1] and
+                        totals[2] < totals[0])
 
     _lib.print_summary('[03] DELETE MODAL', c,
                         extras={
-                            'p4ms counts': counts,
+                            'p4ms counts': p4ms_counts,
+                            'gif counts':  gif_counts,
+                            'total counts': totals,
                             'pages': pages,
-                            'NO-then-YES dropped exactly 1': deleted_dropped,
+                            'NO-then-YES dropped ≥1 file': deleted_dropped,
                         })
 
     # PHASE 2 should leave us on GIFS; PHASE 4 should leave us on MAIN

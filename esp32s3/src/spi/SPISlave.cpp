@@ -109,7 +109,8 @@ static void install_miso_tristate(void)
 
 SPISlave::SPISlave()
     : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0),
-      _aeGain(0), _aeExposure(0), _controlCb(nullptr)
+      _aeGain(0), _aeExposure(0), _controlCb(nullptr),
+      _transferStartCb(nullptr), _transferEndCb(nullptr)
 {
 }
 
@@ -185,7 +186,7 @@ void SPISlave::setJpegData(const uint8_t *data, size_t len)
 {
     _jpegData = data;
     _jpegLen = len;
-    ESP_LOGI(TAG, "JPEG ready: %zu bytes", len);
+    ESP_LOGD(TAG, "JPEG ready: %zu bytes", len);
 }
 
 void SPISlave::clearJpegData()
@@ -366,9 +367,19 @@ void SPISlave::spiTask(void *param)
             }
         }
         if (cmd == CMD_READ_DATA && self->_jpegData) {
-            ESP_LOGI(TAG, "CMD_READ_DATA → DATA (%zu bytes)", self->_jpegLen);
+            /* Hot path: every P4 capture triggers one pair of these. Demoted
+             * to DEBUG — re-enable with esp_log_level_set("spi_slave",
+             * ESP_LOG_DEBUG) when diagnosing. */
+            ESP_LOGD(TAG, "CMD_READ_DATA → DATA (%zu bytes)", self->_jpegLen);
+            /* Visual indicator: NeoPixel turns CAPTURING (white) for the
+             * duration of the SPI transfer. Wrapping streamJpegData with
+             * hooks instead of flipping the LED from main.cpp means the
+             * indicator accurately tracks the time the bytes are actually
+             * on the wire — not the preceding capture window. */
+            if (self->_transferStartCb) self->_transferStartCb();
             streamJpegData(self->_jpegData, self->_jpegLen, data_tx, data_rx);
-            ESP_LOGI(TAG, "DATA transfer complete");
+            if (self->_transferEndCb) self->_transferEndCb();
+            ESP_LOGD(TAG, "DATA transfer complete");
         } else if (cmd == CMD_WIFI_ON || cmd == CMD_WIFI_OFF ||
                    cmd == CMD_REBOOT  || cmd == CMD_IDENTIFY ||
                    cmd == CMD_AUTOFOCUS) {
@@ -393,7 +404,8 @@ void SPISlave::spiTask(void *param)
 #else
 
 SPISlave::SPISlave() : _jpegData(nullptr), _jpegLen(0), _initialized(false), _statusFlags(0),
-                       _aeGain(0), _aeExposure(0), _controlCb(nullptr) {}
+                       _aeGain(0), _aeExposure(0), _controlCb(nullptr),
+                       _transferStartCb(nullptr), _transferEndCb(nullptr) {}
 bool SPISlave::begin() { return false; }
 void SPISlave::stop() {}
 void SPISlave::setJpegData(const uint8_t *, size_t) {}

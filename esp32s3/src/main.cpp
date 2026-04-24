@@ -239,7 +239,10 @@ static void doCapture() {
         /* Snapshot the freshly-settled AE state into the IDLE header so a
          * PIMSLO master can read this camera's exposure via status poll. */
         refresh_exposure_header();
-        ESP_LOGI(TAG, "Photo captured: %zu bytes (available via SPI)", jpegLen);
+        /* Hot path: one per capture. Demoted to DEBUG so steady-state
+         * capture cycles don't spam the CDC. Enable with
+         * esp_log_level_set("main", ESP_LOG_DEBUG) when needed. */
+        ESP_LOGD(TAG, "Photo captured: %zu bytes (available via SPI)", jpegLen);
         /* NOTE: camera fb is NOT released here — it stays valid until
          * the SPI master reads the data, then we release on next capture */
 #else
@@ -382,6 +385,18 @@ extern "C" void app_main(void) {
             msg.payload_len = (uint8_t)(payload_len > sizeof(msg.payload) ? sizeof(msg.payload) : payload_len);
             if (payload && msg.payload_len) memcpy(msg.payload, payload, msg.payload_len);
             xQueueSend(s_controlQueue, &msg, 0);
+        });
+
+        /* Visual indicator: white NeoPixel for the duration of the actual
+         * SPI data transfer to the P4. This is the "I see the trigger +
+         * I'm shipping the bytes" signal the user asked for. Fires from
+         * the SPI task context — setState() is just a uint write, no
+         * blocking, safe to call inline. */
+        spiSlave.setTransferStartCallback([]() {
+            statusLED.setState(LEDState::CAPTURING);
+        });
+        spiSlave.setTransferEndCallback([]() {
+            statusLED.setState(LEDState::READY);
         });
         xTaskCreatePinnedToCore(task_control, "SpiCtrl",
                                 8192, nullptr, 5, nullptr, 0);

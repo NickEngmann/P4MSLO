@@ -137,6 +137,38 @@ P4MSLO/
 
 Set via: `curl -X POST http://<ip>/api/v1/config/position -d '{"position":N}'`
 
+### S3 OTA Flashing (no BOOT+RESET required)
+
+WiFi is OFF by default on the S3s (`DISABLE_WIFI=1` is active — WiFi stack destabilizes the SPI slave — see `spi_camera.c` comments). To push new firmware without unplugging:
+
+```bash
+# 1. Bring S3 WiFi up via SPI from the P4
+#    (serial command over /dev/ttyACM1 — P4 broadcasts SPI_CMD_WIFI_ON to all 4)
+echo "cam_wifi_on all" > /dev/ttyACM1
+# wait ~20 s for WiFi to associate on "The Garden"
+
+# 2. Verify who came up (positions 1/2/3/4 → .119/.248/.66/.38)
+for ip in 192.168.1.119 192.168.1.248 192.168.1.66 192.168.1.38; do
+    curl -s --connect-timeout 2 "http://$ip/api/v1/status" | head -c 80 && echo " $ip"
+done
+
+# 3. Build + parallel OTA-flash all reachable S3s
+cd esp32s3 && pio run -e xiao_esp32s3
+for ip in 192.168.1.119 192.168.1.248 192.168.1.66 192.168.1.38; do
+    timeout 120 curl -s -X POST "http://$ip/api/v1/ota/upload" \
+        --data-binary @.pio/build/xiao_esp32s3/firmware.bin \
+        -H "Content-Type: application/octet-stream" --max-time 120 &
+done
+wait
+
+# 4. After reboot, disable WiFi so SPI captures are reliable
+echo "cam_wifi_off all" > /dev/ttyACM1
+```
+
+**If a camera won't respond to `cam_wifi_on`**: its SPI slave task is likely stuck (see "SPI slave stuck in DATA mode" below). Try `cam_reboot N` first. If still stuck, WiFi won't come up either — USB-flash that one via BOOT+RESET.
+
+**If SPI captures return 0/4 after a fresh OTA round**: suspect wiring on the silent cams (missing MISO series resistor, flaky CS). Do NOT run `POST /api/v1/factory-reset` to "recover" — it wipes the camera position NVS entry that maps device → pos 1-4.
+
 ### How It Works
 1. **Photo button** → takes P4 camera photo + triggers background SPI capture
 2. **SPI capture task** (Core 0) → GPIO34 trigger → receives 4 JPEGs via SPI → saves to `/sdcard/p4mslo/P4M0001/pos{1-4}.jpg`
@@ -256,6 +288,7 @@ GIF encoding runs in the background — the user only waits for the capture phas
 - **bg_worker starvation watchdog** — `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n` in `sdkconfig.defaults`. The `gif_bg` background task runs pure-compute LZW frame decode + palette work on Core 1 at prio 2. A single frame decode for a large GIF is ~700 ms of uninterrupted CPU; tuning any lower than that would mean chasing yields down into ESP-IDF / LVGL code we don't own. Simpler to disable the Core 1 idle watchdog. Core 0 idle wdt stays on (`CHECK_IDLE_TASK_CPU0` defaults to y), so genuinely stuck LVGL / video-stream tasks still fire.
 - **bg_worker must yield foreground** — `app_gifs_next / _prev` set `s_last_nav_ms` (gallery knob nav timestamp) and flip `s_bg_abort_current`. `bg_should_yield` returns true for 15 s after any nav, and the encode pipeline (`app_gifs_encode_pimslo_from_dir`) polls `s_bg_abort_current` at the top + between each JPEG load. `bg_encode_safe_page()` intentionally omits `UI_PAGE_GIFS` — a 50 s PIMSLO encode on the gallery page pins the JPEG decoder + 7 MB of PSRAM + SD I/O and makes gallery nav feel dead for tens of seconds. Stale captures only get re-encoded once the user leaves the gallery for ALBUM / USB / SETTINGS. Pre-rendering of `.p4ms` previews (the other bg path) still runs on any page, with a `vTaskDelay(pdMS_TO_TICKS(100))` between frames to give IDLE1 real run time.
 - **SPI camera RX chunk — single 4 KB buffer, permanent, NULL tx** — `spi_camera.c` uses `spi_device_transmit` with `tx_buffer=NULL` for the receive-only JPEG pull (the S3 slave ignores MOSI during the DATA phase anyway). That halves the DMA-internal requirement from 8 KB (tx+rx) to 4 KB (rx only). The single `chunk_rx` buffer is allocated on first use via `heap_caps_malloc(..., MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)` and held forever — no per-capture heap churn, no OOM once the pool has fragmented. Before the change, "OOM for SPI chunk buffers" fired on every single capture regardless of whether the S3 cameras responded with JPEGs, and all 4 slots returned FAILED even when the slaves clearly had JPEGs ready.
+- **SPI buffers MUST be 64-byte cache-aligned, not just DMA-capable** — `setup_dma_priv_buffer(1206): Failed to allocate priv RX buffer` → `Guru Meditation (Load access fault)` panic mid-capture (usually on camera 4 after 3 successful captures). Root cause: ESP-IDF's `setup_dma_priv_buffer` in `spi_master.c` triggers a per-transaction priv-buffer alloc whenever the source/dest buffer is not aligned to `cache_align_int` — 64 bytes on ESP32-P4. `heap_caps_malloc(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)` returns a 4- or 8-byte aligned block, which fails the 64-byte check; priv buf is then allocated per xfer and eventually fragments the internal pool until alloc fails → NULL deref → panic. Compounded by the PIMSLO capture task's stack living in PSRAM — all stack-allocated `uint8_t tx[8]` for poll/control transactions are unaligned AND in PSRAM, so every small transaction pays the priv-alloc cost. Fix in `spi_camera.c`: (1) permanent 16-byte `s_scratch_tx/rx` via `heap_caps_aligned_alloc(64, ...)` for status/control transactions, (2) `spi_xfer_cam` memcpys through the scratch for any ≤16-byte transaction, (3) chunk-RX uses `heap_caps_aligned_alloc(64, 4096, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)` claimed eagerly at `spi_camera_init` (the lazy-alloc path hits a 2.4 KB largest-free-block by first capture). The 4 KB chunk alloc at init time works because LCD's `trans_size` staging buf is already claimed by `bsp_display_start_with_config` but SD/camera transactions haven't fragmented yet.
 - **ESP-IDF v5.5.3 required** — v5.5.1/5.5.2 fail component resolution
 - **PlatformIO unsupported** — ESP32-P4 requires native ESP-IDF CMake
 - **Simulator camera** — Viewfinder renders empty (no camera feed, expected)

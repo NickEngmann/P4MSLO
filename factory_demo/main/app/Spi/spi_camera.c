@@ -77,6 +77,19 @@ static bool s_fast_mode = false;
  * capture task (or the serial-command task, mutually exclusive). */
 static uint8_t *s_chunk_rx = NULL;
 
+/* Small permanent DMA-internal scratch buffers for status/control
+ * transactions. The PIMSLO capture task's stack lives in PSRAM, so
+ * any `WORD_ALIGNED_ATTR uint8_t tx[8]` inside a SPI helper ends up
+ * in PSRAM too — and the SPI master then has to alloc its own
+ * internal priv RX/TX scratch on every transmission. After a few
+ * successful camera polls the internal RAM pool fragments enough
+ * that `setup_dma_priv_buffer(1206): Failed to allocate priv RX
+ * buffer` fires and panics. Claiming these once at init (32 bytes
+ * total) keeps the fast-path in DMA-internal permanently. */
+#define SPI_SCRATCH_SIZE 16
+static uint8_t *s_scratch_tx = NULL;
+static uint8_t *s_scratch_rx = NULL;
+
 static const int s_cs_pins[SPI_CAM_COUNT] = {
     SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN
 };
@@ -177,23 +190,86 @@ esp_err_t spi_camera_init(void)
      * usually fresh enough (LCD already has its trans_size staging
      * buffer claimed at boot, so LCD flushes don't chew into this
      * pool). */
+    /* 64-byte cache-line aligned — ESP-IDF SPI master triggers a
+     * per-transaction priv-buffer alloc if the source/dest isn't
+     * aligned to `cache_align_int` (64 on ESP32-P4). Those per-xfer
+     * allocs fragment internal RAM and eventually panic
+     * ("setup_dma_priv_buffer(1206): Failed to allocate priv RX
+     * buffer") mid-capture around camera 4. */
+    if (!s_scratch_tx) {
+        s_scratch_tx = heap_caps_aligned_alloc(64, SPI_SCRATCH_SIZE,
+                                               MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    }
+    if (!s_scratch_rx) {
+        s_scratch_rx = heap_caps_aligned_alloc(64, SPI_SCRATCH_SIZE,
+                                               MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    }
+    /* Also claim the 4 KB aligned chunk-RX buffer here. If we wait until
+     * the first capture, the DMA-internal pool has already been carved
+     * up by LCD flushes + SD card transactions and aligned_alloc often
+     * fails with ESP_ERR_NO_MEM (observed: largest DMA-internal ≈ 2.4 KB
+     * by first capture). At spi_camera_init (called from
+     * app_pimslo_init right after bsp display setup + video stream
+     * init) the LCD trans_size buffer is already claimed but SD + other
+     * drivers haven't fragmented the pool yet. */
+    if (!s_chunk_rx) {
+        s_chunk_rx = heap_caps_aligned_alloc(64, SPI_CHUNK_SIZE,
+                                             MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!s_chunk_rx) {
+            ESP_LOGW(TAG, "SPI chunk rx eager alloc failed (largest "
+                          "DMA-internal=%zu)",
+                     heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        }
+    }
+    if (!s_scratch_tx || !s_scratch_rx) {
+        ESP_LOGW(TAG, "SPI scratch alloc failed — status polls will fall back to per-call priv buffer alloc (fragile)");
+    }
+
     s_initialized = true;
     ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 10MHz, software-CS, trigger=GPIO34",
              SPI_CAM_COUNT, SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN);
     return ESP_OK;
 }
 
-/* Full-duplex SPI transaction wrapped in software-CS for camera cam_idx. */
+/* Full-duplex SPI transaction wrapped in software-CS for camera cam_idx.
+ *
+ * Small transactions (≤ SPI_SCRATCH_SIZE bytes) get copied through the
+ * permanent DMA-internal scratch buffers — otherwise the SPI master
+ * would have to `setup_dma_priv_buffer` for PSRAM-stack callers on
+ * every transmission, and the 4th capture of a capture-run panics on
+ * internal-pool fragmentation. Large chunk receives (SPI_CHUNK_SIZE)
+ * already pass DMA-internal pointers via s_chunk_rx, so they skip the
+ * scratch path. */
 static esp_err_t spi_xfer_cam(int cam_idx, const uint8_t *tx, uint8_t *rx, size_t len)
 {
+    const uint8_t *real_tx = tx;
+    uint8_t *real_rx = rx;
+    if (len <= SPI_SCRATCH_SIZE && s_scratch_tx && s_scratch_rx) {
+        if (tx) {
+            memcpy(s_scratch_tx, tx, len);
+            real_tx = s_scratch_tx;
+        } else {
+            memset(s_scratch_tx, 0, len);
+            real_tx = s_scratch_tx;
+        }
+        if (rx) {
+            memset(s_scratch_rx, 0, len);
+            real_rx = s_scratch_rx;
+        }
+    }
+
     cs_assert(cam_idx);
     spi_transaction_t trans = {
         .length = len * 8,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
+        .tx_buffer = real_tx,
+        .rx_buffer = real_rx,
     };
     esp_err_t ret = spi_device_transmit(s_spi_dev, &trans);
     cs_deassert(cam_idx);
+
+    if (ret == ESP_OK && rx && real_rx == s_scratch_rx) {
+        memcpy(rx, s_scratch_rx, len);
+    }
     return ret;
 }
 
@@ -338,8 +414,9 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
      * fall back to a lazy alloc here — slower path but better than
      * failing the capture outright. */
     if (!s_chunk_rx) {
-        s_chunk_rx = heap_caps_malloc(SPI_CHUNK_SIZE,
-                                      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        /* 64-byte aligned — see scratch-alloc comment in spi_camera_init. */
+        s_chunk_rx = heap_caps_aligned_alloc(64, SPI_CHUNK_SIZE,
+                                             MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (!s_chunk_rx) {
             ESP_LOGE(TAG, "OOM for SPI chunk rx buffer (permanent %d B, "
                           "largest DMA-internal=%zu)",

@@ -780,6 +780,9 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
      * alloc per call — fast (not PSRAM), no permanent BSS. */
     uint8_t *work = heap_caps_malloc(32768, MALLOC_CAP_INTERNAL);
     if (!work) {
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        ESP_LOGW(TAG, "decode_jpeg_crop: OOM for 32KB work buf (largest internal=%zu) path=%s",
+                 largest, jpeg_path);
         heap_caps_free(jpeg_buf);
         return ESP_ERR_NO_MEM;
     }
@@ -799,8 +802,14 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
 
     JDEC jd;
     JRESULT r = gif_jd_prepare(&jd, jpeg_crop_in_cb, work, 32768, &ctx);
-    if (r == JDR_OK) {
+    if (r != JDR_OK) {
+        ESP_LOGW(TAG, "decode_jpeg_crop: prepare jdr=%d sz=%ld path=%s", r, sz, jpeg_path);
+    } else {
         r = gif_jd_decomp(&jd, jpeg_crop_out_cb, 0);
+        if (r != JDR_OK) {
+            ESP_LOGW(TAG, "decode_jpeg_crop: decomp jdr=%d w=%u h=%u sz=%ld src_pos=%zu/%zu path=%s",
+                     r, jd.width, jd.height, sz, ctx.src_pos, ctx.src_len, jpeg_path);
+        }
     }
     heap_caps_free(work);
     heap_caps_free(jpeg_buf);

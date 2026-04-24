@@ -101,6 +101,16 @@ public:
      *  so the handler should offload heavy work to a separate task/queue. */
     void setControlCallback(ControlCallback cb) { _controlCb = cb; }
 
+    /** Register handlers that fire when the slave begins / finishes streaming
+     *  the JPEG to the master (wraps the streamJpegData call). main.cpp uses
+     *  these to flip the NeoPixel to CAPTURING for the duration of the SPI
+     *  transfer, giving a quick visual "I saw the trigger + I'm sending"
+     *  indicator to anyone watching the S3. Both are called from the SPI
+     *  task context — do NOT block. */
+    typedef std::function<void()> TransferHook;
+    void setTransferStartCallback(TransferHook cb) { _transferStartCb = cb; }
+    void setTransferEndCallback(TransferHook cb)   { _transferEndCb   = cb; }
+
     /** Update the WiFi status flags that appear in every IDLE header response.
      *  Master sees them via CMD_STATUS polling. */
     void setWifiStatus(bool active, bool connected);
@@ -121,6 +131,8 @@ private:
     uint16_t _aeGain;          // latest sensor gain (OV5640 0x350A/0x350B)
     uint32_t _aeExposure;      // latest sensor exposure (OV5640 0x3500-0x3502, 24-bit)
     ControlCallback _controlCb;
+    TransferHook    _transferStartCb;
+    TransferHook    _transferEndCb;
 
     static void spiTask(void *param);
 };

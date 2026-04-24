@@ -56,6 +56,18 @@ set(P4MSLO_O2_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_lzw.c        # LZW core
     ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/gif_quantize.c   # palette quant
     ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Spi/spi_camera.c     # SPI RX polling
+    # app_gifs.c — needed for jpeg_out_cb / jpeg_crop_out_cb, the tjpgd
+    # per-MCU output callbacks that run 19,200 times per 2560×1920
+    # JPEG. At -Og they took ~30 s per decode; at -O2 the same math
+    # lands in ~2 s (same as gif_encoder.c's tjpgd_output, which has
+    # always been on this list). The file is large and has LVGL
+    # surface, but per-file -O2 is scoped narrowly (CLAUDE.md's "whole
+    # main component -O2 wdt-hangs" warning is about the MAIN_WIDE
+    # toggle, not selective per-file application). If a regression
+    # surfaces, the minimal rollback is to move just the callbacks
+    # into a small helper file compiled -O2, leaving the LVGL-heavy
+    # parts of app_gifs.c at -Og.
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/app/Gif/app_gifs.c
 )
 set_source_files_properties(${P4MSLO_O2_SOURCES}
     PROPERTIES COMPILE_OPTIONS "-O2")

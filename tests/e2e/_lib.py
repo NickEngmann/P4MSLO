@@ -19,7 +19,7 @@ import re
 import serial
 import time
 
-DEFAULT_PORT = '/dev/ttyACM0'
+DEFAULT_PORT = os.environ.get('P4MSLO_TEST_PORT', '/dev/ttyACM0')
 DEFAULT_BAUD = 115200
 
 
@@ -112,7 +112,11 @@ def summarize(txt):
         'ping_pong': txt.count('CMD>pong'),
         'photo_btn': (txt.count('photo_btn (take_photo scheduled)') +
                        txt.count('photo_btn (capture queued')),
-        'captures': re.findall(r'Capture \d+: (\d)/4 cameras', txt),
+        # Match BOTH the old `Capture N: K/4 cameras saved in ...` format
+        # AND the new `Capture NNN: SPI xfer Nms, usable=K/4` format
+        # emitted by pimslo_capture_task after the save-task decoupling.
+        'captures': (re.findall(r'Capture \d+: (\d)/4 cameras', txt) +
+                      re.findall(r'Capture \d+:.*usable=(\d)/4', txt)),
         'p4ms_saved': txt.count('Direct-JPEG .p4ms saved'),
         'gifs_saved': txt.count('PIMSLO GIF saved to'),
         'encode_defers': txt.count('Deferring'),

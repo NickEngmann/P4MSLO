@@ -28,15 +28,19 @@ static const char *TAG = "spi_cam";
 /* SPI transfer chunk size — MUST match the S3 slave's CHUNK_SIZE (4096) */
 #define SPI_CHUNK_SIZE    4096
 
-/* Maximum retries per camera for corrupted transfers */
-/* Was 4. Lowered to 1 because observed retry behaviour on this rig is
- * binary: if cams 1-2 respond on the first attempt, they almost always
- * do, and cams 3-4 that miss the first trigger keep missing later
- * ones too (S3-side timing issue). More retries mostly just multiply
- * the wait — 1 retry + initial = 2 attempts keeps trigger-purgatory
- * bounded (~12s worst case instead of ~30s) while still recovering
- * transient single-camera misses. */
-#define SPI_MAX_RETRIES   1
+/* Maximum retries per camera for corrupted transfers.
+ *
+ * History: 4 → 1 → 0. Retries were originally there to paper over
+ * transient single-camera trigger misses. In practice the retry
+ * behaviour on this rig is binary — a camera that misses the first
+ * trigger keeps missing later ones, so every retry just multiplies
+ * the wait. 4 retries = ~30 s worst case; 1 retry = ~12 s; 0 =
+ * bounded at the first-attempt window (~5 s for a full trigger +
+ * 4-cam poll cycle). Testing iteration speed trumps the edge-case
+ * recovery. If the wire is flaky, fix the wire.
+ *
+ * Value 0 means one attempt, no retries. */
+#define SPI_MAX_RETRIES   0
 
 /* Slave prepends this preamble to every JPEG stream so the master can skip
  * any stale IDLE-header bytes that leaked in before the slave processed
@@ -58,6 +62,20 @@ static const uint8_t SPI_PREAMBLE[PREAMBLE_LEN] = {
 static spi_device_handle_t s_spi_dev = NULL;
 static bool s_initialized = false;
 static bool s_fast_mode = false;
+
+/* Permanent DMA-capable scratch for the chunked JPEG pull.
+ * spi_camera.c::spi_receive_jpeg_chunked() used to allocate + free this
+ * on every camera-per-capture (2 × heap_caps_calloc in the hot path),
+ * which was OOMing once the DMA-internal pool fragmented. The alloc was
+ * then lazy-moved to first-use inside the receive loop, but by the time
+ * the first user-driven capture fires (video-stream + LVGL + other
+ * drivers already up) the largest-free-block can be < 4 KB. Moving
+ * the alloc up here to `spi_camera_init()` — which runs during
+ * `app_pimslo_init()` on app_main, before most of the internal RAM
+ * pressure appears — captures a comfortable block while one's still
+ * available. Single-owned: all callers serialize on the PIMSLO
+ * capture task (or the serial-command task, mutually exclusive). */
+static uint8_t *s_chunk_rx = NULL;
 
 static const int s_cs_pins[SPI_CAM_COUNT] = {
     SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN
@@ -142,6 +160,23 @@ esp_err_t spi_camera_init(void)
     gpio_config(&trig_cfg);
     gpio_set_level(GPIO_NUM_34, 1);
 
+    /* s_chunk_rx is allocated lazily on first use (see spi_receive_
+     * jpeg_chunked). We used to eagerly claim it here "while the pool
+     * is fresh", but that permanently carved 4 KB out of the DMA-
+     * internal pool — which the SD card driver (sdmmc read/write) and
+     * the LCD SPI panel driver both need for their own per-transaction
+     * scratch buffers. Symptom of the eager-alloc version: first photo
+     * capture ran OK, then SD reads started failing with
+     *   E sdmmc_cmd: sdmmc_read_sectors: not enough mem, err=0x101
+     * and the LCD hit
+     *   E spi_master: setup_dma_priv_buffer(1206): Failed to allocate
+     *     priv RX buffer
+     * which then panics via NULL deref. The lazy path in
+     * spi_receive_jpeg_chunked already survives a one-off OOM by
+     * returning ESP_ERR_NO_MEM cleanly, and in practice the pool is
+     * usually fresh enough (LCD already has its trans_size staging
+     * buffer claimed at boot, so LCD flushes don't chew into this
+     * pool). */
     s_initialized = true;
     ESP_LOGI(TAG, "SPI camera master: %d cameras (CS=%d,%d,%d,%d) @ 10MHz, software-CS, trigger=GPIO34",
              SPI_CAM_COUNT, SPI_CAM_CS0_PIN, SPI_CAM_CS1_PIN, SPI_CAM_CS2_PIN, SPI_CAM_CS3_PIN);
@@ -200,7 +235,10 @@ static esp_err_t poll_and_get_size(int cam_idx, int timeout_ms, uint32_t *out_si
 
         if (status == STATUS_JPEG_READY && size > 0 && size < 2000000) {
             *out_size = size;
-            ESP_LOGI(TAG, "JPEG ready: %lu bytes (polled %dms)", (unsigned long)size, elapsed);
+            /* Fires once per camera per capture. Demoted — the "Camera N:
+             * K bytes in Xms ✓" log covers the success case more compactly.
+             * Re-enable with esp_log_level_set("spi_cam", ESP_LOG_DEBUG). */
+            ESP_LOGD(TAG, "JPEG ready: %lu bytes (polled %dms)", (unsigned long)size, elapsed);
             return ESP_OK;
         }
 
@@ -236,7 +274,9 @@ static bool validate_jpeg_integrity(const uint8_t *data, size_t size)
         if (data[i] == 0xFF && data[i + 1] == 0xC0) {
             has_sof = true;
             uint8_t samp = data[i + 11];
-            ESP_LOGI(TAG, "JPEG SOF0: Y sampling=%02X (%s)",
+            /* Per-camera-per-capture — noise in steady-state runs.
+             * Kept as DEBUG for format diagnosis (4:2:0 vs 4:2:2). */
+            ESP_LOGD(TAG, "JPEG SOF0: Y sampling=%02X (%s)",
                      samp, samp == 0x22 ? "4:2:0" : samp == 0x21 ? "4:2:2" : "other");
             break;
         }
@@ -293,26 +333,14 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
 
     uint32_t t_start = esp_log_timestamp();
 
-    /* Receive-only transaction: tx_buffer=NULL makes the SPI master
-     * drive zeros on MOSI during each chunk. Previously we allocated
-     * a zero-filled 4 KB chunk_tx to pass along with chunk_rx; that
-     * doubled our DMA-capable internal RAM requirement (2 × 4 KB) and
-     * was the direct cause of "OOM for SPI chunk buffers" on this
-     * board — the DMA-internal pool's largest free block post-boot
-     * is ~2-4 KB after the LCD trans_size buffer is claimed. The
-     * slave ignores MOSI during the DATA phase anyway; we only care
-     * about the JPEG bytes it puts on MISO.
-     *
-     * Single 4 KB rx buffer, allocated ONCE at first use and held
-     * forever. No per-call heap churn, so runtime fragmentation
-     * never re-exposes the OOM. Serialized by design: all callers
-     * run on the pimslo capture task or the serial-command task,
-     * never both concurrently. */
-    static uint8_t *chunk_rx = NULL;
-    if (!chunk_rx) {
-        chunk_rx = heap_caps_malloc(SPI_CHUNK_SIZE,
-                                    MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-        if (!chunk_rx) {
+    /* s_chunk_rx is normally claimed at spi_camera_init() time while
+     * the DMA pool is fresh. If that eager alloc failed (see init)
+     * fall back to a lazy alloc here — slower path but better than
+     * failing the capture outright. */
+    if (!s_chunk_rx) {
+        s_chunk_rx = heap_caps_malloc(SPI_CHUNK_SIZE,
+                                      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!s_chunk_rx) {
             ESP_LOGE(TAG, "OOM for SPI chunk rx buffer (permanent %d B, "
                           "largest DMA-internal=%zu)",
                      SPI_CHUNK_SIZE,
@@ -321,6 +349,7 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
             return ESP_ERR_NO_MEM;
         }
     }
+    uint8_t *chunk_rx = s_chunk_rx;
 
     size_t offset = 0;
     size_t remaining = read_total;
@@ -410,7 +439,10 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
         return ESP_ERR_INVALID_CRC;
     }
 
-    ESP_LOGI(TAG, "JPEG verified: %lu bytes in %lums (magic@%zd, %.1f KB/s)",
+    /* Per-camera-per-capture — summary line is "Camera N: K bytes in Xms ✓"
+     * a few lines down. DEBUG here keeps the per-KB/s timing available
+     * on demand but off the default log. */
+    ESP_LOGD(TAG, "JPEG verified: %lu bytes in %lums (magic@%zd, %.1f KB/s)",
              (unsigned long)jpeg_size_reported, (unsigned long)elapsed, magic_offset,
              elapsed > 0 ? (float)read_total / elapsed : 0);
 
@@ -483,11 +515,21 @@ esp_err_t spi_camera_query_status(int camera_idx, uint8_t *status_byte)
 }
 
 /* Internal: drive the GPIO34 pulse. Not a wait — just the edges. The
- * S3 slaves interpret any falling edge on this pin as "capture now". */
+ * S3 slaves interpret any falling edge on this pin as "capture now".
+ *
+ * Pulse width history: 100 ms → 250 ms. The S3 side polls D0 every 10 ms
+ * on task_trigger_monitor (prio 5). If that task gets preempted by SPI
+ * streaming or camera-driver work it can stall for 100+ ms, which was
+ * wide enough for cams 2-4 to miss the edge on loaded rigs. A 250 ms
+ * pulse gives a comfortable 10-15× margin over the worst-case poll
+ * stall seen on the bench. Cost: an extra 150 ms added to every
+ * capture cycle's minimum latency — negligible next to the 2-3 s SPI
+ * transfer. */
+#define TRIGGER_PULSE_MS  250
 static void send_trigger_pulse(void)
 {
     gpio_set_level(GPIO_NUM_34, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(TRIGGER_PULSE_MS));
     gpio_set_level(GPIO_NUM_34, 1);
 }
 
@@ -498,7 +540,10 @@ esp_err_t spi_camera_send_trigger(void)
         if (ret != ESP_OK) return ret;
     }
     send_trigger_pulse();
-    ESP_LOGI(TAG, "Trigger sent (early, parallel with P4 photo save)");
+    /* Hot path: one per capture. DEBUG is enough — "Capture %03d"
+     * from pimslo_capture_task + "Capture all: N/M" already cover the
+     * user-visible summary. */
+    ESP_LOGD(TAG, "Trigger sent (early, parallel with P4 photo save)");
     return ESP_OK;
 }
 
@@ -534,7 +579,9 @@ static esp_err_t capture_all_impl(uint8_t *jpeg_bufs[4], size_t jpeg_sizes[4],
         if (!(pre_triggered && attempt == 0)) {
             send_trigger_pulse();
         }
-        ESP_LOGI(TAG, "Trigger %s (attempt %d), waiting for captures...",
+        /* Per-capture (per-attempt). DEBUG — "Capture all: N/M" summarizes
+         * the outcome. */
+        ESP_LOGD(TAG, "Trigger %s (attempt %d), waiting for captures...",
                  (pre_triggered && attempt == 0) ? "skipped — pre-triggered" : "sent",
                  attempt + 1);
         /* Normal post-trigger wait: 300 ms in fast mode, 500 ms otherwise.

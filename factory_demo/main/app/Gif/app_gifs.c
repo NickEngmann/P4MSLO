@@ -167,6 +167,14 @@ static gif_cache_slot_t g_gif_cache[MAX_CACHED_GIFS];
 static volatile bool s_gallery_open = false;
 static volatile bool s_bg_abort_current = false;
 
+/* Forward declaration of the bg worker task handle. The actual
+ * definition lives further down next to app_gifs_start_background_worker.
+ * Needed up here because app_gifs_encode_pimslo_from_dir gates its
+ * mid-encode abort check on `xTaskGetCurrentTaskHandle() == s_bg_worker`
+ * — the pimslo_encode_queue_task must run to completion even during
+ * gallery nav, while bg_worker's optional re-encode can bail. */
+static TaskHandle_t s_bg_worker = NULL;
+
 /* Timestamp (ms) of the last gallery-nav call (app_gifs_next / _prev).
  * bg_worker uses this to throttle: a new ~50-second PIMSLO encode must
  * not start while the user is actively scrubbing through entries,
@@ -627,8 +635,14 @@ fail_release:
  * pixel buffer is never materialized — tjpgd emits MCU tiles and we
  * pick the pixels we care about inline. */
 
+/* tjpgd in_cb pattern is extremely fread-unfriendly (many small 2-8
+ * byte marker reads). Slurping the whole file into PSRAM first and
+ * serving from memory drops a ~1 MB preview JPEG decode from ~15 s
+ * to ~650 ms on this board. Same pattern as show_jpeg's jpeg_ctx_t. */
 typedef struct {
-    FILE *fp;
+    const uint8_t *src;   /* full JPEG bytes, memory-resident */
+    size_t src_len;
+    size_t src_pos;
     uint16_t *canvas;
     int canvas_w, canvas_h;
     int crop_x, crop_y, crop_w, crop_h;    /* source-space crop rect */
@@ -637,10 +651,23 @@ typedef struct {
 static size_t jpeg_crop_in_cb(JDEC *jd, uint8_t *buf, size_t len)
 {
     jpeg_crop_ctx_t *c = (jpeg_crop_ctx_t *)jd->device;
-    if (buf) return fread(buf, 1, len, c->fp);
-    return (size_t)(fseek(c->fp, (long)len, SEEK_CUR) == 0 ? len : 0);
+    size_t avail = (c->src_pos < c->src_len) ? (c->src_len - c->src_pos) : 0;
+    if (len > avail) len = avail;
+    if (buf) memcpy(buf, c->src + c->src_pos, len);
+    c->src_pos += len;
+    return len;
 }
 
+/* This function runs inside tjpgd's per-MCU callback, invoked 19,200
+ * times for a 2560×1920 source JPEG. At -Og the loop body dominated
+ * the decode — 30+ seconds per JPEG because every integer divide +
+ * bit-pack ran unoptimized. gif_encoder.c's equivalent output_cb is in
+ * the file-level -O2 list (see factory_demo/CMakeLists.txt), which is
+ * why that path decoded the same JPEGs in ~2 s. Rather than pull the
+ * whole app_gifs.c into -O2 (lots of LVGL surface we'd have to
+ * re-validate), let the compiler fold just this hot function. Same
+ * treatment below for jpeg_out_cb. */
+__attribute__((optimize("O2")))
 static int jpeg_crop_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
 {
     jpeg_crop_ctx_t *c = (jpeg_crop_ctx_t *)jd->device;
@@ -648,34 +675,70 @@ static int jpeg_crop_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
     int bw = rect->right - rect->left + 1;
     int bh = rect->bottom - rect->top + 1;
 
-    /* Nearest-neighbor downscale. We emit every source pixel that falls
-     * inside the crop rect into its out_x/out_y slot — later writes
-     * overwrite earlier ones (last-write-wins). The earlier "only emit
-     * the first src that maps to this out" check was broken for non-
-     * integer scale ratios (1824→240 = 7.6): integer division of
-     * (out*crop/canvas) did not always round-trip with (src*canvas/crop),
-     * leaving some output columns unwritten. Those cells kept the
-     * memset'd 0x1010 value, rendering as the dark-blue vertical bars
-     * on the .p4ms previews. */
-    for (int by = 0; by < bh; by++) {
-        int src_y = rect->top + by;
-        if (src_y < c->crop_y || src_y >= c->crop_y + c->crop_h) continue;
-        int cropped_y = src_y - c->crop_y;
-        int out_y = (cropped_y * c->canvas_h) / c->crop_h;
-        if (out_y < 0 || out_y >= c->canvas_h) continue;
+    /* Nearest-neighbor downscale — output-cell-driven iteration.
+     * For each canvas cell whose nearest source falls inside this MCU
+     * AND inside the crop rect, pluck that one source pixel. This is
+     * O(canvas_cells_hit) instead of O(MCU_bw · MCU_bh), which at a
+     * 1824×1920 crop → 240×240 canvas is ~58× fewer iterations per
+     * MCU. Previously this function was clocking 30-44 s per 2560×1920
+     * source JPEG because the old per-src-pixel form did 2 × 32-bit
+     * divides PER SOURCE PIXEL (4.9 M px × 2 divides = 10 M divides
+     * per JPEG).
+     *
+     * Writer contract matches the prior form: nearest-neighbor,
+     * last-write-wins across MCU boundaries. The earlier "only emit
+     * the first src that maps to this out" optimization was wrong
+     * for non-integer ratios (integer division of (out*crop/canvas)
+     * didn't always round-trip with (src*canvas/crop), leaving some
+     * output columns unwritten → dark-blue vertical bars on
+     * .p4ms previews). Here we rigorously map each canvas cell to
+     * exactly one source pixel via cropped_x/y = out * crop/canvas
+     * and touch every cell, so the bars can't come back. */
+    const int cx = c->crop_x;
+    const int cy = c->crop_y;
+    const int cw = c->crop_w;
+    const int ch = c->crop_h;
+    const int ow = c->canvas_w;
+    const int oh = c->canvas_h;
 
-        for (int bx = 0; bx < bw; bx++) {
-            int src_x = rect->left + bx;
-            if (src_x < c->crop_x || src_x >= c->crop_x + c->crop_w) continue;
-            int cropped_x = src_x - c->crop_x;
-            int out_x = (cropped_x * c->canvas_w) / c->crop_w;
-            if (out_x < 0 || out_x >= c->canvas_w) continue;
+    /* Output Y range: out_y whose src_y (= cy + out_y * ch / oh) lands
+     * in [rect->top, rect->bottom]. Rearranged:
+     *    out_y_lo = ceil((rect->top    - cy) * oh / ch)
+     *    out_y_hi = floor((rect->bottom - cy) * oh / ch)
+     * Clamp to [0, oh). */
+    int rel_top = rect->top - cy;
+    int rel_bot = rect->bottom - cy;
+    int out_y_lo = (rel_top <= 0) ? 0
+                                  : (rel_top * oh + ch - 1) / ch;
+    int out_y_hi = (rel_bot <  0) ? -1
+                                  : (rel_bot * oh) / ch;
+    if (out_y_hi >= oh) out_y_hi = oh - 1;
 
-            const uint8_t *px = &src[(by * bw + bx) * 3];
+    int rel_left  = rect->left  - cx;
+    int rel_right = rect->right - cx;
+    int out_x_lo = (rel_left  <= 0) ? 0
+                                    : (rel_left  * ow + cw - 1) / cw;
+    int out_x_hi = (rel_right <  0) ? -1
+                                    : (rel_right * ow) / cw;
+    if (out_x_hi >= ow) out_x_hi = ow - 1;
+
+    for (int out_y = out_y_lo; out_y <= out_y_hi; out_y++) {
+        int cropped_y = (out_y * ch) / oh;
+        int src_y = cy + cropped_y;
+        int by = src_y - rect->top;
+        if (by < 0 || by >= bh) continue;
+        uint16_t *dst_row = &c->canvas[out_y * ow];
+        const uint8_t *src_row = &src[by * bw * 3];
+        for (int out_x = out_x_lo; out_x <= out_x_hi; out_x++) {
+            int cropped_x = (out_x * cw) / ow;
+            int src_x = cx + cropped_x;
+            int bx = src_x - rect->left;
+            if (bx < 0 || bx >= bw) continue;
+            const uint8_t *px = &src_row[bx * 3];
             uint16_t pxl = ((px[0] >> 3) << 11)
                          | ((px[1] >> 2) << 5)
                          |  (px[2] >> 3);
-            c->canvas[out_y * c->canvas_w + out_x] = (pxl >> 8) | (pxl << 8);
+            dst_row[out_x] = (pxl >> 8) | (pxl << 8);
         }
     }
     return 1;
@@ -693,12 +756,38 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
     FILE *fp = fopen(jpeg_path, "rb");
     if (!fp) return ESP_ERR_NOT_FOUND;
 
-    /* tjpgd working buffer. PSRAM so the task stack stays small. */
-    uint8_t *work = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM);
-    if (!work) { fclose(fp); return ESP_ERR_NO_MEM; }
+    /* Slurp whole file into PSRAM — see jpeg_crop_in_cb comment for why
+     * fread-per-callback is untenable here. */
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return ESP_FAIL; }
+    uint8_t *jpeg_buf = heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM);
+    if (!jpeg_buf) { fclose(fp); return ESP_ERR_NO_MEM; }
+    size_t got = fread(jpeg_buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (got != (size_t)sz) { heap_caps_free(jpeg_buf); return ESP_FAIL; }
+
+    /* tjpgd working buffer. MUST live in internal RAM — tjpgd reads and
+     * writes it hot during decode (IDCT LUTs, MCU state, Huffman
+     * tables). The prior MALLOC_CAP_SPIRAM version turned a 2 s decode
+     * into a 30 s decode. The prior `static uint8_t s_tjpgd_work[32768]`
+     * version fixed the speed but permanently claimed 32 KB of BSS —
+     * which, combined with show_jpeg's existing `static uint8_t
+     * tjpgd_work[32768]`, dropped RETENT_RAM by 64 KB and made
+     * app_video_stream_init OOM at boot (video utils 0x101), dead
+     * viewfinder, user can't take a photo. Use a transient INTERNAL
+     * alloc per call — fast (not PSRAM), no permanent BSS. */
+    uint8_t *work = heap_caps_malloc(32768, MALLOC_CAP_INTERNAL);
+    if (!work) {
+        heap_caps_free(jpeg_buf);
+        return ESP_ERR_NO_MEM;
+    }
 
     jpeg_crop_ctx_t ctx = {
-        .fp = fp,
+        .src = jpeg_buf,
+        .src_len = (size_t)sz,
+        .src_pos = 0,
         .canvas = canvas,
         .canvas_w = canvas_w, .canvas_h = canvas_h,
         .crop_x = crop_x, .crop_y = crop_y,
@@ -714,7 +803,7 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
         r = gif_jd_decomp(&jd, jpeg_crop_out_cb, 0);
     }
     heap_caps_free(work);
-    fclose(fp);
+    heap_caps_free(jpeg_buf);
     return (r == JDR_OK) ? ESP_OK : ESP_FAIL;
 }
 
@@ -747,11 +836,14 @@ static esp_err_t save_small_gif_from_jpegs(const char *capture_dir,
         uint16_t *canvas = heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM);
         if (!canvas) { free(local.gif_path); goto fail; }
 
+        uint32_t td0 = esp_log_timestamp();
         esp_err_t r = decode_jpeg_crop_to_canvas(jpeg_path,
                                                   crops[i].x, crops[i].y,
                                                   crops[i].w, crops[i].h,
                                                   canvas,
                                                   s_ctx.canvas_width, s_ctx.canvas_height);
+        ESP_LOGI(TAG, "save_small_gif_from_jpegs: cam %d decode took %lums",
+                 src_pos[i], (unsigned long)(esp_log_timestamp() - td0));
         if (r != ESP_OK) {
             heap_caps_free(canvas);
             ESP_LOGW(TAG, "save_small_gif_from_jpegs: decode %s failed", jpeg_path);
@@ -1590,6 +1682,9 @@ static size_t jpeg_in_cb(JDEC *jd, uint8_t *buf, size_t len)
     return len;
 }
 
+/* -O2 for the same reason as jpeg_crop_out_cb above: this is a per-MCU
+ * tjpgd output callback and runs thousands of times per JPEG decode. */
+__attribute__((optimize("O2")))
 static int jpeg_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
 {
     jpeg_ctx_t *c = (jpeg_ctx_t *)jd->device;
@@ -1988,13 +2083,21 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     int delay_cs = (frame_delay_ms > 0 ? frame_delay_ms : 150) / 10;
     float strength = (parallax > 0.0f && parallax <= 1.0f) ? parallax : 0.05f;
 
-    /* Fast-path abort: the caller (bg_worker) may have flipped
-     * s_bg_abort_current between deciding to start us and us actually
-     * running. Honor that before we claim is_encoding + the 7 MB
-     * PSRAM scaled buffer. Gallery knob nav sets this flag (see
-     * app_gifs_next / _prev) so new encodes don't fire into the face
-     * of an actively-navigating user. */
-    if (s_bg_abort_current) {
+    /* s_bg_abort_current is set by gallery-nav (app_gifs_next / _prev)
+     * so the bg_worker's optional PIMSLO re-encode can bail early. It
+     * must NOT apply to the main pimslo_encode_queue_task, which is
+     * the first-class path from a fresh capture → .gif on SD — that
+     * path has to run to completion even if the user is scrubbing
+     * through the gallery. Gate the abort check by caller identity:
+     * only honor the flag when we're executing on the bg_worker task.
+     *
+     * Prior bug: test 02's capture → encode chain fired gallery nav
+     * during encode, which set the flag, which aborted the encode,
+     * producing "GIF encode failed for P4M%04d: 0x103" and no
+     * finished .gif.
+     */
+    const bool is_bg_caller = (xTaskGetCurrentTaskHandle() == s_bg_worker);
+    if (is_bg_caller && s_bg_abort_current) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2012,11 +2115,8 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
     int src_pos[MAX_PIMSLO_CAMS] = {0};
 
     for (int i = 0; i < MAX_PIMSLO_CAMS; i++) {
-        /* Per-JPEG abort check: the user can flip s_bg_abort_current
-         * at any time (gallery nav, new capture arrived, etc). Stop
-         * here before we burn 5 more seconds on SD I/O + PSRAM alloc
-         * for the next pos.jpg. */
-        if (s_bg_abort_current) {
+        /* Per-JPEG abort check — bg_worker only (see main guard above). */
+        if (is_bg_caller && s_bg_abort_current) {
             ret = ESP_ERR_INVALID_STATE;
             ESP_LOGI(TAG, "Encode aborted mid-load (%d/%d cams loaded)",
                      num_cams, MAX_PIMSLO_CAMS);
@@ -2044,10 +2144,8 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         num_cams++;
     }
 
-    /* Second gate: after all JPEGs are loaded, before we claim the
-     * HW JPEG decoder and allocate the 7 MB scaled_buf. Nav that
-     * happened during the SD reads gets its grace period here. */
-    if (s_bg_abort_current) {
+    /* Second gate: bg_worker caller only (see main guard above). */
+    if (is_bg_caller && s_bg_abort_current) {
         ret = ESP_ERR_INVALID_STATE;
         ESP_LOGI(TAG, "Encode aborted pre-palette (all JPEGs loaded, %d cams)",
                  num_cams);
@@ -2348,7 +2446,8 @@ esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax)
  * flags, and any in-progress pre-render polls `s_bg_abort_current` so
  * foreground activity can preempt it. */
 
-static TaskHandle_t  s_bg_worker = NULL;
+/* Actual storage — declared up near the other module-scope statics
+ * via the `s_bg_worker` forward decl; see comment there. */
 /* s_gallery_open / s_bg_abort_current are declared near the top of the
  * file so play_current() can poke them. */
 

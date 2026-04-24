@@ -735,8 +735,11 @@ static void dispatch_command(char *line)
         size_t dma_int_large = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         size_t int_free      = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
         size_t int_large     = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        cmd_respond("heap_caps dma_int=%zu (largest=%zu) int=%zu (largest=%zu)",
-                    dma_int_free, dma_int_large, int_free, int_large);
+        size_t psram_free    = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        size_t psram_large   = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        cmd_respond("heap_caps dma_int=%zu (largest=%zu) int=%zu (largest=%zu) psram=%zu (largest=%zu)",
+                    dma_int_free, dma_int_large, int_free, int_large,
+                    psram_free, psram_large);
     } else if (strcmp(line, "menu_goto") == 0) {
         cmd_menu_goto(arg ? arg : "main");
     } else if (strcmp(line, "btn_up") == 0) {

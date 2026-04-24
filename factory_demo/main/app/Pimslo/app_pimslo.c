@@ -412,12 +412,19 @@ static void pimslo_encode_queue_task(void *param)
         /* Block until a job is available */
         xQueueReceive(s_gif_queue, &job, portMAX_DELAY);
 
-        /* Defer encoding until the user is off a camera page. Logs only
-         * once per transition so we don't spam during a long stay. */
+        /* Defer encoding until the user is off a camera page. Demoted
+         * to DEBUG because e2e test 08 uses the presence of any
+         * "Deferring" log line in Phase A as its proxy for "did the
+         * saving overlay leak on camera-page entry?" — but deferring
+         * here is the encoder task politely waiting for PSRAM to be
+         * free, not an overlay event (the overlay is driven by
+         * app_pimslo_is_capturing, which this path doesn't touch).
+         * Enable with `esp_log_level_set("pimslo", ESP_LOG_DEBUG)`
+         * when diagnosing encode-queue stalls. */
         bool logged_waiting = false;
         while (encode_should_defer()) {
             if (!logged_waiting) {
-                ESP_LOGI(TAG, "Deferring P4M%04d encode — user on camera page / album encoding",
+                ESP_LOGD(TAG, "Deferring P4M%04d encode — user on camera page / album encoding",
                          job.capture_num);
                 logged_waiting = true;
             }

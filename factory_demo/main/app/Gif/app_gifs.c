@@ -34,6 +34,30 @@
 
 static const char *TAG = "app_gifs";
 
+/* Shared tjpgd working buffer — used by both show_jpeg() (gallery
+ * preview flash onto the LVGL canvas, LVGL task) and
+ * decode_jpeg_crop_to_canvas() (.p4ms preview save, pimslo_save_task
+ * on Core 1).
+ *
+ * tjpgd needs 32 KB in internal RAM for its Huffman tables + IDCT
+ * state + MCU scratch. Previously show_jpeg had a function-local
+ * `static uint8_t tjpgd_work[32768]` and decode_jpeg_crop_to_canvas
+ * used a transient `heap_caps_malloc(32768, MALLOC_CAP_INTERNAL)`.
+ * The transient alloc started OOM'ing once the gallery was open +
+ * the P4 photo save ran SD writes + SPI camera allocated its
+ * permanent DMA-internal buffers — largest-free-block could drop
+ * to 4-7 KB by the time decode_jpeg_crop fired, well below the
+ * 32 KB needed. That made the .p4ms preview save silently fail on
+ * every capture under normal e2e test pressure.
+ *
+ * Since the codebase already has TWO 32 KB statics in BSS for
+ * tjpgd (show_jpeg's local + gif_encoder.c's `tjwork[32768]`),
+ * promoting show_jpeg's local to file scope and sharing with
+ * decode_jpeg_crop is a net-zero BSS change. A mutex prevents
+ * races between the LVGL task and pimslo_save_task. */
+static uint8_t s_tjpgd_work[32768] __attribute__((aligned(4)));
+static SemaphoreHandle_t s_tjpgd_mutex = NULL;
+
 /* Compile-time switch for per-step timing in the gallery play_current /
  * show_jpeg hot paths. Off by default (zero overhead — the compiler
  * elides the esp_log_timestamp() calls and the ESP_LOGI lines). Flip
@@ -778,14 +802,14 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
      * app_video_stream_init OOM at boot (video utils 0x101), dead
      * viewfinder, user can't take a photo. Use a transient INTERNAL
      * alloc per call — fast (not PSRAM), no permanent BSS. */
-    uint8_t *work = heap_caps_malloc(32768, MALLOC_CAP_INTERNAL);
-    if (!work) {
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        ESP_LOGW(TAG, "decode_jpeg_crop: OOM for 32KB work buf (largest internal=%zu) path=%s",
-                 largest, jpeg_path);
+    /* Shared with show_jpeg() — see s_tjpgd_work comment at file top.
+     * Worst-case mutex hold: show_jpeg's decode (~650 ms). */
+    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "decode_jpeg_crop: tjpgd mutex timeout — show_jpeg holding too long?");
         heap_caps_free(jpeg_buf);
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_TIMEOUT;
     }
+    uint8_t *work = s_tjpgd_work;
 
     jpeg_crop_ctx_t ctx = {
         .src = jpeg_buf,
@@ -811,7 +835,7 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
                      r, jd.width, jd.height, sz, ctx.src_pos, ctx.src_len, jpeg_path);
         }
     }
-    heap_caps_free(work);
+    if (s_tjpgd_mutex) xSemaphoreGive(s_tjpgd_mutex);
     heap_caps_free(jpeg_buf);
     return (r == JDR_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -1248,6 +1272,10 @@ cleanup:
 esp_err_t app_gifs_init(lv_obj_t *canvas)
 {
     memset(&s_ctx, 0, sizeof(s_ctx));
+
+    if (!s_tjpgd_mutex) {
+        s_tjpgd_mutex = xSemaphoreCreateMutex();
+    }
 
     s_ctx.canvas = canvas;
     s_ctx.canvas_width = BSP_LCD_H_RES;
@@ -1780,8 +1808,12 @@ static esp_err_t show_jpeg(const char *path)
         return ESP_FAIL;
     }
 
-    /* Reasonable working buffer size for tjpgd's LUT + state. */
-    static uint8_t tjpgd_work[32768] __attribute__((aligned(4)));
+    /* Shared tjpgd work buffer — see s_tjpgd_work comment at file top. */
+    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "show_jpeg: tjpgd mutex timeout");
+        heap_caps_free(jpeg_buf);
+        return ESP_ERR_TIMEOUT;
+    }
 
     jpeg_ctx_t ctx = {
         .src = jpeg_buf,
@@ -1794,10 +1826,11 @@ static esp_err_t show_jpeg(const char *path)
 
     JDEC jd;
     TIMING_MARK(t_prep0);
-    JRESULT r = gif_jd_prepare(&jd, jpeg_in_cb, tjpgd_work, sizeof(tjpgd_work), &ctx);
+    JRESULT r = gif_jd_prepare(&jd, jpeg_in_cb, s_tjpgd_work, sizeof(s_tjpgd_work), &ctx);
     TIMING_MARK(t_prep1);
     if (r != JDR_OK) {
         ESP_LOGE(TAG, "JPEG header parse failed for %s (jdr=%d)", path, r);
+        if (s_tjpgd_mutex) xSemaphoreGive(s_tjpgd_mutex);
         heap_caps_free(jpeg_buf);
         return ESP_FAIL;
     }
@@ -1836,6 +1869,7 @@ static esp_err_t show_jpeg(const char *path)
                ctx.src_w, ctx.src_h,
                (unsigned long)(t_prep1 - t_prep0),
                (unsigned long)(t_dec1 - t_dec0));
+    if (s_tjpgd_mutex) xSemaphoreGive(s_tjpgd_mutex);
     heap_caps_free(jpeg_buf);
     if (r != JDR_OK) {
         ESP_LOGE(TAG, "JPEG decode failed (jdr=%d)", r);

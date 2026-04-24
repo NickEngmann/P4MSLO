@@ -343,6 +343,67 @@ static void cmd_sd_rm(const char *path)
     }
 }
 
+/* Recursive directory wipe. Used by `tests/e2e/run_all.sh` at the start
+ * of the full regression suite to clear accumulated PIMSLO captures +
+ * generated GIFs — a bloated gallery slows every test (44+ entry scans,
+ * DMA-internal fragmentation from preview decodes, 134 s encodes that
+ * should be 50 s). This is DESTRUCTIVE; only run on test-rig SD cards.
+ * Traverses path, unlinks regular files and recurses into subdirs,
+ * then removes the target directory itself. Caller's responsibility
+ * to point it only at known-safe directories (no `/sdcard` root). */
+static void cmd_sd_rmrf(const char *path)
+{
+    if (!path || !*path || strcmp(path, "/") == 0 ||
+        strcmp(path, "/sdcard") == 0) {
+        cmd_respond("error: refusing unsafe path '%s'", path ? path : "(null)");
+        return;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        /* Not an error to try to wipe a non-existent dir. */
+        cmd_respond("ok sd_rmrf %s (not present)", path);
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(path) == 0) {
+            cmd_respond("ok sd_rmrf %s (file)", path);
+        } else {
+            cmd_respond("error: sd_rmrf unlink %s failed", path);
+        }
+        return;
+    }
+    DIR *d = opendir(path);
+    if (!d) {
+        cmd_respond("error: sd_rmrf opendir %s failed", path);
+        return;
+    }
+    int removed = 0, failed = 0;
+    struct dirent *e;
+    char full[260];
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+        struct stat est;
+        if (stat(full, &est) != 0) { failed++; continue; }
+        if (S_ISDIR(est.st_mode)) {
+            /* One-level recurse via re-entry is fine for our 2-deep
+             * capture-dir layout (/sdcard/p4mslo/P4Mxxxx/pos*.jpg).
+             * Guard against the unsafe paths at the top prevents
+             * accidental root wipe through recursion. */
+            closedir(d);
+            cmd_sd_rmrf(full);
+            d = opendir(path);
+            if (!d) { cmd_respond("error: sd_rmrf reopen %s", path); return; }
+            removed++;
+            continue;
+        }
+        if (unlink(full) == 0) removed++; else failed++;
+    }
+    closedir(d);
+    if (rmdir(path) != 0) failed++;
+    cmd_respond("ok sd_rmrf %s: %d removed, %d failed", path, removed, failed);
+}
+
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static void cmd_sd_base64(const char *args)
@@ -788,6 +849,8 @@ static void dispatch_command(char *line)
         cmd_sd_hexdump(arg ? arg : "");
     } else if (strcmp(line, "sd_rm") == 0) {
         cmd_sd_rm(arg);
+    } else if (strcmp(line, "sd_rmrf") == 0) {
+        cmd_sd_rmrf(arg);
     } else if (strcmp(line, "sd_base64") == 0) {
         cmd_sd_base64(arg ? arg : "");
     } else {

@@ -52,14 +52,15 @@ def main():
         _lib.do(s, 'menu_goto gifs', 6, fh)
         _lib.do(s, 'status', 2, fh)
 
-        # Encode is ~50 s under ideal (idle-gallery) conditions but
-        # stretches to 120-180 s when it overlaps with gallery
-        # playback + foreground UI. 180 s covers the observed worst
-        # case on this build where test 02's gallery-nav phase starts
-        # while the encoder is still working and every frame has to
-        # contend for PSRAM + the shared tjpgd engine.
-        _lib.mark(fh, 'PHASE 3 — wait for encode to complete (up to 180s)')
-        t_end = time.time() + 180
+        # Encode is ~50 s nominal but observed up to ~280 s in
+        # practice: the pimslo_encode_queue_task has an internal
+        # `encode_should_defer` loop that won't start until we're off
+        # CAMERA + gallery has been opened + no in-flight encode, so
+        # the queue timer can idle well past the initial photo_btn
+        # before actually kicking off the encode, then the encode
+        # itself takes 50-120 s. 300 s covers the observed worst case.
+        _lib.mark(fh, 'PHASE 3 — wait for encode to complete (up to 300s)')
+        t_end = time.time() + 300
         got_gif = False
         while time.time() < t_end:
             _lib.drain(s, 5, fh)

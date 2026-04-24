@@ -161,7 +161,11 @@ def log_path(test_script_path):
 def summarize(txt):
     """Common counters every test surfaces."""
     return {
-        'watchdogs': txt.count('task_wdt'),
+        # Count actual watchdog EVENTS, not individual log lines —
+        # ESP-IDF prints 5-6 `task_wdt:` lines per event (the trigger
+        # message, the task list, the register dump header, etc.).
+        # The "got triggered" line is the unique per-event anchor.
+        'watchdogs': txt.count('Task watchdog got triggered'),
         'panics': txt.count('Guru Meditation'),
         'ping_pong': txt.count('CMD>pong'),
         'photo_btn': (txt.count('photo_btn (take_photo scheduled)') +

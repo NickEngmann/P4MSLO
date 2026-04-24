@@ -58,7 +58,7 @@ def main():
     with open(LOG, 'w') as fh:
         _lib.drain(s, 3, fh)
         _lib.do(s, 'ping', 2, fh)
-        _lib.do(s, 'heap_caps', 3, fh)
+        _lib.do(s, 'heap_caps', 5, fh)
         _lib.do(s, 'status', 2, fh)
     s.close()
 

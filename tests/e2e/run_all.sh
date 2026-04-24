@@ -21,9 +21,9 @@ set -eu
 cd "$(dirname "$0")"
 
 # Per-test hard cap — `timeout` SIGTERMs on expiry. Most tests run in
-# 20-90 s; 300 s covers the slowest legit test (05 with its 150 s
-# bg-worker observation window + setup).
-PER_TEST_TIMEOUT=300
+# 20-90 s; 420 s covers the slowest legit test (02 with its 300 s
+# encode-complete wait + photo_btn + gallery setup overhead).
+PER_TEST_TIMEOUT=420
 
 TESTS=(
     01_boot_and_liveness.py
@@ -64,6 +64,30 @@ except Exception as e:
 # ESP32-P4 boots in 1-2 s but LVGL + video stream init adds another
 # ~2 s before the serial_cmd task is reading. 8 s is comfortable margin.
 sleep 8
+
+# Wipe accumulated PIMSLO content from SD BEFORE running the suite.
+# A full gallery (40+ entries) fragments the DMA-internal pool enough
+# to OOM the tjpgd 32 KB work buffer and drags PIMSLO encodes from
+# 50 s → 130+ s — both cause test 02 to fail on encode-wait timeout
+# and watchdog-starved IDLE0 during the encode. Starting each full
+# run from an empty SD makes capture + encode timing deterministic.
+# Keep /sdcard/esp32_p4_pic_save (normal P4 photo album) around; only
+# nuke the PIMSLO-related dirs + previews.
+echo "Wiping SD PIMSLO state..."
+python3 -c "
+import serial, time
+s = serial.Serial('${P4MSLO_TEST_PORT}', 115200, timeout=0.3)
+for d in ['/sdcard/p4mslo', '/sdcard/p4mslo_gifs', '/sdcard/p4mslo_small',
+          '/sdcard/p4mslo_previews']:
+    s.write(('sd_rmrf ' + d + '\n').encode()); s.flush()
+    time.sleep(6)  # wipe can be slow on 40+ entries
+    resp = s.read(4000).decode('utf-8','replace').strip()
+    # Print the 'ok sd_rmrf ...' response line
+    for line in resp.splitlines():
+        if 'sd_rmrf' in line and ('ok' in line or 'error' in line):
+            print('  ' + line)
+s.close()
+"
 
 total=${#TESTS[@]}
 pass=0

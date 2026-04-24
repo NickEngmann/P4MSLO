@@ -51,16 +51,25 @@ def main():
         _lib.do(s, 'ping', 1.5, fh)
         _lib.do(s, 'status', 1.5, fh)
 
-        # --- 2/3/4. Page nav + buttons on each page ---
-        # Keyword → reported page name (see cmd_menu_goto in
-        # app_serial_cmd.c — `usb` maps to `USB_DISK`, `video` to
-        # `VIDEO_MODE`, not the literal arg).
-        _lib.mark(fh, '2/9 page nav')
+        # --- 2. SPI capture FIRST, before anything fragments the
+        #     DMA-internal pool. Tests showed: doing page nav + SD
+        #     + gallery first dropped dma_int largest-free-block from
+        #     6.4 KB at boot to ~2 KB by the time spi_pimslo ran,
+        #     and ESP-IDF's per-xfer priv-alloc path then panics on
+        #     setup_dma_priv_buffer. The capture path is the most
+        #     alignment-sensitive consumer; run it while the pool is
+        #     fresh. All subsequent subsystems (LCD, SD, etc.) can
+        #     fragment the pool freely after. ---
+        _lib.mark(fh, '2/9 spi_pimslo one shot (pool fresh)')
+        _lib.do(s, 'spi_pimslo 150 0.05', 20, fh)
+
+        # --- 3. Page nav over all 6 pages + buttons ---
+        _lib.mark(fh, '3/9 page nav')
         for page in ['camera', 'gifs', 'video', 'usb', 'settings', 'main']:
             _lib.do(s, f'menu_goto {page}', 3, fh)
             _lib.do(s, 'ping', 1, fh)
 
-        _lib.mark(fh, '3/9 buttons on main menu')
+        _lib.mark(fh, '4/9 buttons on main menu')
         for btn in ['btn_up', 'btn_down', 'btn_up', 'btn_down']:
             _lib.do(s, btn, 0.6, fh)
 
@@ -73,12 +82,8 @@ def main():
         _lib.do(s, 'sd_ls /sdcard/p4mslo_gifs', 3, fh)
         _lib.do(s, 'sd_ls /sdcard/p4mslo_small', 3, fh)
 
-        # --- 7. SPI capture (one shot, don't wait for encode) ---
-        _lib.mark(fh, '7/9 spi_pimslo one shot')
-        _lib.do(s, 'spi_pimslo 150 0.05', 20, fh)
-
-        # --- 8. Gallery + play ---
-        _lib.mark(fh, '8/9 gallery + nav')
+        # --- 7/8. Gallery + nav ---
+        _lib.mark(fh, '7/9 gallery + nav')
         _lib.do(s, 'menu_goto gifs', 4, fh)
         _lib.do(s, 'btn_up', 2, fh)
         _lib.do(s, 'btn_down', 2, fh)

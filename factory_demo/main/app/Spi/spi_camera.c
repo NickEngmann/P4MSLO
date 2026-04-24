@@ -77,6 +77,18 @@ static bool s_fast_mode = false;
  * capture task (or the serial-command task, mutually exclusive). */
 static uint8_t *s_chunk_rx = NULL;
 
+/* Permanent DMA-capable all-zeros TX buffer for the chunked receive
+ * path. We used to pass `tx_buffer = NULL` to spi_device_transmit
+ * when pulling the 4 KB JPEG chunks from the S3 (the slave ignores
+ * MOSI during the DATA phase), which let ESP-IDF allocate its own
+ * internal zero-fill TX scratch. With SPI_TRANS_DMA_BUFFER_ALIGN_MANUAL
+ * set on the transaction, that auto-alloc is DISABLED — a NULL TX
+ * now hits `setup_dma_priv_buffer(1203)` with "TX addr&len not align
+ * to 64". Providing our own aligned zero buffer removes the
+ * ambiguity. 4 KB internal cost matches s_chunk_rx's footprint and
+ * is still trivial next to the 30 KB-ish DMA-internal pool. */
+static uint8_t *s_chunk_tx_zeros = NULL;
+
 /* Permanent DMA-internal scratch buffers for small status/control
  * transactions. Sized to exactly one cache line (64 B on ESP32-P4)
  * because `spi_master.c::setup_dma_priv_buffer` triggers a per-xfer
@@ -267,8 +279,13 @@ esp_err_t spi_camera_init(void)
                      heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
         }
     }
-    if (!s_scratch_tx || !s_scratch_rx) {
-        ESP_LOGW(TAG, "SPI scratch alloc failed — status polls will fall back to per-call priv buffer alloc (fragile)");
+    if (!s_chunk_tx_zeros) {
+        s_chunk_tx_zeros = heap_caps_aligned_alloc(128, SPI_CHUNK_SIZE,
+                                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (s_chunk_tx_zeros) memset(s_chunk_tx_zeros, 0, SPI_CHUNK_SIZE);
+    }
+    if (!s_scratch_tx || !s_scratch_rx || !s_chunk_tx_zeros) {
+        ESP_LOGW(TAG, "SPI scratch/chunk_tx alloc failed — status polls will fall back to per-call priv buffer alloc (fragile)");
     }
 
     s_initialized = true;

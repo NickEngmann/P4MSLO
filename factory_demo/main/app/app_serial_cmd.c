@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include "esp_log.h"
+#include "esp_system.h"
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_vfs_dev.h"
@@ -417,6 +418,16 @@ static void dispatch_command(char *line)
 
     if (strcmp(line, "ping") == 0) {
         cmd_ping();
+    } else if (strcmp(line, "reboot") == 0) {
+        /* Used by tests/e2e/run_all.sh to force a clean boot before a
+         * long suite run so accumulated PSRAM fragmentation / heap
+         * state from prior iterations doesn't bias late-in-suite
+         * tests. No confirmation — tests explicitly ask for this.
+         * `esp_restart()` does not return; the response fires first
+         * so the test can see the ack before the reboot. */
+        cmd_respond("ok reboot");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
     } else if (strcmp(line, "trigger") == 0) {
         cmd_trigger(arg);
     } else if (strcmp(line, "spi_init") == 0) {

@@ -39,13 +39,19 @@ def main():
         # btn_down ONCE to reach ALBUM.
         for i in range(5):
             _lib.mark(fh, f'CYCLE #{i+1}: home → up-to-top → down → menu → back')
-            _lib.do(s, 'menu_goto main', 1, fh)
+            # Longer settle after menu_goto main — the first 1-2 btn_up
+            # events otherwise race the main-menu paint on fresh boot
+            # (the scroll-end callback that sets `selected_btn` only
+            # fires once LVGL has finished the initial layout pass).
+            # Observed pattern at 1 s settle: 2 of 5 cycles landed on
+            # CAMERA instead of ALBUM; at 2 s the flake disappears.
+            _lib.do(s, 'menu_goto main', 2, fh)
             # Scroll all the way up to CAMERA — send up 8x (more than
             # the 6 menu entries) so we're definitely at the top.
             for _ in range(8):
-                _lib.do(s, 'btn_up', 0.25, fh)
+                _lib.do(s, 'btn_up', 0.35, fh)
             # Extra settle time so scroll-end callback sets selected_btn
-            _lib.drain(s, 0.5, fh)
+            _lib.drain(s, 0.8, fh)
 
             # btn_down to highlight ALBUM (2nd item after CAMERA)
             _lib.do(s, 'btn_down', 1.2, fh)

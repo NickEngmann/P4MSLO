@@ -40,6 +40,31 @@ TESTS=(
     05_bg_encode_while_on_gallery.py
 )
 
+# Force a clean boot — 11+ tests of capture/encode churn leave the
+# PSRAM heap and camera-buffer lifetimes in a state that has surfaced
+# late-suite panics (Store access fault at 83 min uptime in test 09).
+# Starting every full run from a fresh boot keeps each test running
+# against the same baseline heap state. Fire-and-forget: the `reboot`
+# serial command (app_serial_cmd.c) prints its ack and then
+# esp_restart()s, so we just sleep long enough for the device to come
+# back up before the first test opens the port.
+: "${P4MSLO_TEST_PORT:=/dev/ttyACM0}"
+echo "Requesting device reboot on ${P4MSLO_TEST_PORT} for clean baseline state..."
+python3 -c "
+import serial, time, sys
+try:
+    s = serial.Serial('${P4MSLO_TEST_PORT}', 115200, timeout=0.3)
+    s.write(b'reboot\n'); s.flush()
+    time.sleep(0.5)
+    print(s.read(200).decode('utf-8','replace').strip())
+    s.close()
+except Exception as e:
+    print(f'reboot request failed ({e}) — proceeding with existing state')
+"
+# ESP32-P4 boots in 1-2 s but LVGL + video stream init adds another
+# ~2 s before the serial_cmd task is reading. 8 s is comfortable margin.
+sleep 8
+
 total=${#TESTS[@]}
 pass=0
 t0=$(date +%s)

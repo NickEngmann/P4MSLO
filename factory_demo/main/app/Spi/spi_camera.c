@@ -95,7 +95,15 @@ static uint8_t *s_chunk_rx = NULL;
  * 8 bytes it cares about. The extra 56 bytes of wire time at 10 MHz
  * cost ~50 µs per poll — trivially cheaper than the priv-alloc
  * churn this replaces. */
-#define SPI_SCRATCH_SIZE 64
+/* 128, not 64: ESP-IDF's SPI master on ESP32-P4 queries
+ * `esp_cache_get_alignment(MALLOC_CAP_DMA, ...)` and on some P4X
+ * configurations that returns > 64 — even though the L1 D-cache line
+ * itself is 64 B. At 64, `setup_dma_priv_buffer(1206)` still fired
+ * after a fresh boot on capture #156 despite our scratch buffer being
+ * aligned-alloc'd to 64. 128 satisfies all observed cache_align_int
+ * values. Wire cost: 128 B at 10 MHz = ~100 µs per poll — trivially
+ * cheaper than the priv-alloc panic path. */
+#define SPI_SCRATCH_SIZE 128
 static uint8_t *s_scratch_tx = NULL;
 static uint8_t *s_scratch_rx = NULL;
 
@@ -206,11 +214,11 @@ esp_err_t spi_camera_init(void)
      * ("setup_dma_priv_buffer(1206): Failed to allocate priv RX
      * buffer") mid-capture around camera 4. */
     if (!s_scratch_tx) {
-        s_scratch_tx = heap_caps_aligned_alloc(64, SPI_SCRATCH_SIZE,
+        s_scratch_tx = heap_caps_aligned_alloc(128, SPI_SCRATCH_SIZE,
                                                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     }
     if (!s_scratch_rx) {
-        s_scratch_rx = heap_caps_aligned_alloc(64, SPI_SCRATCH_SIZE,
+        s_scratch_rx = heap_caps_aligned_alloc(128, SPI_SCRATCH_SIZE,
                                                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     }
     /* Also claim the 4 KB aligned chunk-RX buffer here. If we wait until
@@ -222,7 +230,7 @@ esp_err_t spi_camera_init(void)
      * init) the LCD trans_size buffer is already claimed but SD + other
      * drivers haven't fragmented the pool yet. */
     if (!s_chunk_rx) {
-        s_chunk_rx = heap_caps_aligned_alloc(64, SPI_CHUNK_SIZE,
+        s_chunk_rx = heap_caps_aligned_alloc(128, SPI_CHUNK_SIZE,
                                              MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (!s_chunk_rx) {
             ESP_LOGW(TAG, "SPI chunk rx eager alloc failed (largest "
@@ -268,7 +276,7 @@ static esp_err_t spi_xfer_cam(int cam_idx, const uint8_t *tx, uint8_t *rx, size_
 
     cs_assert(cam_idx);
     spi_transaction_t trans = {
-        .length = wire_len * 8,
+        .length    = wire_len * 8,
         .tx_buffer = real_tx,
         .rx_buffer = real_rx,
     };
@@ -423,7 +431,7 @@ esp_err_t spi_camera_receive_jpeg(int camera_idx,
      * failing the capture outright. */
     if (!s_chunk_rx) {
         /* 64-byte aligned — see scratch-alloc comment in spi_camera_init. */
-        s_chunk_rx = heap_caps_aligned_alloc(64, SPI_CHUNK_SIZE,
+        s_chunk_rx = heap_caps_aligned_alloc(128, SPI_CHUNK_SIZE,
                                              MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (!s_chunk_rx) {
             ESP_LOGE(TAG, "OOM for SPI chunk rx buffer (permanent %d B, "

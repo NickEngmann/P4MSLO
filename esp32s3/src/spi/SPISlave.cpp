@@ -300,18 +300,33 @@ void SPISlave::spiTask(void *param)
 {
     SPISlave *self = (SPISlave *)param;
 
-    /* IDLE single buffer */
-    WORD_ALIGNED_ATTR uint8_t *tx_buf = (uint8_t *)heap_caps_calloc(1, CHUNK_SIZE, MALLOC_CAP_DMA);
-    WORD_ALIGNED_ATTR uint8_t *rx_buf = (uint8_t *)heap_caps_calloc(1, CHUNK_SIZE, MALLOC_CAP_DMA);
+    /* All SPI slave DMA buffers are 64-byte cache-line aligned.
+     * ESP-IDF's spi_slave.c calls esp_cache_get_alignment(MALLOC_CAP_DMA)
+     * which returns the L1 DCache line size on S3 (32 B default,
+     * configurable 16/32/64). If the user-passed buffer isn't aligned,
+     * spi_slave.c:442/459 allocates a per-transaction priv buffer via
+     * heap_caps_aligned_alloc — same fragmentation pattern as the P4
+     * master hit with its "setup_dma_priv_buffer Failed to allocate
+     * priv RX buffer" panic. heap_caps_malloc only guarantees word
+     * (4B) alignment, so we were paying that priv-alloc cost on every
+     * transaction. 64 B covers every DCache config up to
+     * CONFIG_ESP32S3_DATA_CACHE_LINE_64B. CHUNK_SIZE (4096) is already
+     * a multiple of 64, so the length side is always fine. */
+    uint8_t *tx_buf = (uint8_t *)heap_caps_aligned_alloc(64, CHUNK_SIZE,
+                                                         MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint8_t *rx_buf = (uint8_t *)heap_caps_aligned_alloc(64, CHUNK_SIZE,
+                                                         MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (tx_buf) memset(tx_buf, 0, CHUNK_SIZE);
+    if (rx_buf) memset(rx_buf, 0, CHUNK_SIZE);
 
     /* DATA ping-pong buffers — pre-allocated so entering DATA mode is fast */
     uint8_t *data_tx[2] = {
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
+        (uint8_t *)heap_caps_aligned_alloc(64, CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+        (uint8_t *)heap_caps_aligned_alloc(64, CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
     };
     uint8_t *data_rx[2] = {
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
-        (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA),
+        (uint8_t *)heap_caps_aligned_alloc(64, CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+        (uint8_t *)heap_caps_aligned_alloc(64, CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
     };
 
     if (!tx_buf || !rx_buf || !data_tx[0] || !data_tx[1] || !data_rx[0] || !data_rx[1]) {

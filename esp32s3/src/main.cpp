@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -266,42 +267,68 @@ static void doCapture() {
     statusLED.setState(LEDState::READY);
 }
 
-// ─── Trigger monitoring task ────────────────────────────────
+// ─── Trigger monitoring (ISR-driven) ────────────────────────
+//
+// Was a 10 ms-poll loop with edge detection. Failure mode: if the
+// trigger monitor task got preempted for longer than the P4's 250 ms
+// pulse width (camera driver, SD writes, and the SPI slave task at
+// prio 10 can all push it out), the falling edge happened entirely
+// between polls and lastState stayed HIGH → trigger missed. That
+// showed up as random camera drop-outs in 4/4 capture runs.
+//
+// Now: GPIO ISR on the falling edge gives a semaphore. The task just
+// waits on the semaphore. ISR latency is ~us regardless of what
+// other tasks are doing, so a missed trigger is no longer possible
+// short of a genuine hang. Debounce moves into the task (after the
+// semaphore take) so the ISR itself stays short.
+
+static SemaphoreHandle_t s_trigger_sem = nullptr;
+
+static void IRAM_ATTR trigger_isr(void *arg) {
+    BaseType_t higher = pdFALSE;
+    xSemaphoreGiveFromISR(s_trigger_sem, &higher);
+    if (higher == pdTRUE) portYIELD_FROM_ISR();
+}
 
 static void task_trigger_monitor(void *param) {
-    // Configure D0 as input with pull-up
+    // Configure D0 as input with pull-up, interrupt on falling edge.
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << TRIGGER_PIN);
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.intr_type = GPIO_INTR_NEGEDGE;
     gpio_config(&io_conf);
 
-    bool lastState = true;  // Pull-up: idle = HIGH
+    s_trigger_sem = xSemaphoreCreateBinary();
+    configASSERT(s_trigger_sem);
+
+    // install_isr_service is idempotent — if some other subsystem
+    // already installed it (shouldn't happen here but be defensive),
+    // the ESP_ERR_INVALID_STATE return is harmless.
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    gpio_isr_handler_add((gpio_num_t)TRIGGER_PIN, trigger_isr, nullptr);
+
     uint32_t lastTriggerMs = 0;
 
     while (true) {
-        bool currentState = gpio_get_level((gpio_num_t)TRIGGER_PIN);
-
-        // Detect falling edge (HIGH -> LOW) with debounce
-        if (lastState && !currentState) {
+        // Block here until either an edge fires the ISR OR an HTTP
+        // capture request comes in. 50 ms poll period is for the HTTP
+        // path (flag set by captureRequested=true); the ISR wakes us
+        // within microseconds of the edge regardless.
+        if (xSemaphoreTake(s_trigger_sem, pdMS_TO_TICKS(50)) == pdTRUE) {
             uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
             if (now - lastTriggerMs > TRIGGER_DEBOUNCE_MS) {
                 lastTriggerMs = now;
-                ESP_LOGI(TAG, "D0 trigger detected!");
+                ESP_LOGI(TAG, "D0 trigger detected (ISR)");
                 captureRequested = true;
             }
         }
 
-        // Also check for HTTP-triggered captures
         if (captureRequested) {
             captureRequested = false;
             doCapture();
         }
-
-        lastState = currentState;
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 

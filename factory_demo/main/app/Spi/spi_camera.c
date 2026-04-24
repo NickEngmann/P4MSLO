@@ -115,16 +115,45 @@ static const int s_cs_pins[SPI_CAM_COUNT] = {
 static inline void cs_assert(int cam_idx)
 {
     gpio_set_level((gpio_num_t)s_cs_pins[cam_idx], 0);
-    /* CS setup time — lets the slave's GPIO edge ISR re-enable MISO output
-     * before the first SCLK edge. ~5 µs covers worst-case ISR latency. */
-    esp_rom_delay_us(5);
+    /* CS setup time — the S3 slave uses spi_slave_transmit internally
+     * which queues a transaction and waits for the hardware CS edge;
+     * on CS assert the driver flips MISO from high-Z to output and
+     * the first clock needs to arrive after that. 5 µs was empirically
+     * too tight on this 4-cam PCB v2 — individual cameras would drop
+     * out of 4/4 runs. Bumped to 25 µs to give worst-case ISR latency
+     * + MISO output-enable stabilization a wide margin. Cost: 20 µs
+     * per SPI poll × ~8 polls per capture × 4 cameras = 640 µs per
+     * capture — negligible next to the 2 s transfer window. */
+    esp_rom_delay_us(25);
 }
 
 /* Drive the specified camera's CS pin HIGH (deassert). */
 static inline void cs_deassert(int cam_idx)
 {
-    esp_rom_delay_us(1);    /* minimal hold */
+    /* CS hold time — give the slave a window to tri-state its MISO
+     * output before we drop CS. At 1 µs this was cutting it close:
+     * on back-to-back camera polls the shared MISO bus would still
+     * be weakly driven by the previous S3 when the next CS asserted,
+     * causing ghost data in the next camera's status bytes. 10 µs
+     * is well past the S3's MISO disable propagation. */
+    esp_rom_delay_us(10);
     gpio_set_level((gpio_num_t)s_cs_pins[cam_idx], 1);
+    /* Post-deassert gap — needs to be long enough for the slave's
+     * IDLE loop to:
+     *   1. Return from spi_slave_transmit (CS deassert triggered it)
+     *   2. memset(tx_buf, 0, 4096)          — ~20 µs
+     *   3. Re-populate the IDLE header      — negligible
+     *   4. Re-call spi_slave_transmit       — ESP-IDF queue setup,
+     *                                         ~50-200 µs on S3
+     * If we start the next master transaction before this sequence
+     * completes, the slave has nothing queued and MISO reads as
+     * zeros — observed symptom: cams 2/3/4 would time out on
+     * poll_and_get_size despite having jpeg_ready=1 in their next
+     * cam_status query. 500 µs covers the worst-case re-queue
+     * window with a wide margin. Cost: ~0.5 ms per SPI transaction
+     * × ~8 transactions per capture × 4 cameras = 16 ms per capture
+     * — negligible next to the 2 s transfer window. */
+    esp_rom_delay_us(500);
 }
 
 static spi_device_handle_t get_device(int cam_idx)

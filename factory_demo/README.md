@@ -1,4 +1,41 @@
-# Factory Demo
+# Factory Demo (P4MSLO master firmware)
+
+> **⚠ This is the P4MSLO fork of Espressif's P4-EYE factory demo.**
+>
+> The original project was a single-camera AI demo (face/pedestrian
+> detection, YOLOv11n object detection, timed capture, video recording,
+> etc.). **All AI components have been removed** along with most of the
+> original camera-app screens. What remains:
+>
+> - The BSP plumbing (display, knob, buttons, SD, USB)
+> - The P4 viewfinder + photo capture path (still uses MIPI-CSI OV2710)
+> - The album/JPEG-decoder path (legacy, kept compiled but not on the menu)
+> - The serial command interface (extended for PIMSLO)
+>
+> Layered on top: the **PIMSLO 4-camera stereoscopic GIF pipeline** —
+> the master fires GPIO34, captures 4× ESP32-S3 cameras over SPI,
+> encodes a 1824×1920 6-frame GIF + 240×240 `.p4ms` preview. See:
+>
+> - [../README.md](../README.md) — project overview
+> - [../CLAUDE.md](../CLAUDE.md) — engineering reference (PIMSLO pipeline,
+>   memory budget, known issues, test infrastructure)
+> - [../CLAUDE-MOCK.md](../CLAUDE-MOCK.md) — host mock harness reference
+> - [../tests/README.md](../tests/README.md) — on-device e2e tests
+>
+> The original Espressif feature documentation below is kept for
+> reference but **does not describe what this firmware does anymore**.
+> AI Detection, YOLO, Settings → "enable YOLO object detection",
+> Album → object detection on browse — **all removed**. The sections
+> on Photo Capture, Timed Capture, Video Recording, USB Mounting are
+> still functional in a degraded form (no AI overlay, no YOLO).
+>
+> Build / flash steps from the original doc still work, but you'll
+> usually want the project-root commands instead — see
+> [../README.md § Quick start](../README.md#quick-start).
+>
+> ---
+>
+> **Original Espressif factory-demo documentation follows.**
 
 [中文版本](./README_CN.md)
 

@@ -25,8 +25,8 @@ Expected output ends with `HOST SUITE: ALL PASS` (~2 seconds).
 | `host_encode` | The actual `gif_encoder.c` + `gif_lzw.c` + `gif_quantize.c` + `gif_tjpgd.c` source files compiled against host stubs, driven against the 4 fixture JPEGs in `debug_gifs/`. Compiled with `-fsanitize=address,undefined` so heap-corruption / use-after-free / OOB write bugs in the encoder fire here too. 50× back-to-back stress run. **Validates: encoder code is memory-clean.** |
 | `test_budget` | Every known sized allocation on the device (LCD, LVGL, SPI camera, all task stacks, encoder buffers, viewfinder, album PPA, etc.) has an entry in the `P4_BUDGET_BASELINE` catalog. The simulator runs them through the constrained allocator and reports which fall back to PSRAM and which hard-fail. Compares BASELINE vs PROPOSED architecture catalogs side-by-side. **Validates: the proposed memory layout is feasible.** |
 | `test_phases` | Walks through the full PIMSLO photo→encode lifecycle as a sequence of alloc/free events: boot → capture → save → free viewfinder → encoder_create → pass1×4 → pass2×4 → encoder_destroy → realloc viewfinder. Catches order-dependent bugs ("forgot to free viewfinder before allocating scaled_buf"). **Validates: lifecycle ordering is correct.** |
-| `test_timing` | Predicts end-to-end encode duration for both stack regimes (INTERNAL vs PSRAM) using measured per-frame numbers from the device. Confirms PROPOSED arch hits the < 2 min target while BASELINE doesn't. **Validates: the timing fix actually fixes the timing.** |
-| `test_e2e` | Ten user-visible scenarios mirroring the on-device e2e tests: photo from MAIN, photo from CAMERA + nav, multiple photos, too-few-cams drop, bg worker recovery, gallery yield, memory steady state, etc. **Validates: user-facing flows work end-to-end.** |
+| `test_timing` | Predicts end-to-end encode duration for the LUT-placement variants (PSRAM, INTERNAL BSS, RGB444, OCTREE_TCM, OCTREE_HPRAM) using measured per-frame numbers from the device. Confirms which architecture hits the < 2 min target. **Validates: the timing fix actually fixes the timing.** |
+| `test_e2e` | **31 user-visible scenarios** mirroring on-device e2e tests: photo from MAIN, photo from CAMERA + nav, multiple photos, too-few-cams drop, bg worker recovery, gallery yield, memory steady state, foreground vs bg encode, app_album release/reacquire JPEG-decoder dance (4 scenarios), gallery delete-modal flows, p4ms persistence across page transitions, long-sequence heap stability (30-cycle stress), encoder timing per LUT variant. **Validates: user-facing flows work end-to-end.** |
 
 ## The simulator library
 
@@ -40,16 +40,20 @@ chip has multiple banks (a 7 MB alloc doesn't preclude a parallel
 
 Two preset memory models:
 
-  - `P4_MEM_MODEL_DEFAULT` — post-boot snapshot. `dma_int largest=6400`,
-    `int largest=7168`, `psram largest=8650752` plus a 6 MB second PSRAM
-    block. Numbers are direct reads from the `heap_caps` serial cmd on
-    the live board. Use this when simulating runtime behavior of the
-    AS-IS firmware.
+  - `P4_MEM_MODEL_DEFAULT` — post-boot snapshot. **Updated 2026-04-25
+    after `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` bumped 32 KB → 64 KB:**
+    `dma_int largest=36864` (was 6400), `int largest=31732` (was 7168),
+    `psram largest=8388608` plus a 6 MB second PSRAM block. TCM is
+    4 KB usable (8 KB total - 4 KB consumed by the encoder's R4G4B4
+    LUT). Numbers are direct reads from the `heap_caps` serial cmd
+    on the live board. Use this when simulating runtime behavior of
+    the current firmware.
 
   - `P4_MEM_MODEL_RAW` — pre-BSS, pre-ESP-IDF state. Use when
     experimenting with "what if I add or remove N KB of BSS?": start
     RAW, run the catalog (BSS items drain the pools first), then
-    runtime allocs see the resulting headroom.
+    runtime allocs see the resulting headroom. Also updated for the
+    64 KB DMA reservation.
 
 The allocator tracks:
   - active alloc count + bytes per pool
@@ -402,67 +406,115 @@ observation: 8bb11b7 (the 100% SPI baseline) has three 32 KB BSS
 items in the same region without breaking SPI, but a single 64 KB
 item flips it.
 
-## TCM-octree path — RECOMMENDED next step (mock-validated)
+## TCM-LUT path — SHIPPED (commit `a206f6e`, 2026-04-25)
 
 The encoder's per-pixel LUT lookup needs internal-RAM speed but
-shouldn't compete with SPI's DMA pool. Solution: put an 8 KB
-**octree LUT in TCM** (the Tightly-Coupled Memory at 0x30100000).
-TCM is:
+shouldn't compete with SPI's DMA pool. Solution: put a small LUT in
+**TCM** (the Tightly-Coupled Memory at 0x30100000). TCM is:
   - Separate from HP L2MEM (where the DMA pool lives)
-  - 8 KB total — exactly fits an octree-quantized 256-color palette LUT
-  - Closer to the core than HP L2MEM (1-2 cycle load latency)
+  - 8 KB total — but ~2.8 KB consumed by `pmu_init.c` and friends
+  - Closer to the core than HP L2MEM (single-cycle access)
   - Pre-cleared at boot, so functionally a normal BSS region
 
-The simulator now models TCM as `P4_POOL_TCM`. Octree LUT lookups
-take 3-4 indirections per pixel (vs 1 for the flat 64 KB LUT) but
-all in cache-warm TCM, so the per-pixel cost is roughly 1.8× the
-flat-internal nominal — still 15× faster than PSRAM-resident.
+**Final implementation: 4 KB R4G4B4 LUT** (12-bit address, 4 bits each
+of R/G/B). The original "8 KB octree" plan in this section was
+prototyped against an 8 KB R4G5B4 direct LUT, but that overflowed
+`tcm_idram_seg` by 2816 bytes at link time once the pmu_init.c TCM
+usage was accounted for. 4 KB R4G4B4 fits with 1280 B headroom.
 
-### Predicted timings (test_timing output)
+Mock simulator predicted ~54 s for an 8 KB octree-TCM path; hardware
+delivered ~140 s with the 4 KB direct-TCM LUT. The gap is:
+- Mock used a single `LUT_PENALTY` scalar; reality has multiple
+  cumulative penalties on the dither hot loop (PSRAM err_cur/err_nxt,
+  scaled_buf reads, etc.) that the timing model didn't separate.
+- The 4 KB R4G4B4 lookup is ~25× faster than the PSRAM 64 KB LUT,
+  same as the mock predicted; the encoder Pass 2 work is no longer
+  LUT-bound.
 
-| arch                                           | total | budget |
-|------------------------------------------------|-------|--------|
-| BASELINE (PSRAM stack + PSRAM LUT)             | 331 s | ✗      |
-| PROPOSED (commit 72e06bd, current shipping)    | 260 s | ✗      |
-| PROPOSED + RGB444 LUT (4 KB internal, lossy)   |  50 s | ✓      |
-| **PROPOSED + OCTREE LUT in TCM (8 KB)**        | **54 s** | **✓** |
-| PROPOSED + OCTREE LUT in HP L2MEM (rejected)   |  56 s | ✓ but SPI risk |
-| PROPOSED + 64 KB BSS LUT (rejected)            |  48 s | ✓ but SPI broken |
+The mock budget catalog still has the OCTREE_TCM and OCTREE_HPRAM
+entries for what-if comparisons. The actual shipping LUT placement
+is `P4_LUT_OCTREE_TCM` in the timing model (the model name is
+historical — the implementation is a direct R4G4B4 lookup, not an
+octree, but in TCM at the modeled size).
 
-### dma_int budget under PROPOSED_OCTREE_TCM
+### What the firmware change actually looked like
 
-| catalog                            | dma_int largest |
-|------------------------------------|-----------------|
-| BASELINE / RAW                     |  ~32 KB         |
-| PROPOSED with BSS_LUT (rejected)   |   1.6 KB ✗      |
-| **PROPOSED with octree-in-TCM**    | **27.6 KB ✓**   |
+In `factory_demo/main/app/Gif/gif_encoder.c`:
+```c
+TCM_DRAM_ATTR static uint8_t s_pixel_lut_tcm[4096] __attribute__((aligned(64)));
 
-The budget simulator scenario `proposed_octree_tcm_passes_dma_int_budget`
-asserts dma_int stays ≥ 5 KB (LCD priv-TX threshold). Currently passes.
+esp_err_t gif_encoder_pass1_finalize(gif_encoder_t *enc) {
+    // ... build palette ...
+    enc->pixel_lut = s_pixel_lut_tcm;          // no heap alloc — TCM static
+    gif_quantize_build_lut12(&enc->palette, enc->pixel_lut);
+    return ESP_OK;
+}
+```
 
-### What the firmware change looks like
+And in the Pass 2 hot loop:
+```c
+uint16_t d12 = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+uint8_t idx = lut[d12];   // single TCM indirection, ~3 ns
+```
 
-When ready to ship (after this mock prototyping):
+`gif_quantize.c::gif_quantize_build_lut12()` iterates the 4096
+buckets, expands each R4G4B4 to RGB888 with bit replication, finds
+the nearest palette entry, and writes the index. ~40 ms to build.
 
-1. In `gif_encoder.c`:
-   - Drop the `heap_caps_malloc(65536, MALLOC_CAP_SPIRAM)` for `pixel_lut`.
-   - Replace with a static octree built into a
-     `__attribute__((section(".tcm.bss")))` array, ~8 KB.
-   - Replace per-pixel `idx = lut[d16]` with
-     `idx = octree_lookup(octree, r, g, b)` — 3-4 indirections.
-2. In `gif_quantize.c`:
-   - New `gif_quantize_build_octree(palette, octree)` that fills the
-     TCM array from the 256-color palette.
-3. No linker script change needed — `tcm_idram_seg` is already
-   configured at `0x30100000 / 0x2000` per `factory_demo.map`.
+### dma_int budget on hardware (verified)
 
-The octree algorithm (iterate RGB888 high bits, descend tree by
-branch index, leaves point to palette index) is well-known.
-Implementation effort: ~2-3 hours for the forward port + a unit
-test against the host fixtures in `debug_gifs/`.
+| state                                | dma_int largest |
+|--------------------------------------|-----------------|
+| Pre-fix (LUT in PSRAM)               | ~6.4 KB         |
+| Tried: 64 KB BSS LUT in HP L2MEM     | ~1.6 KB → SPI panic |
+| **Shipped: 4 KB R4G4B4 in TCM + 64 KB DMA reserve** | **~36 KB ✓** |
 
-After flash:
-- `run_fast.sh` should pass (SPI healthy because dma_int intact)
-- Encode timing should land near 54 s on the legacy `pimslo` path
-- photo_btn flow's internal-stack `pimslo_encode_queue_task` should
-  hit the same number once cameras are 4/4 reliable
+The mock scenario `proposed_octree_tcm_passes_dma_int_budget` still
+runs as a regression check.
+
+### Hardware verification
+
+10× back-to-back `spi_pimslo` captures: **10/10 × 4/4 cameras**, zero
+priv_buf failures, zero panics. Encoder Pass 2 ~22 s/frame instead
+of ~270 s/frame from the original PSRAM-LUT pre-fix state.
+
+See [CLAUDE.md § Pipeline Timing](./CLAUDE.md#pipeline-timing-ov5640-4-cameras-working)
+and [docs/OPTIMIZATIONS.md](./docs/OPTIMIZATIONS.md) for the full
+canonical numbers.
+
+## Subsequent stability fixes (commits `d170f0e`, `1ac42a1`)
+
+Beyond the TCM LUT, two more fixes landed to address heap-corruption
+panics that surfaced under heavy concurrent load:
+
+### `gif_bg` static BSS stack (commit `d170f0e`)
+
+Was `xTaskCreatePinnedToCoreWithCaps(MALLOC_CAP_SPIRAM)` with a 16 KB
+PSRAM stack. The encoder hot path through gif_bg overflowed the stack
+into adjacent PSRAM heap blocks, corrupting free-block prev/next
+pointers. FreeRTOS canary doesn't reliably cover PSRAM stacks on this
+chip. Symptom: `tlsf::remove_free_block` panic with garbage MTVAL.
+
+Fixed by switching to `xTaskCreateStaticPinnedToCore` with a
+BSS-resident static 16 KB stack array in internal RAM. Mock budget
+catalog had this in the PROPOSED architecture for a while; the firmware
+just hadn't caught up.
+
+### Defense-in-depth combo (commit `1ac42a1`)
+
+Three knobs together because none alone covered all failure modes:
+
+1. **`CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536`** (was 32 KB) —
+   doubles DMA-only pool. Eliminates `setup_dma_priv_buffer(1206)`
+   panics in `13_spi_back_to_back.py`.
+2. **`CONFIG_HEAP_POISONING_LIGHT=y`** — defense-in-depth canary on
+   every allocation. Catches buffer overruns from the second
+   still-unidentified PSRAM-stack source (likely `pimslo_save` 6 KB
+   or `pimslo_cap` 8 KB).
+3. **`err_cur` / `err_nxt` → MALLOC_CAP_SPIRAM unconditionally** —
+   eliminates the encoder's per-frame internal-RAM allocation churn
+   that fragmented the dma_int pool.
+
+Mock catalog updated to match — DMA pool reservation reflected in the
+DEFAULT/RAW models, encoder per-frame allocs in `pimslo_sim.c`'s
+`run_encode_pipeline` model the PSRAM placement.

@@ -62,11 +62,16 @@ static bool              s_encoding = false;
  * actively in the encoder vs one still sitting in the queue. */
 static volatile uint16_t s_encoding_num = 0;
 static volatile bool     s_capturing = false;
-/* s_saving is an OR-signal: the capture task sets it right before it
- * enqueues a save job and the save task clears it when the job is done.
- * Keeps app_pimslo_is_capturing() truthy (and the "saving..." overlay
- * visible) across the capture→save handoff so the user sees continuous
- * feedback while the SD writes run in the background. */
+/* s_saving was originally an OR-signal in app_pimslo_is_capturing() to
+ * keep the "saving..." overlay visible through the capture→save
+ * handoff. As of 2026-04-25 it is NO LONGER used by the overlay —
+ * app_pimslo_is_capturing() returns just s_capturing so the overlay
+ * clears as soon as the SPI transfer finishes (~3 s) instead of
+ * waiting for the SD writes (~10 s). The flag is still
+ * set/cleared by capture/save tasks for telemetry — read it via
+ * `status` for "is the SD save queue draining?". DO NOT add it back
+ * to is_capturing without a strong reason — the user-visible photo
+ * cadence is now SPI-bound (~3 s/shot) and that's a major UX win. */
 static volatile bool     s_saving = false;
 static bool              s_initialized = false;
 
@@ -183,9 +188,12 @@ static void pimslo_capture_task(void *param)
         spi_camera_init();
 
         /* NB: the preview-JPEG copy (P4 latest photo → P4M<num>.jpg) is
-         * handled later on the save task. Keeping it out of this task
-         * shaves ~2 s of SD-I/O off the time the user's "saving"
-         * overlay stays up. */
+         * handled later on the save task. Keeping it off this task
+         * means the SPI capture window stays minimal — it doesn't
+         * actually shorten the user-visible "saving" overlay anymore
+         * (overlay = `s_capturing` only as of 2026-04-25, ~2-3 s),
+         * but it does keep the next photo cycle from being blocked
+         * by SD I/O. Don't move SD writes back here. */
 
         /* Create capture directory */
         char dir_path[64];
@@ -517,18 +525,31 @@ esp_err_t app_pimslo_init(void)
      * than 4 KB (observed stack-protect fault at 4 KB in prior attempt).
      *
      * Stack placed in PSRAM (xTaskCreatePinnedToCoreWithCaps +
-     * MALLOC_CAP_SPIRAM). The P4-EYE has a very tight DMA-capable
-     * internal RAM budget — only ~32 KB reserved by esp_psram at boot,
-     * most of which goes to FreeRTOS TCBs / SPI master scratch / etc.
-     * When this task's 6 KB stack was in internal RAM (the default),
-     * the LCD SPI driver's per-flush priv TX scratch allocation
-     * started failing ("setup_dma_priv_buffer: Failed to allocate priv
-     * TX buffer"), because LVGL's canvas buffer sits in PSRAM and the
-     * LCD SPI device doesn't set SPI_TRANS_DMA_USE_PSRAM, so every
-     * flush demands a fresh DMA-internal copy. Symptom: button presses
-     * register internally but the screen stops refreshing. Moving the
-     * stack to PSRAM is safe here because this task never runs from
-     * an ISR context; all it does is fwrite + ESP_LOGI. */
+     * MALLOC_CAP_SPIRAM). The P4-EYE has a tight DMA-capable internal
+     * RAM budget; this 6 KB stack would otherwise compete with LCD
+     * priv-TX scratch allocations. When this task's stack was in
+     * internal RAM (the default), the LCD SPI driver's per-flush priv
+     * TX scratch alloc failed (`setup_dma_priv_buffer: Failed to
+     * allocate priv TX buffer`), because LVGL's canvas buffer is in
+     * PSRAM and the ST7789 SPI device doesn't set
+     * SPI_TRANS_DMA_USE_PSRAM — every flush demands a fresh DMA-
+     * internal copy. Symptom: button presses register internally but
+     * the screen stops refreshing.
+     *
+     * SAFETY NOTE for future work: PSRAM stacks on ESP32-P4 have an
+     * unreliable canary — Espressif's RAM-usage docs admit
+     * `FREERTOS_CHECK_STACKOVERFLOW` "may skip over the watchpoint or
+     * canary on overflow and corrupt another region of RAM instead."
+     * Symptom in the wild: `tlsf::remove_free_block` panic with
+     * garbage MTVAL minutes or runs later. We hit this on `gif_bg`
+     * before moving its 16 KB stack to BSS internal (commit d170f0e).
+     * `pimslo_save` is OK in PSRAM ONLY because its call chain stays
+     * shallow (fopen → fwrite → fclose → log → free). Do NOT extend
+     * this task to call into the encoder, tjpgd, image processing, or
+     * anything else with deep recursion / large stack frames. If you
+     * need to add such work, allocate it on a separate task with a
+     * static BSS-internal stack (see `pimslo_encode_queue_task` and
+     * `gif_bg` for the pattern). */
     ret = xTaskCreatePinnedToCoreWithCaps(
         pimslo_save_task, "pimslo_save", 6144, NULL, 4, NULL, 1,
         MALLOC_CAP_SPIRAM);

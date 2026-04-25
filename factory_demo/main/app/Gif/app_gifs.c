@@ -2509,15 +2509,24 @@ esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax)
 
     s_ctx.is_encoding = true;
 
-    /* The legacy `pimslo` / `spi_pimslo` serial cmd path.
-     * xTaskCreatePinnedToCore (without caps) hardcodes
-     * MALLOC_CAP_INTERNAL for the stack — and after the s_pixel_lut
-     * BSS landed, internal_largest is ~15 KB, so a 16 KB stack alloc
-     * fails outright with no PSRAM fallback. Use WithCaps so this
-     * path keeps working even on the new BSS layout. The encoder
-     * runs slow on PSRAM stack, but this is the test/serial-cmd path
-     * — not the user-facing photo_btn flow which uses
-     * pimslo_encode_queue_task (static BSS stack). */
+    /* The legacy `pimslo` / `spi_pimslo` serial cmd path. PSRAM stack
+     * via xTaskCreatePinnedToCoreWithCaps + MALLOC_CAP_SPIRAM.
+     *
+     * Why PSRAM here when pimslo_encode_queue_task is BSS-internal?
+     * The two encoder-task slots BSS-internally are already taken by
+     * pimslo_encode_queue_task (16 KB) and gif_bg (16 KB). Internal
+     * RAM is too tight to stand up a third 16 KB BSS stack without
+     * pushing other things (SPI scratch, LCD priv-TX) past their
+     * minimums. This path is test/serial-cmd only — the user-facing
+     * photo_btn flow uses pimslo_encode_queue_task which has the BSS
+     * stack and the encoder is fast there.
+     *
+     * SAFETY caveat (same as pimslo_save in app_pimslo.c): the
+     * FreeRTOS canary doesn't reliably cover PSRAM stacks on
+     * ESP32-P4. Encoder hot-loop call chain via this path can
+     * overflow if anything is added to the encoder. If a tlsf::
+     * remove_free_block panic shows up after exercising this serial
+     * cmd, look here first. */
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
         pimslo_encode_task, "pimslo_enc", 16384, params, 5, NULL, 1,
         MALLOC_CAP_SPIRAM);

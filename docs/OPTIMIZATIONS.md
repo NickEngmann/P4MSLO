@@ -1,90 +1,273 @@
 # GIF Encoder Optimization Log
 
+Session log of perf work on the PIMSLO encoder. Numbers are measured
+on the actual P4MSLO device — ESP32-P4X v3.1, OV5640 cameras over
+SPI, 1824×1920 stereoscopic 6-frame GIFs (4 forward + 2 replayed).
+
+The original version of this doc covered the P4-EYE single-camera
+1920×1080 4-frame GIF encoder. That codebase is gone; this one is
+PIMSLO-specific. The "what worked" wins below carry over conceptually
+but the numbers are different.
+
 ## Hardware
-- **CPU**: ESP32-P4, dual-core RISC-V @ 360MHz
-- **ISA**: `rv32imafc_zicsr_zifencei_xesploop_xespv`
-- **RAM**: 32MB PSRAM @ 200MHz, ~350KB internal SRAM
-- **Target**: 4-frame 1920×1080 animated GIF with Floyd-Steinberg dithering
 
-## Results Summary
+- **CPU**: ESP32-P4X v3.1, dual-core RISC-V @ 400 MHz
+- **ISA**: `rv32imafc_zicsr_zifencei_xesploop_xespv` (no Zb)
+- **RAM**: 32 MB PSRAM @ 200 MHz, ~287 KB internal HP L2MEM, **8 KB TCM at 0x30100000**
+- **Target**: 1824×1920 stereoscopic GIF, 6 frames (4 forward + 2 replayed), Floyd-Steinberg dithering, 256-color palette
 
-| Optimization | dither+LZW/frame | Total (4 frames) | Speedup vs baseline |
-|---|---|---|---|
-| Baseline (no LUT, -Og) | ~40,000ms | ~160s | 1x |
-| **+ RGB565 LUT (64KB)** | ~4,500ms | ~30s | **5.3x** |
-| + XOR hash + generation counter | ~4,300ms | ~28s | 5.7x |
-| + Internal RAM LUT (64KB SRAM) | ~4,200ms | ~27s | 5.9x |
-| + Internal RAM error buffers (23KB) | ~4,000ms | ~26s | 6.2x |
-| + Row pixel prefetch (4KB SRAM) | ~3,950ms | ~26s | 6.2x |
-| + 32KB file write buffer | ~3,950ms | ~26s | 6.2x |
-| **+ -O3 compiler optimization** | ~3,600ms | ~24s | **6.7x** |
-| + SIMD memzero for error buffers | ~3,600ms | ~24s | 6.7x |
+## Headline numbers (current build, 2026-04-25)
 
-**Final: ~24 seconds for a 4-frame 1920×1080 dithered GIF (down from 160s)**
+| Stage | Time |
+|---|---|
+| User-visible "saving" overlay | **~2-3 s** (SPI capture only) |
+| Background SD save (4× ~500 KB) | ~6-12 s, invisible |
+| `.p4ms` preview generation (4× tjpgd → 240×240) | ~7 s |
+| GIF Pass 1 (palette build) | ~10-15 s |
+| GIF Pass 2 (6 frames × ~24 s/frame) | ~140 s |
+| **Total photo → playable GIF** | **~150-160 s (~2.5 min)** |
+| **Photo cadence (back-to-back)** | **every ~3 s** (SPI-bound) |
 
-## What Worked
+10 back-to-back `spi_pimslo` captures verified **10/10 × 4/4 cameras**
+at 100% on this build — see `tests/e2e/_spi_20shot.py`.
 
-### 1. RGB565 → Palette LUT (biggest win: 9x per-pixel speedup)
-Precompute a 64KB lookup table mapping every possible RGB565 value to its nearest palette index. Built once after palette finalization (~1.3s). Eliminates the 256-entry linear search per pixel — each pixel is now a single array lookup.
+## What's working in the current encoder
 
-### 2. -O3 Compiler Optimization (~15% improvement)
-Setting `-O3 -funroll-loops -ffast-math` for the GIF encoder/LZW/quantizer files while the rest of the project stays at `-Og`. The compiler does better register allocation, loop unrolling, and instruction scheduling.
+### 1. TCM-resident LUT (commit `a206f6e`)
 
-### 3. Internal RAM Placement (~10% improvement)
-Moving hot data structures from PSRAM (200MHz, high latency) to internal SRAM (~0 latency):
-- LUT: 64KB in SRAM (accessed every pixel)
-- Error diffusion buffers: 23KB in SRAM (read+written every pixel)
-- Row pixel cache: 4KB in SRAM (prefetch from PSRAM once per row)
-- Palette RGB arrays: 768 bytes on stack
+The Pass 2 hot loop's per-pixel palette lookup is the encoder's tightest
+inner loop. We've tried three places for the lookup table:
 
-### 4. LZW Hash Table Optimization
-- XOR-shift hash instead of multiply (faster on RISC-V)
-- Generation counter eliminates memset on dictionary reset (~500 resets/frame)
-- 16K→8K entries for better cache behavior
+| LUT placement | Per-lookup latency | Status |
+|---|---|---|
+| 64 KB RGB565 LUT in PSRAM | ~80 ns | Original — Pass 2 took ~270 s for a 6-frame GIF |
+| 64 KB RGB565 LUT in HP L2MEM BSS | ~3 ns | **REJECTED** — starved DMA-internal pool, broke SPI master |
+| **4 KB R4G4B4 LUT in TCM** | **~3 ns** | **CURRENT** — separate physical SRAM, doesn't compete with DMA |
 
-### 5. Two-Pass Row Processing
-Separate dithering (Pass A: pixel conversion + error distribution → indices array) from LZW encoding (Pass B: feed indices to compressor). Better cache behavior since each pass accesses memory sequentially.
+R4G4B4 = 12-bit address (4 bits each of R/G/B). The bottom 4 LSBs of
+each channel are dropped. Floyd-Steinberg's error propagation already
+adds noise larger than 4 LSBs, so the visual difference is below the
+encoder's noise floor.
 
-## What Didn't Help Much
+TCM lookup is `((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4)` — single
+indirection, ~3 ns. **~25× faster than the PSRAM LUT.**
 
-### Separated Error Distribution
-Collecting all errors in a buffer then distributing in three linear loops (below-left, below-center, below-right). Added overhead from the extra buffer and three passes outweighed the simpler loops. ~4,000ms vs 3,600ms — worse.
+The 4 KB sizing is forced by `pmu_init.c` and friends already
+consuming ~2.8 KB of the 8 KB TCM region. An 8 KB R4G5B4 attempt
+overflowed `tcm_idram_seg` by 2816 bytes.
 
-### int8_t Error Buffers
-Using int8_t instead of int16_t for error diffusion. PSRAM accesses are word-aligned regardless, so half-sized buffers don't reduce bandwidth. Clamping to ±127 also loses precision.
+### 2. BSS-resident static stacks for encoder tasks (commits `d170f0e`, `1ac42a1`)
 
-### Direct-Indexed LZW Dictionary (4MB table)
-Replacing the hash table with a direct `dict[prefix*256+suffix]` array. Zero collisions but 4MB allocation competed with other PSRAM buffers, causing allocation failures. The hash table with generation counter is a better tradeoff.
+`pimslo_encode_queue_task` ("pimslo_gif", 16 KB) and `gif_bg` (16 KB)
+both use `xTaskCreateStaticPinnedToCore` with stack arrays in
+internal-RAM BSS. The shorter-call-chain tasks (`pimslo_save` 6 KB,
+`pimslo_cap` 8 KB) keep PSRAM/internal stacks.
 
-## What We Investigated but Didn't Implement
+Why: per-pixel hot loop hits the stack constantly. PSRAM stack means
+every push/local-read costs ~100-200 ns instead of an internal-RAM
+cycle. Net effect on Pass 2 alone: ~12 s/frame (internal stack) →
+~55 s/frame (PSRAM stack). Plus the heap-corruption risk —
+the FreeRTOS canary doesn't reliably cover PSRAM stacks; a stack
+overflow into adjacent PSRAM heap blocks corrupts free-list metadata
+and panics later in `tlsf::remove_free_block`.
 
-### xespv SIMD Vector Instructions
-The ESP32-P4 has 128-bit vector registers (q0-q7) with operations like `esp.vadd.s16` (8 × int16 parallel add). We wrote a `gif_simd.S` with `esp.zero.q` for fast memzero and `gif_simd_distribute_below` for vectorized error distribution.
+The internal-RAM headroom for these stacks comes from the TCM LUT
+change above — moving the 64 KB LUT off internal RAM freed enough
+space.
 
-**Challenge**: Floyd-Steinberg dithering has horizontal dependencies (pixel x+1 depends on pixel x's error), making the core loop inherently serial. SIMD can only help the vertical error distribution (below-row), which is a small fraction of total time.
+### 3. Shared `s_tjpgd_work[32768]` workspace (commit `f9fad72`)
 
-**Opportunity**: The `esp.vmulas.s16.qacc` instruction could accelerate the error × fraction multiplies (7/16, 5/16, 3/16, 1/16) on 8 values at once, but requires careful assembly to handle the accumulator register protocol.
+`gif_encoder.c` and `app_gifs.c` used to each have their own 32 KB
+tjpgd workspace BSS. They never run concurrently within an encode
+pipeline (encoder uses it for Pass 1/Pass 2 decodes; app_gifs uses
+it for `decode_jpeg_crop_to_canvas` in the .p4ms path).
+Consolidated under a mutex (`s_tjpgd_mutex` in `app_gifs.c`):
 
-### Parallel Decode/Encode Pipeline
-Decode frame N+1 on a worker task while encoding frame N. Would save ~500ms/frame (the JPEG decode time). Requires double-buffering the scaled pixel buffer (2 × 4MB) and FreeRTOS synchronization. Estimated improvement: ~2 seconds total.
+- `app_gifs_acquire_tjpgd_work(timeout, &size)` — takes mutex, returns workspace pointer
+- `app_gifs_release_tjpgd_work()` — releases mutex
 
-### DMA2D Block Transfers
-The ESP32-P4 has a 2D DMA engine that could accelerate rectangle-to-rectangle memory copies. Could replace the row prefetch `memcpy` with async DMA, overlapping data transfer with computation.
+Saves 32 KB internal BSS. That headroom is what lets pimslo_gif have
+a static BSS stack.
 
-## Performance Breakdown (Current Best)
+### 4. `EXT_RAM_BSS_ATTR` for the 32 KB stdio fwrite buffer
 
-For a single 1920×1080 frame at -O3:
-- **JPEG decode + copy**: ~500ms (JPEG HW decoder + memcpy from decode buffer)
-- **Dithering loop**: ~2,000ms (2M pixels × RGB565→RGB888 + error + clamp + LUT + error distribution)
-- **LZW encoding**: ~1,500ms (2M pixels × hash lookup + bit packing + SD card writes)
-- **Total**: ~4,000ms/frame
+`gif_encoder.c::file_buf[32768]` lives in PSRAM (via
+`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y` + `EXT_RAM_BSS_ATTR`).
+SD throughput is the bottleneck (~250 KB/s); PSRAM access on the
+fwrite path is wildly faster than the bottleneck so the move is free.
 
-The ~2,000ms dithering is **~360 cycles/pixel** at 360MHz — close to the minimum for the arithmetic operations involved. The ~1,500ms LZW is **~270 cycles/pixel** for hash table lookup + variable-length code packing.
+Saves 32 KB internal BSS.
 
-## Future Ideas
+### 5. File-level `-O2` for pure-math files (`factory_demo/CMakeLists.txt`)
 
-1. **Ordered (Bayer) dithering** instead of Floyd-Steinberg — fully parallelizable (no pixel dependencies), SIMD-friendly, but lower visual quality
-2. **ESP32-P4 second core** — run dithering on core 0 and LZW on core 1 with a ring buffer between them
-3. **Reduced-precision dithering** — use 4-bit error fractions (shift only, no multiply) for the Floyd-Steinberg weights
-4. **Frame delta encoding** — GIF supports only encoding changed pixels between frames, dramatically reducing LZW work for similar consecutive frames
-5. **PSRAM burst optimization** — align data structures to cache lines and access in sequential bursts to maximize PSRAM throughput
+Global `COMPILER_OPTIMIZATION_DEBUG=y` (`-Og`) for stability, with
+`-O2` opt-in via `set_source_files_properties` for:
+
+- `main/app/Gif/gif_tjpgd.c` (JPEG decode)
+- `main/app/Gif/gif_encoder.c` (LZW + palette)
+- `main/app/Gif/gif_decoder.c` (LZW decode)
+- `main/app/Gif/gif_lzw.c`
+- `main/app/Gif/gif_quantize.c`
+- `main/app/Spi/spi_camera.c`
+
+These files are pure number-crunching with no LVGL / display
+interaction. Per-frame tjpgd decode goes ~2.2 s → ~1.7 s (~25%
+faster).
+
+Whole-component `-O2` was tried (LVGL, esp_lvgl_port, esp_lcd,
+esp_driver_spi/jpeg/isp/cam, the whole `main` component) — all of
+them WDT-hung. Per-file targeting is the safe path.
+
+### 6. Output-cell-driven JPEG downscale (commit `c9a4631`)
+
+In `app_gifs.c::jpeg_crop_out_cb` (the .p4ms path), the original
+implementation iterated every source pixel in each MCU and computed
+which output cell it maps to — O(MCU_bw × MCU_bh) per block, ~9.5 K
+ops per MCU at 16×16. Replaced with output-cell iteration: for each
+canvas cell whose nearest source falls inside this MCU and inside
+the crop rect, pluck that one source pixel — O(canvas_cells_hit)
+≈ ~160 ops per MCU on a 1824 → 240 downscale. **~58× fewer
+iterations per MCU.**
+
+Watch out: the inverse mapping has an off-by-one trap. The forward
+map is `cropped_x = floor(out_x * cw / ow)`, so the inverse upper
+bound must be `out_x_hi = ((rel_right + 1) * ow - 1) / cw`, NOT
+`floor(rel_right * ow / cw)`. The wrong formula loses one canvas
+column at every MCU boundary, rendering as **vertical dark bars on
+.p4ms previews**.
+
+### 7. SPI camera reliability (commits `8bb11b7`, `c835c28`, `eaadcbd`)
+
+The SPI master had two reliability problems:
+
+- **`setup_dma_priv_buffer(1206): Failed to allocate priv RX buffer`**
+  panic mid-capture, usually on camera 4 after 3 successful
+  captures. Cause: ESP-IDF's SPI master triggers a per-transaction
+  priv-buffer alloc whenever the source/dest buffer is not aligned
+  to `cache_align_int` (64 bytes on ESP32-P4). `heap_caps_malloc(
+  MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)` returns 4-byte aligned
+  blocks, which fails the 64-byte check; priv buf allocated per xfer
+  → fragmentation → NULL deref → panic.
+
+  Fixes:
+  1. Permanent 64-byte aligned `s_scratch_tx[16]` / `s_scratch_rx[16]`
+     for status/control transactions. `spi_xfer_cam` memcpys through
+     the scratch for any ≤16-byte transaction.
+  2. Permanent 64-byte aligned `s_chunk_rx[4096]` for chunked-RX,
+     claimed eagerly at `spi_camera_init` while DMA pool is fresh.
+  3. ISR-driven trigger on GPIO34 with a CS re-queue gap.
+
+- **DMA pool starvation under concurrent capture+encode** (commit
+  `1ac42a1`). The default `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768`
+  gave a 32 KB reserved pool for DMA-only allocations. Under
+  concurrent capture + encode + SD writes, fragmentation took the
+  largest free DMA block down to ~6-14 KB, which broke priv-buffer
+  alloc. Bumped to **64 KB**; now stays at ~30 KB largest under load.
+
+Result on `_spi_20shot.py 10`: **10/10 × 4/4 cameras**, zero priv_buf
+failures, zero panics.
+
+## What didn't work / things to avoid
+
+### 64 KB LUT in HP L2MEM BSS
+
+`s_pixel_lut[65536]` as static BSS got the per-pixel speedup (~25×
+faster than PSRAM) but the 64 KB consumed enough of HP L2MEM that
+`dma_int largest` dropped to ~1.6 KB. The SPI master's per-tx
+priv-buffer alloc then started failing → mid-capture panic. Reverted.
+
+The mock simulator (`p4_budget.c`) now mirrors INTERNAL BSS deductions
+≥32 KB into the dma_int pool to catch this kind of architecture
+regression at simulation time. See the
+`proposed_bss_lut_starves_dma_int` scenario in `test_e2e.c`.
+
+### `CONFIG_HEAP_POISONING_COMPREHENSIVE=y`
+
+Boot hung at LVGL init. The canary overhead was too high for the
+L2MEM headroom on this board. `CONFIG_HEAP_POISONING_LIGHT=y` boots
+fine and stays as defense-in-depth (~12 B per allocation).
+
+### Whole-component `-O2`
+
+Tried on LVGL, esp_lvgl_port, esp_lcd, esp_driver_*, `main` — all
+WDT-hung. Per-file `-O2` for pure-math files works, whole-component
+doesn't. (Specific symptom: under global `-O2`, LVGL's `lv_refr`
+busy-waits forever on `draw_buf->flushing` at `lv_refr.c:709`.)
+
+### Encoder error buffers in INTERNAL with PSRAM fallback
+
+`err_cur` / `err_nxt` (11.5 KB each, allocated per Pass 2 frame for
+Floyd-Steinberg) used to try `MALLOC_CAP_INTERNAL` first with PSRAM
+fallback. The 23 KB pair × 12 alloc cycles per encode (4 + 2 frames
+× 2 buffers) was the binding source of dma_int fragmentation under
+concurrent capture+encode.
+
+Manifested as either `setup_dma_priv_buffer(1206)` SPI master panics
+OR `sdmmc_write_sectors: not enough mem (0x101)` failures during the
+save task's SD writes. Forced to PSRAM unconditionally as of commit
+`1ac42a1`. Costs ~75 ns/access on the dither hot loop ≈ 1.5 s/frame
+≈ 10 s per 6-frame encode (so encode total went from ~95 s to
+~140 s). Acceptable trade vs OOM panics.
+
+### PSRAM-resident task stacks for the encoder hot path
+
+`pimslo_encode_queue_task` and `gif_bg` falling back to PSRAM (via
+`xTaskCreatePinnedToCore`'s silent fallback when internal can't
+satisfy the request) made the encoder ~5-7× slower AND introduced
+silent stack overflows that the FreeRTOS canary doesn't catch (see
+research notes from Espressif: forum t=22793). Static BSS internal
+stacks are the only stable option.
+
+## Memory layout pinned by these wins
+
+The current memory map is the result of trading off all of the above:
+
+| Region | Reserved for | Notes |
+|---|---|---|
+| TCM (8 KB) | 4 KB R4G4B4 LUT + ~2.8 KB pmu_init.c statics | Single-cycle access, separate from DMA |
+| HP L2MEM internal BSS | 32 KB shared tjpgd_work + 16 KB pimslo_gif stack + 16 KB gif_bg stack + 700 B static TCBs | All other BSS as needed |
+| HP L2MEM regular heap | task TCBs, scratch, drivers | ~73 KB free, ~32 KB largest post-boot |
+| HP L2MEM DMA-reserved | SPI master priv-buffers, SDMMC DMA descriptors | 64 KB reserved at boot via `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`, ~36 KB largest post-boot |
+| PSRAM | encoder scaled_buf (7 MB), album PPA (6 MB), file_buf (32 KB EXT_RAM_BSS), err_cur/err_nxt (23 KB per encode), pimslo_save stack (6 KB), frame caches | ~17 MB free post-boot, 8.4 MB largest contig |
+
+## Things to consider for the next round
+
+1. **Streaming GIF playback decoder** — already done in commit
+   `e0dea27`. Peak playback memory dropped 6.7 MB → 3.5 MB.
+
+2. **Parallel decode/encode pipeline** — decode frame N+1 on a
+   worker task while encoding frame N. Saves ~1.7 s/frame. Requires
+   double-buffered scaled_buf (2× 7 MB = 14 MB PSRAM). Estimated
+   improvement: ~10 s per encode (~7%). Probably not worth the
+   complexity.
+
+3. **DMA2D for cache row prefetch** — `enc->scaled_buf` is in PSRAM;
+   `row_cache[1920]` is internal. Currently `memcpy` per row. The
+   ESP32-P4 has a DMA2D engine that could do this async, overlapping
+   with the previous row's dither work. Estimated saving: ~50 ms /
+   frame (1920 × 2 bytes ÷ PSRAM bandwidth). Negligible.
+
+4. **Move the encoder error buffers back to internal somehow** —
+   ~10 s/encode regression from the PSRAM placement. Would need to
+   either (a) reduce internal-BSS footprint somewhere else first, or
+   (b) keep the error buffers internal but allocate them ONCE per
+   encoder session (not per frame) so the per-frame churn is
+   eliminated.
+
+5. **Ordered (Bayer) dithering** — fully parallelizable (no pixel
+   dependencies), SIMD-friendly, but lower visual quality. The
+   encoder's current Floyd-Steinberg quality is part of the product;
+   probably don't go here.
+
+6. **Frame delta encoding** — GIF supports encoding only changed
+   pixels between frames. For a stereoscopic PIMSLO, frames 1→4 are
+   parallax-shifted versions of similar source content; the LZW work
+   could probably be reduced for frames 5/6 (the replays). Worth
+   investigating if encoder timing becomes user-painful again.
+
+## Cross-references
+
+- [CLAUDE.md § Pipeline Timing](../CLAUDE.md#pipeline-timing-ov5640-4-cameras-working) — the canonical timing table
+- [CLAUDE.md § Known Issues](../CLAUDE.md#known-issues) — full diagnosis log for memory / SPI bugs
+- [CLAUDE-MOCK.md](../CLAUDE-MOCK.md) — host mock harness (validates architecture decisions in <1 s before flashing)
+- [tests/README.md](../tests/README.md) — on-device e2e tests

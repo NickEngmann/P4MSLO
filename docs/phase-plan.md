@@ -1,8 +1,19 @@
 # P4MSLO — Implementation Phase Plan
 
-This is the working plan for the current multi-feature session. Features are grouped into 5 phases, each landing as its own commit. Phases are ordered so low-risk changes ship first and each later phase can assume the earlier ones are in place.
+This is the working plan for the original multi-feature session
+(2026-04-21). Features are grouped into 5 phases, each landing as
+its own commit. Phases are ordered so low-risk changes ship first
+and each later phase can assume the earlier ones are in place.
 
-## Lessons-learned index (updated 2026-04-21)
+> **Status note (2026-04-25):** Phases 1-2 shipped, Phase 3 deferred,
+> Phase 4 partial (AF stubbed; AE sync working), Phase 5 partial
+> (code shipped, on-device WiFi unverified — C6 SDIO transport pins
+> need schematic review). The encoder timing problems Phase 3 was
+> meant to fix were instead solved via a different attack — see
+> [Post-roadmap session: encoder + heap stability](#post-roadmap-session-encoder--heap-stability-2026-04-25)
+> at the bottom of this doc.
+
+## Lessons-learned index (updated 2026-04-25)
 
 Concrete things this multi-session implementation cycle taught me, all rediscovered via on-device testing after I'd already "verified" them via host-test + build-only checks:
 
@@ -22,7 +33,17 @@ Concrete things this multi-session implementation cycle taught me, all rediscove
 
 8. **Extended IDLE header is backward-compatible.** Masters still reading only 5 bytes keep working unchanged — the extra AE bytes at offsets 5-9 are just zero-padding to them.
 
-9. **Background encode vs foreground playback is the architecture issue.** The GIF encoder needs 7 MB; the player needs 7 MB; PSRAM only has ~8 MB contiguous. Neither pausing encoding nor defragmenting solves this robustly — only a streaming decoder that doesn't need the full-res intermediate does. Tracked as "Phase 3-style refactor" in the next steps section.
+9. **Background encode vs foreground playback is the architecture issue.** The GIF encoder needs 7 MB; the player needs 7 MB; PSRAM only has ~8 MB contiguous. Neither pausing encoding nor defragmenting solves this robustly — only a streaming decoder that doesn't need the full-res intermediate does. Tracked as "Phase 3-style refactor" in the next steps section. **(2026-04-21: shipped — peak playback memory dropped 6.7 MB → 3.5 MB via in-place palette→RGB565 conversion.)**
+
+10. **(Added 2026-04-25) FreeRTOS stack canaries don't reliably cover PSRAM-resident task stacks on ESP32-P4.** Espressif's own RAM-usage docs admit the canary "may skip over the watchpoint or canary on overflow and corrupt another region of RAM instead." Symptom: a task with a 16 KB stack via `xTaskCreatePinnedToCoreWithCaps(MALLOC_CAP_SPIRAM)` overflows on a deep call chain (encoder hot loop), scribbles into the next PSRAM heap free-block's prev/next pointers, and TLSF panics with `Store access fault` and MTVAL well outside any valid memory region — minutes or runs later. The diagnosis path (poison the heap, eliminate the offender, etc.) is in CLAUDE.md "Known Issues" → tlsf::remove_free_block. Default rule for new tasks with deep call chains (encoder, image processing): use `xTaskCreateStaticPinnedToCore` with a BSS-resident static stack array in internal RAM. The shorter-call-chain tasks (`pimslo_save`, `pimslo_cap`) can stay PSRAM.
+
+11. **(Added 2026-04-25) Internal RAM is one pool — DMA-reservation cuts a slice off the same physical region.** `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` carves a chunk of HP L2MEM out as a DMA-only sub-pool. Plain `MALLOC_CAP_INTERNAL` allocations don't get that chunk; SPI master priv-buffer / SDMMC DMA descriptor allocations do. The default 32 KB reservation is too tight on this board under concurrent capture+encode+SD — bumped to 64 KB. Don't try to "save" 32 KB by reverting that change without first eliminating the encoder's per-frame internal allocs.
+
+12. **(Added 2026-04-25) TCM is the right place for small hot LUTs.** ESP32-P4's TCM (8 KB at `0x30100000`) is single-cycle access, separate physical SRAM from HP L2MEM, and NOT DMA-capable — so it doesn't compete with the SPI/SDMMC priv-buffer pool. ~2.8 KB of TCM is consumed by `pmu_init.c` and friends, leaving ~5.4 KB usable. The encoder's RGB565 → palette LUT (formerly 64 KB PSRAM, ~80 ns/lookup) now lives in TCM as a 4 KB R4G4B4 table (~3 ns/lookup, 4-bit precision drop on each channel — below dithering noise floor). Same pattern works for any small static lookup that's read every pixel.
+
+13. **(Added 2026-04-25) Mock harness validates architecture, not panics.** The host mock simulator (`test/host_encode/`, `test/mocks/p4_*.{h,c}`) catches memory-budget regressions, fragmentation patterns, and lifecycle ordering bugs in <1 second. It cannot reproduce concurrency races or PSRAM-stack overflows because it runs single-threaded with no real PSRAM. When a hardware bug doesn't reproduce in the mock, that's the diagnostic — it's a concurrency/overflow issue, not a fragmentation issue. CLAUDE-MOCK.md is the reference.
+
+14. **(Added 2026-04-25) Encoder per-frame allocs ARE NOT FREE.** `err_cur` / `err_nxt` (11.5 KB each, allocated per Pass 2 frame) × 12 cycles per encode (4 forward + 2 replayed × 2 buffers) is 138 KB of alloc/free churn. Pulling that from `MALLOC_CAP_INTERNAL` fragments the same pool that SPI master and SDMMC compete for, causing `setup_dma_priv_buffer(1206)` panics or `sdmmc_write_sectors: not enough mem (0x101)` failures during long sequences. Forced to PSRAM as of commit `1ac42a1`. Costs ~10 s/encode in dither hot-loop time, eliminates OOM panics. Acceptable trade.
 
 ---
 
@@ -443,3 +464,76 @@ Tracked here so we don't forget:
 3. **esp_hosted SDIO pinout on P4-EYE** — need schematic / BSP definition
 4. **Parallel GIF encode PSRAM peak** — actual concurrent allocation might exceed 14MB depending on how `heap_caps_malloc` allocates; worst case we fall back to single-buffer (no perf gain, but no regression)
 5. **UI page-enter hook for gallery** — may need to add an on-enter callback if one doesn't exist
+
+---
+
+## Post-roadmap session: encoder + heap stability (2026-04-25)
+
+Phases 1-5 above shipped (or reached partial state). After that, a
+follow-on session focused on encoder timing and heap stability that
+the original phase plan didn't anticipate. Summary of what landed:
+
+### Goal
+
+Encoder timing was either ~5-7 min (photo_btn flow with PSRAM stack)
+or stuck on the LUT-in-PSRAM ~80 ns/lookup. Plus intermittent
+`tlsf::remove_free_block` panics on long e2e runs (~70% repro rate
+under heavy testing).
+
+### What shipped
+
+| Commit | Change | Outcome |
+|---|---|---|
+| `a206f6e` | TCM-resident 4 KB R4G4B4 LUT | Per-pixel lookup ~80 ns → ~3 ns. Encoder Pass 2 ~22 s/frame instead of being LUT-bound. SPI master untouched (TCM is separate physical SRAM from DMA pool). |
+| `0864f32` | Mock: app_album JPEG decoder release/reacquire dance | Coverage gap — 4 new e2e mock scenarios validate the encoder's PPA-buffer dance. |
+| `c9a4631` | p4ms vertical bars + saving overlay 9-10s→3s | Off-by-one in `jpeg_crop_out_cb` inverse-bound formula was leaving canvas columns unwritten at every MCU boundary. Saving overlay tied to `s_capturing` only (not `s_saving`) — user can fire next photo every ~3 s instead of every ~10 s. |
+| `d170f0e` | gif_bg → BSS-resident static stack | Eliminated PSRAM-stack overflow source for tlsf panics. |
+| `1ac42a1` | DMA pool 32→64 KB + LIGHT poisoning + err buffers PSRAM | Defense-in-depth combo: more DMA headroom for SPI/SDMMC, canary catches buffer overruns, encoder no longer fragments internal pool. |
+| `0fc643c` | Doc rewrite (CLAUDE.md Pipeline Timing + How It Works) | Numbers brought to current measured values. |
+
+### Hardware verification
+
+- `tests/e2e/_spi_20shot.py 10` → **10/10 × 4/4 cameras** at 100% on
+  this build. Zero priv_buf failures, zero panics.
+- Fast suite: 3/3 PASS (~80 s)
+- Full regression: tests 01, 02, 06, 10, 12, 13 PASS — zero panics.
+  Test 08 fails on a pre-existing CDC TX saturation issue (encoder
+  log spam during heavy runs eats one of the 4 photo_btn responses)
+  — not a firmware regression.
+
+### Final encoder timing (current build)
+
+| Stage | Time |
+|---|---|
+| User-visible "saving" overlay | **~2-3 s** |
+| Background SD save (4× ~500 KB) | ~6-12 s, invisible |
+| `.p4ms` preview generation | ~7 s |
+| GIF Pass 1 (palette) | ~10-15 s |
+| GIF Pass 2 (6 frames × ~24 s) | ~140 s |
+| **Total photo → playable GIF** | **~150-160 s (~2.5 min)** |
+| Photo cadence | every ~3 s |
+
+Encoder is ~10 s slower than the theoretical-best ~95 s because
+err_cur/err_nxt are now in PSRAM unconditionally (the trade-off for
+panic-free operation under concurrent load). Acceptable.
+
+### What's still open after this session
+
+- **Test 08 photo_btn count flake**: CDC TX saturation pattern.
+  Could fix the test by counting `Capture XXX:` log lines instead
+  of just response text (test 13 already does this). Not urgent.
+- **Second PSRAM-stack source**: `pimslo_save` (6 KB) and
+  `pimslo_cap` (8 KB internal-with-PSRAM-fallback) still have
+  PSRAM stacks. LIGHT poisoning catches their overruns currently;
+  if a tlsf panic shows up again, look here next.
+- **Recovering the ~10 s err-buffer regression**: would need to
+  either (a) free more internal BSS first, or (b) allocate
+  err_cur/err_nxt ONCE per encoder session (not per frame) so the
+  per-frame churn that fragmented internal RAM is eliminated.
+
+### Cross-references
+
+- [CLAUDE.md § Pipeline Timing](../CLAUDE.md#pipeline-timing-ov5640-4-cameras-working) — current measured numbers
+- [CLAUDE.md § Known Issues](../CLAUDE.md#known-issues) — diagnosis trail for each panic
+- [docs/OPTIMIZATIONS.md](./OPTIMIZATIONS.md) — encoder optimization log (rewritten this session)
+- [CLAUDE-MOCK.md](../CLAUDE-MOCK.md) — host mock harness reference

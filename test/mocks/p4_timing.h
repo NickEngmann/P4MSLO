@@ -45,28 +45,35 @@ typedef enum {
 } p4_lut_location_t;
 
 /* Per-frame timing baseline (with INTERNAL stack + INTERNAL LUT),
- * in milliseconds. Numbers from CLAUDE.md "Pipeline Timing" + measured
- * Frame timing logs. */
+ * in milliseconds. Numbers from measured Frame timing logs:
+ *   commit 79c09f9 (BSS LUT):
+ *     decode=1605 ms, encode=2030 ms — both bottlenecks resolved
+ *   commit f9fad72 (PSRAM LUT, INTERNAL stack):
+ *     decode=1571 ms, encode=55328 ms — LUT bound
+ * We model ENCODE nominal as 2000 ms (the BSS-LUT measurement) and
+ * apply LUT penalties on top. */
 #define P4_TIMING_DECODE_PER_FRAME_MS    1700   /* tjpgd decode 2560×1920 → 1824×1920 */
-#define P4_TIMING_ENCODE_PER_FRAME_MS    10000  /* dither + LZW for 1824×1920, INTERNAL LUT */
+#define P4_TIMING_ENCODE_PER_FRAME_MS    2000   /* dither + LZW with INTERNAL LUT */
 #define P4_TIMING_PALETTE_PER_FRAME_MS   1750   /* Pass 1 palette accumulation */
 #define P4_TIMING_REPLAY_PER_FRAME_MS    9000   /* file write of cached frame bytes */
 
 /* LUT-location penalty for the Pass 2 LZW+dither encode step.
- * Measured: with INTERNAL stack but LUT-in-PSRAM the encode is still
- * ~55 s/frame (vs ~10 s with LUT internal). So the LUT-location
- * penalty is bigger than the stack-location penalty.
- *   100 = LUT internal — nominal
- *   550 = LUT in PSRAM — measured, ~5.5×
- *   180 = LUT octree (4 indirections, all in internal) — estimated
- *         from typical octree-vs-table-lookup cost ratios
- *   140 = RGB444 LUT (1 lookup, smaller table) — slightly slower
- *         than RGB565 due to extra channel-shrink ops, but still
- *         cache-warm */
+ * Calibrated against hardware measurements (commit 79c09f9 vs
+ * f9fad72): moving the 64 KB pixel_lut from PSRAM to internal BSS
+ * dropped Pass 2 encode from 55 s/frame to 2.0 s/frame — a 27.5×
+ * speedup. So the PSRAM penalty is much higher than originally
+ * estimated; the per-pixel LUT read pattern is essentially random
+ * across the 64 KB table, defeating the cache.
+ *   100  = LUT internal — nominal (~2 s/frame)
+ *   2750 = LUT in PSRAM — measured 27.5× hardware speedup of move
+ *   200  = LUT octree (4 indirections, 8 KB table, cache-warm) —
+ *          estimated; could be measured if we ever build it
+ *   130  = RGB444 LUT (4 KB table, 1 lookup, cache-warm) — slight
+ *          extra channel-shrink ops vs RGB565 */
 #define P4_TIMING_LUT_PENALTY_INTERNAL_PCT 100
-#define P4_TIMING_LUT_PENALTY_PSRAM_PCT    550
-#define P4_TIMING_LUT_PENALTY_OCTREE_PCT   140
-#define P4_TIMING_LUT_PENALTY_RGB444_PCT   115
+#define P4_TIMING_LUT_PENALTY_PSRAM_PCT    2750  /* 55s / 2s = 27.5× — measured */
+#define P4_TIMING_LUT_PENALTY_OCTREE_PCT   200
+#define P4_TIMING_LUT_PENALTY_RGB444_PCT   130
 
 /* Per-encode setup costs (one-time per run). */
 #define P4_TIMING_VIEWFINDER_FREE_MS      50

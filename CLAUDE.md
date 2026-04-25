@@ -87,10 +87,10 @@ Two-tier suite that talks to the P4 over `/dev/ttyACMn` via the serial
 command interface. Set `P4MSLO_TEST_PORT=/dev/ttyACMn` when the P4
 enumerates as something other than `/dev/ttyACM0`.
 
-### Fast heartbeat (`run_fast.sh`, ~100 s)
+### Fast heartbeat (`run_fast.sh`, ~80 s)
 
 For iterative development. Three tests that together smoke-test the
-full P4 stack.
+full P4 stack. **Verified PASS 3/3 in 82 s on `fix/pimslo-encode-stuck`.**
 
 ```bash
 tests/e2e/run_fast.sh
@@ -101,6 +101,11 @@ tests/e2e/run_fast.sh
 | `01_boot_and_liveness.py` | ping/status/cam_status respond; 0 panics, 0 watchdogs |
 | `12_dma_heap_health.py`   | dma_int largest ≥ 2 KB, psram largest ≥ 8 MB, no "SPI scratch/chunk alloc failed", no "Failed to start BG worker", no video_utils OOM |
 | `11_heartbeat.py`         | Page nav over all 6 menu pages, buttons, one spi_pimslo capture, gallery entry + play, sd_ls, heap health, reset_state |
+
+Test 14 (`14_capture_encode_offpage` — photo_btn → encode kickoff) is
+NOT in this suite. See the matching note in Known Issues for the two
+reasons (encode is 5-7 min on the photo_btn flow + JPEG decoder
+calloc panic). It still lives in `run_all.sh`.
 
 ### Full regression (`run_all.sh`, 10-15 min)
 
@@ -386,10 +391,12 @@ To recover the ~95s number you'd need to either (a) free 16 KB contiguous intern
 - **Gallery scan preserves view by STEM, not exact path** — `app_gifs_scan()` restores `current_index` by matching either the exact previous primary path OR the PIMSLO stem (P4Mxxxx). Without the stem fallback, an entry whose JPEG-only state got promoted to GIF during encode would see its primary path flip from `.jpg` to `.gif` and the scan would bounce the user to index 0 instead of following them onto the same capture.
 - **bg encoder failure blacklist** — `bg_find_jpeg_only` + `bg_find_unprocessed_gif` both skip blacklisted paths. Session-scoped in-memory list, cleared on reboot. Prevents the bg worker from thrashing on a broken `.gif` or a capture dir with <2 pos files forever.
 - **LVGL task stack is 8 KB** — set in `common_components/esp32_p4_eye/esp32_p4_eye.c`. `lv_async_call` from bg tasks schedules `app_gifs_scan()` + `app_gifs_play_current()` which together use more than the ESP-IDF default 4 KB (overflowed under -Og with tjpgd's 32 KB work buffer allocated on stack in one path — that's now static, but keeping 8 KB gives headroom).
+- **photo_btn → JPEG HW decoder calloc heap-corruption panic** (intermittent, ~50% on 2nd photo_btn after a recent encode) — `Guru Meditation: Store access fault` with `MEPC` inside `tlsf_control_functions.h:374`. Stack: `app_video_photo.c:206` (`app_storage_save_picture`) → `app_storage.c:620` (`jpeg_decoder_get_info`) → `esp_driver_jpeg/jpeg_decode.c:139` → `heap_caps_calloc` → `multi_heap.c:216` → TLSF integrity check trips on a corrupt free-list block. The corruption is caused by *something* upstream — most likely the encode pipeline's tjpgd workspace or scaled_buf overrunning, or the album release/reacquire JPEG-decoder dance smashing a heap header. Reproduced cleanly with the SD-PIMSLO wipe at the top of `run_fast.sh`, so it's not stale-file-related. Open. Triage path: enable `CONFIG_HEAP_POISONING_COMPREHENSIVE=y` in `sdkconfig.defaults` to catch the offender at the moment of the bad write rather than the eventual panic.
+- **Fast heartbeat (`run_fast.sh`) is 3 tests, not 4** — `01_boot_and_liveness`, `12_dma_heap_health`, `11_heartbeat`. Test 14 (`14_capture_encode_offpage`) has been moved to `run_all.sh` because (a) the `pimslo_encode_queue_task` 16 KB stack lands in PSRAM on this board (largest free internal block ~7 KB), so a real photo→encode cycle takes 5-7 min — wildly over the sub-4-min fast-suite budget, and (b) the photo_btn → JPEG-decoder calloc panic above fires often enough during back-to-back fast iterations to make every other run wedge before the rest of the suite runs.
 
 ## Open Research Questions
 
-(None outstanding. Historical list moved to the Known Issues section as things get fixed — see "Gallery JPEG preview decode" entry there for the biggest one.)
+- **Recover ~95 s photo→encode flow** — the encoder hits ~95 s total when it lands on a task whose stack is in internal RAM (seen via the legacy `pimslo` serial cmd path that spawns a fresh task on demand) but ~5-7 min when it lands on `pimslo_encode_queue_task` whose stack is forced to PSRAM by FreeRTOS's allocator fallback. Two viable paths: (a) free 16 KB of contiguous internal RAM and use `xTaskCreateStaticPinnedToCore` for `pimslo_encode_queue_task` so its stack is BSS-resident — the candidate freed BSS is one of the two 32 KB tjpgd workspaces (`gif_encoder.c::tjwork` or `app_gifs.c::s_tjpgd_work`), shareable via mutex since they're never used concurrently within a single encode pipeline; (b) split the encoder hot loop into a smaller worker thread with a stack that *does* fit in 7 KB. (a) is the more surgical of the two. An attempt at static stack alone (without freeing BSS first) succeeded at the 82 s baseline but starved the DMA-internal pool — `gif_bg` failed to start at boot, `dma_int` largest dropped to ~3 KB which made USB-CDC TX flaky enough that test 11's `heap_caps` response got dropped. Reverted in `c9204d8`.
 
 ## Flash via Docker
 

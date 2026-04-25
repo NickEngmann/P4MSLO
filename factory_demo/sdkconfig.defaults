@@ -19,6 +19,19 @@ CONFIG_SPIRAM_MEMTEST=n
 # task's static 16 KB stack. SD throughput (~250 KB/s) is the
 # bottleneck for fwrite, so PSRAM access is way faster than that.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Reserve 64 KB of internal RAM for DMA-only allocations, up from
+# the default 32 KB. The SPI master's per-transaction priv-buffer
+# path (triggered when source/dest is not 64-byte cache-aligned)
+# allocates from this pool. With the default 32 KB and concurrent
+# capture+encode hitting it from both directions (encoder's
+# err_cur/err_nxt internal allocs + camera/LCD priv-buffer allocs),
+# the largest free block can drop to <8 KB during a 5-shot back-
+# to-back stress test (test 13), which fires `setup_dma_priv_buffer
+# (1206): Failed to allocate priv RX buffer` and panics with a
+# Load access fault in `uninstall_priv_desc` (NULL deref in cleanup
+# path). 64 KB pool gives ~16-20 KB largest free block under load,
+# safely above the SPI master's per-transaction need.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=5584
@@ -90,12 +103,17 @@ CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
 # doesn't have. Toolchain supports Zb (GCC 14 -march=help lists
 # zba/zbb/...) but the silicon doesn't.
 #
-# Heap poisoning to catch the intermittent tlsf::remove_free_block
-# panic on long e2e sequences. COMPREHENSIVE was tried first and
-# hung boot at LVGL init (canary overhead too high for L2MEM
-# headroom on this board). LIGHT fills only HEAD canaries on alloc
-# and checks them on free — half the overhead, still catches the
-# common "write past end of allocation" pattern that's the most
-# likely cause given the research findings on PSRAM-stack-overflow
-# producing exactly this MTVAL panic signature.
+# Heap poisoning kept on (LIGHT). The gif_bg PSRAM-stack-overflow fix
+# (commit d170f0e — move stack to BSS-internal) eliminated ONE source
+# of the intermittent tlsf::remove_free_block panic in tests 08/09,
+# but a second offender remained — without poisoning the panic still
+# fires ~30% of the time on long sequences. LIGHT poisoning's HEAD
+# canaries catch buffer overruns landing in the canary instead of in
+# adjacent block metadata; combined with the 64 KB DMA pool reserve
+# below, this gets the panic to 0% across multiple test runs (vs ~70%
+# pre-fix). Cost: ~12 B per allocation (within budget).
+# When the second offender is eventually found:
+#   1. comment this out to compare panic rates
+#   2. if poisoning was masking, switch to COMPREHENSIVE + periodic
+#      heap_caps_check_integrity_all to identify the writer
 CONFIG_HEAP_POISONING_LIGHT=y

@@ -50,12 +50,11 @@ LOG = _lib.log_path(__file__)
 # (largest dropping to a few hundred bytes from background task
 # churn) rather than the already-absorbed claim itself.
 MIN_DMA_INT_LARGEST = 2048
-# 8 MB minus a small headroom for HEAP_POISONING_LIGHT canary overhead.
+# 8 MB minus 64 B headroom for HEAP_POISONING_LIGHT canary overhead.
 # Each allocation under LIGHT poisoning is padded by 4 bytes, which
-# shaves ~12 B off the largest-free-block reported by heap_caps after
-# boot. Floor at 8 MB - 64 B to absorb that without masking real
-# regressions (a real regression drops the block by hundreds of KB,
-# not bytes).
+# shaves ~12 B off the largest-free PSRAM block reported by heap_caps
+# after boot. 64 B headroom catches real regressions (which drop the
+# block by KB or MB) without flagging the canary cost.
 MIN_PSRAM_LARGEST   = 8 * 1024 * 1024 - 64
 
 

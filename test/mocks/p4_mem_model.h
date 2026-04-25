@@ -108,12 +108,19 @@ typedef struct {
  * deduct the same size from `P4_POOL_DMA_INT`. That mirrors the
  * hardware sharing. AS_IS mode keeps using the post-boot snapshot
  * which already reflects whatever BSS is live. */
+/* Numbers updated 2026-04-25 after CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL
+ * was bumped 32 KB → 64 KB to fix `setup_dma_priv_buffer(1206)` panics
+ * during concurrent capture+encode on test 13. With 64 KB reserved for
+ * DMA-only allocations (vs 32 KB default), post-boot dma_int largest
+ * is ~36 KB instead of ~6.4 KB. The 32 KB extra reservation is taken
+ * from internal RAM, so the regular-int pool shrunk slightly to
+ * compensate. */
 #define P4_MEM_MODEL_DEFAULT ((p4_mem_model_t){ \
-    .pool[P4_POOL_DMA_INT] = { .total_free = 13191,    .largest_contiguous = 6400, .blocks = {0,0,0} }, \
-    .pool[P4_POOL_INT]     = { .total_free = 25527,    .largest_contiguous = 7168, .blocks = {0,0,0} }, \
-    .pool[P4_POOL_PSRAM]   = { .total_free = 17000000, .largest_contiguous = 8650752, \
+    .pool[P4_POOL_DMA_INT] = { .total_free = 45000,    .largest_contiguous = 36864, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_INT]     = { .total_free = 73611,    .largest_contiguous = 31732, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_PSRAM]   = { .total_free = 17000000, .largest_contiguous = 8388608, \
                                .blocks = { 6266880, 1027072, 0 } }, \
-    .pool[P4_POOL_TCM]     = { .total_free = 8192,     .largest_contiguous = 8192, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_TCM]     = { .total_free = 4096,     .largest_contiguous = 4096, .blocks = {0,0,0} }, \
 })
 
 /* RAW profile — pre-BSS, pre-ESP-IDF state. Use when experimenting
@@ -125,8 +132,8 @@ typedef struct {
  * heap. ESP-IDF + FreeRTOS startup eats ~720 KB before our app runs;
  * we model that as a fixed delta. */
 #define P4_MEM_MODEL_RAW ((p4_mem_model_t){ \
-    .pool[P4_POOL_DMA_INT] = { .total_free = 13191 + 4224, \
-                               .largest_contiguous = 32768, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_DMA_INT] = { .total_free = 65536, \
+                               .largest_contiguous = 65536, .blocks = {0,0,0} }, \
     .pool[P4_POOL_INT]     = { .total_free = 25527 + 96 * 1024, \
                                .largest_contiguous = 7168 + 96 * 1024, .blocks = {0,0,0} }, \
     .pool[P4_POOL_PSRAM]   = { .total_free = 17000000, .largest_contiguous = 8650752, \

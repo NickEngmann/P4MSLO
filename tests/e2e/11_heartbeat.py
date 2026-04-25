@@ -37,8 +37,7 @@ LOG = _lib.log_path(__file__)
 # just catching catastrophic exhaustion (< 128 B means no future alloc
 # can succeed at all).
 MIN_DMA_INT_LARGEST = 128
-# 8 MB minus 64 B headroom for HEAP_POISONING_LIGHT canary overhead
-# (~12-byte shave). See test 12 for the same adjustment.
+# 8 MB minus 64 B for HEAP_POISONING_LIGHT canary overhead. See test 12.
 MIN_PSRAM_LARGEST   = 8 * 1024 * 1024 - 64
 
 

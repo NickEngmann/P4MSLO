@@ -530,19 +530,31 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
         pal_b[i] = enc->palette.entries[i].b;
     }
 
-    /* Error diffusion buffers — try internal RAM first for speed.
-     * Each: 1920 * 3 * 2 = 11,520 bytes. Two buffers = 23KB. */
+    /* Error diffusion buffers — PSRAM. Each: 1920 * 3 * 2 = 11,520 B,
+     * pair = 23 KB.
+     *
+     * Used to try INTERNAL first ("for speed") with a PSRAM fallback,
+     * but on this board the 23 KB allocated PER Pass 2 frame from the
+     * INTERNAL pool was the binding source of dma_int fragmentation
+     * under concurrent capture+encode. Manifested as either
+     * `setup_dma_priv_buffer(1206)` SPI master panics OR
+     * `sdmmc_write_sectors: not enough mem (0x101)` failures during
+     * the save-task SD writes — both because the SPI/SD drivers fight
+     * the encoder for the same internal-RAM headroom.
+     *
+     * Forcing PSRAM here costs ~75 ns/access on the dither hot loop
+     * (~1.5 s/frame, ~10 s per 6-frame encode). That's an acceptable
+     * trade vs OOM panics. The TCM-resident pixel_lut + the row_cache
+     * (3.8 KB internal, allocated below) keep the actual hot-path
+     * lookups in fast memory. */
     size_t err_size = w * 3 * sizeof(int16_t);
-    int16_t *err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    int16_t *err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
+    int16_t *err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
     if (!err_cur || !err_nxt) {
-        if (err_cur) { free(err_cur); err_cur = NULL; }
-        if (err_nxt) { free(err_nxt); err_nxt = NULL; }
-        err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
-        err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
-        ESP_LOGW(TAG, "Error buffers in PSRAM");
-    } else {
-        ESP_LOGI(TAG, "Error buffers in internal RAM (%zu bytes each)", err_size);
+        ESP_LOGE(TAG, "Failed to allocate error buffers (%zu B each)", err_size);
+        if (err_cur) heap_caps_free(err_cur);
+        if (err_nxt) heap_caps_free(err_nxt);
+        return ESP_ERR_NO_MEM;
     }
 
     /* Prefetch pixel row into internal SRAM for fast access (3840 bytes for 1920px) */
@@ -783,14 +795,15 @@ esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
         pal_b[i] = enc->palette.entries[i].b;
     }
 
+    /* Error diffusion buffers — PSRAM (see pass2_add_frame for the
+     * dma_int-fragmentation rationale). Same trade-off applies. */
     size_t err_size = w * 3 * sizeof(int16_t);
-    int16_t *err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    int16_t *err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
+    int16_t *err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
     if (!err_cur || !err_nxt) {
-        if (err_cur) { free(err_cur); err_cur = NULL; }
-        if (err_nxt) { free(err_nxt); err_nxt = NULL; }
-        err_cur = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
-        err_nxt = heap_caps_calloc(1, err_size, MALLOC_CAP_SPIRAM);
+        if (err_cur) heap_caps_free(err_cur);
+        if (err_nxt) heap_caps_free(err_nxt);
+        return ESP_ERR_NO_MEM;
     }
 
     uint16_t *row_cache = heap_caps_malloc(w * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);

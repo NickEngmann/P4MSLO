@@ -292,3 +292,63 @@ truth for the simulator — wrong numbers there mean the predictions
 are wrong. Verify against `factory_demo/build/factory_demo.map` for
 BSS placements and against `heap_caps` serial cmd output for the
 runtime model.
+
+## What landed on hardware (commit f9fad72)
+
+The PROPOSED architecture from the simulator was applied to the
+firmware in three surgical changes, fully validated on host before
+flashing:
+
+  1. `gif_encoder.c::tjwork` dropped — shares `s_tjpgd_work` from
+     app_gifs.c via new `app_gifs_acquire_tjpgd_work()` API. Mutex
+     gates the three call sites.
+  2. `gif_encoder.c::file_buf` moved to PSRAM via `EXT_RAM_BSS_ATTR`.
+     Required `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y` in
+     sdkconfig.defaults.
+  3. `pimslo_encode_queue_task` and `gif_bg` use `xTaskCreateStatic`
+     with 16 KB BSS stacks each.
+
+### Measured on-device deltas (heap_caps post-boot):
+
+| pool       | before  | after   | delta   |
+|------------|---------|---------|---------|
+| dma_int free | 13191 | 36535 | +22 KB  |
+| dma_int largest | 6400 | 23552 | +17 KB |
+| int free   | 25527 | 73455 | +48 KB |
+| int largest | 7168  | 31744 | +24 KB |
+
+Matches the simulator's prediction.
+
+### Encoder timing impact:
+
+| step                    | before          | after          |
+|-------------------------|-----------------|----------------|
+| .p4ms cam decode (×4)   | 12-40 s each   | 1.3-2.4 s each |
+| Pass 2 decode (×4)      | 18 s/frame     | 1.5 s/frame    |
+| Pass 2 LZW+dither (×4)  | 55 s/frame     | 55 s/frame ⚠   |
+| Total estimate          | 5-7 min        | ~4.5 min       |
+
+The Pass 2 LZW hot loop is still PSRAM-bound — the 64 KB `pixel_lut`
+doesn't fit the new 31 KB largest-internal block, so per-pixel LUT
+reads still cost ~100-200 ns each. That's the next bottleneck and
+the next surgical target. Options being considered:
+
+  - **Octree LUT (~8 KB)**: hierarchical color-quantization table.
+    Slower per-lookup (3-4 indirections vs 1) but small enough for
+    internal RAM. Net win because PSRAM latency dominates.
+  - **RGB444 LUT (4 KB)**: drop 1-2 bits per channel. Smallest LUT
+    that still works. Quality impact: probably acceptable since the
+    encoder dithers, but needs A/B comparison.
+  - **64 KB static BSS LUT**: drop one of the static stacks (gif_bg
+    back to heap-alloc) to make room. Simplest if quality loss is
+    unacceptable.
+
+### Hardware test status
+
+`run_fast.sh` and `run_all.sh` need 4/4 SPI captures to exercise the
+photo→encode flow. The S3 cameras on the test rig are currently
+stuck at status 0x00 (unresponsive to `cam_reboot`); per CLAUDE.md
+"SPI slave stuck in DATA mode" this requires a physical USB
+power-cycle of the S3 boards to recover. Architecture validation
+ran via the legacy `pimslo` serial cmd (encodes from existing SD
+fixtures) which doesn't need cameras.

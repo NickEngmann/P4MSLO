@@ -69,8 +69,15 @@ void p4_mem_adjust_pool(p4_pool_t pool, ptrdiff_t total_delta, ptrdiff_t largest
 {
     if (pool >= P4_POOL_COUNT) return;
     p4_pool_state_t *p = &s_model.pool[pool];
-    p->total_free = (size_t)((ptrdiff_t)p->total_free + total_delta);
-    p->largest_contiguous = (size_t)((ptrdiff_t)p->largest_contiguous + largest_delta);
+    /* Floor at 0 so size_t doesn't wrap when a delta would push past zero.
+     * In practice this fires when the proposed BSS layout exceeds the
+     * RAW model's available space — meaning the BSS would land in DRAM
+     * outside the heap (linker uses total DRAM, not per-pool heap),
+     * but the heap allocator effectively has nothing left. */
+    ptrdiff_t new_total   = (ptrdiff_t)p->total_free + total_delta;
+    ptrdiff_t new_largest = (ptrdiff_t)p->largest_contiguous + largest_delta;
+    p->total_free = (new_total < 0) ? 0 : (size_t)new_total;
+    p->largest_contiguous = (new_largest < 0) ? 0 : (size_t)new_largest;
 }
 
 p4_pool_state_t p4_mem_pool_state(p4_pool_t pool)

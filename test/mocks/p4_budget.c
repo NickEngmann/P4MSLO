@@ -238,6 +238,23 @@ const p4_component_t P4_BUDGET_PROPOSED[] = {
       .note = "Two StaticTask_t headers — small, but counted to keep "
               "the BSS arithmetic honest." },
 
+    /* CANDIDATE NEXT STEP: 64 KB pixel_lut as static BSS. This is the
+     * fastest-encode option but consumes a chunky 64 KB of internal
+     * DRAM that the heap will lose. Test the full PROPOSED catalog
+     * with this enabled to verify the heap can still fit a fallback
+     * 16 KB stack (gif_bg if we kept it heap-alloc'd) plus LCD/CDC
+     * scratch. */
+    { .name = "encoder pixel_lut STATIC BSS (next step)",
+      .pool = P4_POOL_INT, .psram_fallback_ok = false,
+      .lifetime = P4_LIFETIME_BSS, .size_bytes = 65536,
+      .note = "Replaces the per-encode PSRAM heap_caps_malloc(65536). "
+              "Pass 2 LZW becomes ~14 s/frame instead of ~55 s/frame "
+              "(LUT reads on internal DRAM are ~10× faster than PSRAM). "
+              "Cost: -64 KB internal heap. Mitigation: drop gif_bg's "
+              "static stack (heap-alloc'd 16 KB falls back to PSRAM, "
+              "bg encodes go back to ~5 min — acceptable since they're "
+              "background)." },
+
     /* The rest is unchanged from BASELINE — copy-pasted minus the
      * three CHANGED entries above. */
 

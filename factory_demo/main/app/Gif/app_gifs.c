@@ -29,6 +29,7 @@
 #include "bsp/esp-bsp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"  /* xTaskCreatePinnedToCoreWithCaps */
 #include "app_video_stream.h"
 #include "app_album.h"
 
@@ -2493,15 +2494,18 @@ esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax)
 
     s_ctx.is_encoding = true;
 
-    /* The legacy `pimslo` serial cmd path. Heap-alloc'd 16 KB stack
-     * lands in PSRAM (slow encoder). The hot path is the photo_btn
-     * flow which goes through pimslo_encode_queue_task (static BSS
-     * stack — see app_pimslo.c). Don't make pimslo_enc static here
-     * because we recreate the task every cmd invocation, and reusing
-     * a StaticTask_t while the previous instance is still in IDLE
-     * cleanup races. */
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        pimslo_encode_task, "pimslo_enc", 16384, params, 5, NULL, 1);
+    /* The legacy `pimslo` / `spi_pimslo` serial cmd path.
+     * xTaskCreatePinnedToCore (without caps) hardcodes
+     * MALLOC_CAP_INTERNAL for the stack — and after the s_pixel_lut
+     * BSS landed, internal_largest is ~15 KB, so a 16 KB stack alloc
+     * fails outright with no PSRAM fallback. Use WithCaps so this
+     * path keeps working even on the new BSS layout. The encoder
+     * runs slow on PSRAM stack, but this is the test/serial-cmd path
+     * — not the user-facing photo_btn flow which uses
+     * pimslo_encode_queue_task (static BSS stack). */
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        pimslo_encode_task, "pimslo_enc", 16384, params, 5, NULL, 1,
+        MALLOC_CAP_SPIRAM);
     if (ret != pdPASS) {
         free(params);
         s_ctx.is_encoding = false;
@@ -2925,19 +2929,27 @@ void app_gifs_start_background_worker(void)
     if (s_ctx.canvas_width <= 0)  s_ctx.canvas_width  = BSP_LCD_H_RES;
     if (s_ctx.canvas_height <= 0) s_ctx.canvas_height = BSP_LCD_V_RES;
 
-    /* Static BSS stack — same rationale as pimslo_encode_queue_task in
-     * app_pimslo.c. The bg worker calls app_gifs_encode_pimslo_from_dir
-     * which has the same per-pixel hot loop; PSRAM stack would slow it
-     * 4-5×. Single instance, never deleted, so static reuse is safe.
-     * 16 KB matches pimslo_encode_queue_task; 8 KB overflowed the stack
-     * on pass 1 pre-palette work. */
-    static StaticTask_t s_bg_worker_tcb;
-    static StackType_t s_bg_worker_stack[16384 / sizeof(StackType_t)];
-    s_bg_worker = xTaskCreateStaticPinnedToCore(
-        bg_worker_task, "gif_bg",
-        sizeof(s_bg_worker_stack) / sizeof(StackType_t),
-        NULL, 2, s_bg_worker_stack, &s_bg_worker_tcb, 1);
-    if (!s_bg_worker) {
+    /* gif_bg stack lives in PSRAM via xTaskCreatePinnedToCoreWithCaps.
+     *
+     * Why PSRAM? After the s_pixel_lut BSS landed (64 KB internal),
+     * the largest free internal block dropped to ~15 KB. Plain
+     * xTaskCreatePinnedToCore allocates the stack via pvPortMalloc
+     * which hardcodes MALLOC_CAP_INTERNAL — it doesn't fall back to
+     * PSRAM, so a 16 KB stack request fails with "Failed to start BG
+     * worker" and the bg pre-render / re-encode paths go silent.
+     *
+     * Using WithCaps + MALLOC_CAP_SPIRAM forces the stack to PSRAM.
+     * Cost: bg encodes run at ~5-7 min (PSRAM-stack penalty applies
+     * to gif_bg's per-pixel hot loop) — acceptable since bg work is
+     * background. The foreground photo_btn path uses
+     * pimslo_encode_queue_task which keeps its INTERNAL-stack static
+     * BSS allocation and benefits from the new internal-RAM
+     * pixel_lut. */
+    BaseType_t r = xTaskCreatePinnedToCoreWithCaps(
+        bg_worker_task, "gif_bg", 16384, NULL, 2, &s_bg_worker, 1,
+        MALLOC_CAP_SPIRAM);
+    if (r != pdPASS) {
         ESP_LOGE(TAG, "Failed to start BG worker");
+        s_bg_worker = NULL;
     }
 }

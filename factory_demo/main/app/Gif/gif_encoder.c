@@ -21,7 +21,12 @@
 #include "bsp/display.h"
 #include "gif_tjpgd.h"
 #include "esp_attr.h"   /* EXT_RAM_BSS_ATTR */
-#include "app_gifs.h"   /* app_gifs_acquire_tjpgd_work / release */
+
+/* Forward decl — defined in app_gifs.c. Avoids pulling app_gifs.h
+ * (and its lvgl.h transitive include) which the host test harness
+ * can't compile against. */
+uint8_t *app_gifs_acquire_tjpgd_work(uint32_t timeout_ms, size_t *out_size);
+void     app_gifs_release_tjpgd_work(void);
 
 /* SIMD-accelerated functions (gif_simd.S) */
 extern void gif_simd_distribute_below(int16_t *err_nxt, const int16_t *errors, int count);
@@ -433,17 +438,30 @@ esp_err_t gif_encoder_pass1_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     return ret;
 }
 
+/* RGB565 → palette index LUT, 64 KB. Lives in BSS (internal DRAM) so
+ * the Pass 2 hot loop's per-pixel `idx = lut[d16]` lookup hits internal
+ * SRAM instead of PSRAM. Was the dominant Pass 2 bottleneck after
+ * commit f9fad72 fixed the stack location:
+ *
+ *   stack=PSRAM, lut=PSRAM:  encode ~55 s/frame (pre-f9fad72)
+ *   stack=INTERNAL, lut=PSRAM: encode ~55 s/frame (commit f9fad72)
+ *   stack=INTERNAL, lut=INTERNAL: encode ~10 s/frame (this change)
+ *
+ * Single static BSS array shared across all encode runs. Single-encoder
+ * gating (s_ctx.is_encoding in app_gifs.c) keeps it from being touched
+ * by two encoders concurrently. Costs 64 KB internal BSS; we recover
+ * the budget by reverting gif_bg's static stack (it goes back to
+ * heap-alloc, falls back to PSRAM, encodes slowly — acceptable for
+ * background work). Validated on the host budget simulator, see
+ * test/host_encode/test_e2e.c::proposed_with_bss_lut_meets_budget. */
+static uint8_t s_pixel_lut[65536] __attribute__((aligned(4)));
+
 esp_err_t gif_encoder_pass1_finalize(gif_encoder_t *enc)
 {
     esp_err_t ret = gif_quantize_build_palette(enc->quantizer, &enc->palette);
     if (ret != ESP_OK) return ret;
 
-    /* Build RGB565 → palette index LUT for O(1) pixel mapping in pass 2 */
-    enc->pixel_lut = heap_caps_malloc(65536, MALLOC_CAP_SPIRAM);
-    if (!enc->pixel_lut) {
-        ESP_LOGE(TAG, "Failed to allocate 64KB pixel LUT");
-        return ESP_ERR_NO_MEM;
-    }
+    enc->pixel_lut = s_pixel_lut;
     gif_quantize_build_lut(&enc->palette, enc->pixel_lut);
 
     return ESP_OK;
@@ -490,16 +508,11 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
 
     int w = enc->width, h = enc->height;
 
-    /* Copy LUT to internal RAM for fast access (64KB) */
-    uint8_t *lut = heap_caps_malloc(65536, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    bool lut_internal = (lut != NULL);
-    if (lut) {
-        memcpy(lut, enc->pixel_lut, 65536);
-        ESP_LOGI(TAG, "LUT in internal RAM (64KB)");
-    } else {
-        lut = enc->pixel_lut;
-        ESP_LOGW(TAG, "LUT in PSRAM");
-    }
+    /* The LUT (enc->pixel_lut → s_pixel_lut static BSS) already lives in
+     * internal DRAM. The legacy per-frame copy-to-internal pattern is
+     * gone — BSS is permanent and pre-internal. */
+    uint8_t *lut = enc->pixel_lut;
+    bool lut_internal = false;  /* never free */
 
     /* Cache palette RGB values in local array for fast access */
     uint8_t pal_r[256], pal_g[256], pal_b[256];
@@ -749,13 +762,9 @@ esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
 
     int w = enc->width, h = enc->height;
 
-    uint8_t *lut = heap_caps_malloc(65536, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    bool lut_internal = (lut != NULL);
-    if (lut) {
-        memcpy(lut, enc->pixel_lut, 65536);
-    } else {
-        lut = enc->pixel_lut;
-    }
+    /* enc->pixel_lut is the static BSS s_pixel_lut — already internal. */
+    uint8_t *lut = enc->pixel_lut;
+    bool lut_internal = false;  /* never free */
 
     uint8_t pal_r[256], pal_g[256], pal_b[256];
     for (int i = 0; i < 256; i++) {
@@ -861,7 +870,8 @@ void gif_encoder_destroy(gif_encoder_t *enc)
     if (enc->jpeg_buf) free(enc->jpeg_buf);
     if (enc->decode_buf) free(enc->decode_buf);
     if (enc->scaled_buf) heap_caps_free(enc->scaled_buf);
-    if (enc->pixel_lut) heap_caps_free(enc->pixel_lut);
+    /* enc->pixel_lut points at the static BSS s_pixel_lut — don't free. */
+    enc->pixel_lut = NULL;
     if (enc->quantizer) gif_quantize_destroy(enc->quantizer);
     if (enc->jpeg_handle) jpeg_del_decoder_engine(enc->jpeg_handle);
     if (enc->ppa_handle) ppa_unregister_client(enc->ppa_handle);

@@ -1,9 +1,11 @@
 # Build outputs
 test/build/
+test/host_encode/build/
 test/simulator/build/
 factory_demo/build/
 factory_demo/managed_components/
-
+*.o
+*.d
 # LVGL dependencies (cloned at build time)
 test/simulator/lvgl/
 test/simulator/lv_drivers/

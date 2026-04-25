@@ -4,6 +4,14 @@
 #pragma once
 
 #include <stdio.h>
+#include <stdint.h>
+#include <time.h>
+
+static inline uint32_t esp_log_timestamp(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
 
 typedef enum {
     ESP_LOG_NONE,

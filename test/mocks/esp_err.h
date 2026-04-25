@@ -4,6 +4,8 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
 
 typedef int esp_err_t;
 

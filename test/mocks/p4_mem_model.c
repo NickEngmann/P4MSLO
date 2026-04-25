@@ -1,0 +1,186 @@
+/**
+ * @file p4_mem_model.c
+ * @brief Constrained allocator tracking the on-device memory shape.
+ */
+#include "p4_mem_model.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <assert.h>
+#include <stdbool.h>
+
+static p4_mem_model_t s_model;
+static size_t         s_active_count = 0;
+static size_t         s_active_bytes[P4_POOL_COUNT] = {0};
+static size_t         s_alloc_fail[P4_POOL_COUNT]   = {0};
+
+/* Side-table mapping live user-pointer → metadata. Avoids a header
+ * prefix that ASan flags as out-of-bounds when free walks backwards. */
+#define MAX_LIVE_ALLOCS 256
+typedef struct {
+    void     *ptr;       /* NULL = slot empty */
+    size_t    size;
+    p4_pool_t pool;
+} alloc_record_t;
+
+static alloc_record_t s_live[MAX_LIVE_ALLOCS];
+
+static int find_or_take_slot(void *p)
+{
+    for (int i = 0; i < MAX_LIVE_ALLOCS; i++) {
+        if (s_live[i].ptr == NULL) return i;
+    }
+    return -1;
+}
+static int find_slot(void *p)
+{
+    for (int i = 0; i < MAX_LIVE_ALLOCS; i++) {
+        if (s_live[i].ptr == p) return i;
+    }
+    return -1;
+}
+
+void p4_mem_init(p4_mem_model_t initial)
+{
+    /* If we still have live allocations from a previous run, free them
+     * so AddressSanitizer's leak detector doesn't yell. The user-facing
+     * contract is "p4_mem_init resets the model" — frees are part of
+     * that. */
+    for (int i = 0; i < MAX_LIVE_ALLOCS; i++) {
+        if (s_live[i].ptr) { free(s_live[i].ptr); s_live[i].ptr = NULL; }
+    }
+    s_model = initial;
+    s_active_count = 0;
+    memset(s_active_bytes, 0, sizeof(s_active_bytes));
+    memset(s_alloc_fail, 0, sizeof(s_alloc_fail));
+}
+
+void p4_mem_set_internal_largest(size_t bytes)
+{
+    s_model.pool[P4_POOL_INT].largest_contiguous = bytes;
+}
+void p4_mem_set_psram_largest(size_t bytes)
+{
+    s_model.pool[P4_POOL_PSRAM].largest_contiguous = bytes;
+}
+void p4_mem_adjust_pool(p4_pool_t pool, ptrdiff_t total_delta, ptrdiff_t largest_delta)
+{
+    if (pool >= P4_POOL_COUNT) return;
+    p4_pool_state_t *p = &s_model.pool[pool];
+    p->total_free = (size_t)((ptrdiff_t)p->total_free + total_delta);
+    p->largest_contiguous = (size_t)((ptrdiff_t)p->largest_contiguous + largest_delta);
+}
+
+p4_pool_state_t p4_mem_pool_state(p4_pool_t pool)
+{
+    if (pool >= P4_POOL_COUNT) return (p4_pool_state_t){0};
+    return s_model.pool[pool];
+}
+size_t p4_mem_active_alloc_count(void) { return s_active_count; }
+size_t p4_mem_active_alloc_bytes(p4_pool_t pool) {
+    return (pool < P4_POOL_COUNT) ? s_active_bytes[pool] : 0;
+}
+size_t p4_mem_alloc_fail_count(p4_pool_t pool) {
+    return (pool < P4_POOL_COUNT) ? s_alloc_fail[pool] : 0;
+}
+
+static const char *pool_name(p4_pool_t p)
+{
+    switch (p) {
+        case P4_POOL_DMA_INT: return "dma_int";
+        case P4_POOL_INT:     return "int";
+        case P4_POOL_PSRAM:   return "psram";
+        default:              return "?";
+    }
+}
+
+void p4_mem_print_summary(FILE *fh)
+{
+    fprintf(fh, "\n--- p4_mem summary ---\n");
+    fprintf(fh, "  active allocs        : %zu\n", s_active_count);
+    for (int p = 0; p < P4_POOL_COUNT; p++) {
+        fprintf(fh, "  %-12s active     : %zu B\n", pool_name(p), s_active_bytes[p]);
+        fprintf(fh, "  %-12s alloc fails: %zu\n", pool_name(p), s_alloc_fail[p]);
+        fprintf(fh, "  %-12s largest    : %zu B (model)\n",
+                pool_name(p), s_model.pool[p].largest_contiguous);
+    }
+    fprintf(fh, "----------------------\n");
+}
+
+void p4_mem_assert_no_leaks(void)
+{
+    if (s_active_count != 0) {
+        fprintf(stderr, "LEAK: %zu allocations still live\n", s_active_count);
+        for (int p = 0; p < P4_POOL_COUNT; p++) {
+            if (s_active_bytes[p] > 0) {
+                fprintf(stderr, "  %s: %zu B leaked\n", pool_name(p), s_active_bytes[p]);
+            }
+        }
+        abort();
+    }
+}
+
+static void *do_alloc(size_t size, p4_pool_t pool, bool zeroed, size_t align)
+{
+    if (pool >= P4_POOL_COUNT) return NULL;
+    /* Largest-contiguous is the binding constraint. The actual on-device
+     * allocator (FreeRTOS / TLSF) returns NULL when no single free block
+     * can satisfy the request, regardless of total free. */
+    if (size > s_model.pool[pool].largest_contiguous) {
+        s_alloc_fail[pool]++;
+        return NULL;
+    }
+    int slot = find_or_take_slot(NULL);
+    if (slot < 0) {
+        fprintf(stderr, "p4_mem: side-table full (>%d live allocs)\n", MAX_LIVE_ALLOCS);
+        return NULL;
+    }
+    void *p = NULL;
+    size_t a = (align >= 8) ? align : 8;
+    if (posix_memalign(&p, a, size) != 0) {
+        s_alloc_fail[pool]++;
+        return NULL;
+    }
+    if (zeroed) memset(p, 0, size);
+    s_live[slot].ptr  = p;
+    s_live[slot].size = size;
+    s_live[slot].pool = pool;
+
+    s_active_count++;
+    s_active_bytes[pool] += size;
+    s_model.pool[pool].total_free -= size;
+    if (s_model.pool[pool].largest_contiguous >= size) {
+        s_model.pool[pool].largest_contiguous -= size;
+    } else {
+        s_model.pool[pool].largest_contiguous = 0;
+    }
+    return p;
+}
+
+void *p4_mem_malloc(size_t size, p4_pool_t pool) { return do_alloc(size, pool, false, 8); }
+void *p4_mem_calloc(size_t n, size_t size, p4_pool_t pool) { return do_alloc(n * size, pool, true, 8); }
+void *p4_mem_aligned_alloc(size_t align, size_t size, p4_pool_t pool) { return do_alloc(size, pool, false, align); }
+
+void p4_mem_free(void *p)
+{
+    if (!p) return;
+    int slot = find_slot(p);
+    if (slot < 0) {
+        fprintf(stderr, "p4_mem_free: untracked pointer %p (double-free?)\n", p);
+        abort();
+    }
+    p4_pool_t pool = s_live[slot].pool;
+    size_t    size = s_live[slot].size;
+    if (s_active_bytes[pool] >= size) s_active_bytes[pool] -= size;
+    s_active_count--;
+    s_model.pool[pool].total_free += size;
+    /* Largest-contiguous: grow back by `size` (conservative — real
+     * heap may coalesce or not). Don't exceed the original starting
+     * value to avoid drift over many alloc/free cycles. */
+    s_model.pool[pool].largest_contiguous += size;
+
+    free(s_live[slot].ptr);
+    s_live[slot].ptr = NULL;
+}

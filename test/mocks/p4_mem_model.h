@@ -75,7 +75,27 @@ typedef struct {
  * pixel. Our single-largest-contiguous model is too pessimistic for
  * PSRAM specifically; we set total_free to 16 MB so two big blocks
  * can coexist. Internal RAM is small enough that the
- * single-largest-contiguous model holds. */
+ * single-largest-contiguous model holds.
+ *
+ * NOTE on DMA-internal vs INTERNAL pool sharing — HARDWARE-VALIDATED:
+ * the ESP32-P4's HP L2MEM is a single physical region used by BOTH
+ * the regular internal heap (`MALLOC_CAP_INTERNAL`) AND the DMA-
+ * capable pool (`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`). BSS items
+ * placed in internal RAM at link time SUBTRACT FROM BOTH pools.
+ *
+ * Discovered the hard way: a 64 KB static BSS `pixel_lut` shrunk
+ * `dma_int largest` from ~6.4 KB to ~1.6 KB on hardware, breaking
+ * the SPI master's per-xfer priv-buffer alloc and panicking
+ * mid-capture (`setup_dma_priv_buffer(1206): Failed to allocate
+ * priv RX buffer` → `Load access fault`). The simulator's old
+ * separate-pool model showed PROPOSED_BSS_LUT as fitting fine; it
+ * doesn't.
+ *
+ * Mitigation in `p4_budget.c::p4_budget_simulate`: when running with
+ * mode=FROM_RAW and a BSS item has `pool == P4_POOL_INT`, also
+ * deduct the same size from `P4_POOL_DMA_INT`. That mirrors the
+ * hardware sharing. AS_IS mode keeps using the post-boot snapshot
+ * which already reflects whatever BSS is live. */
 #define P4_MEM_MODEL_DEFAULT ((p4_mem_model_t){ \
     .pool[P4_POOL_DMA_INT] = { .total_free = 13191,    .largest_contiguous = 6400, .blocks = {0,0,0} }, \
     .pool[P4_POOL_INT]     = { .total_free = 25527,    .largest_contiguous = 7168, .blocks = {0,0,0} }, \

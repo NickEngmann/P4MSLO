@@ -379,6 +379,21 @@ int p4_budget_simulate(const p4_component_t *items, size_t n,
             if (mode == P4_BUDGET_MODE_FROM_RAW) {
                 p4_mem_adjust_pool(c->pool, -(ptrdiff_t)c->size_bytes,
                                    -(ptrdiff_t)c->size_bytes);
+                /* HARDWARE-VALIDATED: HP L2MEM is one physical region;
+                 * the dma_int heap is a CAP filter on the same memory
+                 * INTERNAL BSS lands in. INTERNAL BSS reduces dma_int
+                 * too, but at a weighted rate — DMA-eligible banks are
+                 * a subset of HP L2MEM, so only items that are big
+                 * enough to span DMA-eligible regions hurt dma_int.
+                 * Empirically: 32 KB BSS items (3 × in 8bb11b7) coexist
+                 * with a healthy dma_int pool, but a single 64 KB BSS
+                 * (the BSS pixel_lut experiment) collapses dma_int from
+                 * 6.4 KB → 1.6 KB. Model that as "BSS over a 32 KB
+                 * threshold deducts the EXCESS from dma_int." */
+                if (c->pool == P4_POOL_INT && c->size_bytes > 32 * 1024) {
+                    ptrdiff_t excess = (ptrdiff_t)c->size_bytes - 32 * 1024;
+                    p4_mem_adjust_pool(P4_POOL_DMA_INT, -excess, -excess);
+                }
             }
         }
     }

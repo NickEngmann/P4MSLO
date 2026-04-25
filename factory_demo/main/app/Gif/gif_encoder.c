@@ -438,30 +438,37 @@ esp_err_t gif_encoder_pass1_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     return ret;
 }
 
-/* RGB565 → palette index LUT, 64 KB. Lives in BSS (internal DRAM) so
- * the Pass 2 hot loop's per-pixel `idx = lut[d16]` lookup hits internal
- * SRAM instead of PSRAM. Was the dominant Pass 2 bottleneck after
- * commit f9fad72 fixed the stack location:
+/* RGB565 → palette index LUT, 64 KB. Lives in PSRAM.
  *
- *   stack=PSRAM, lut=PSRAM:  encode ~55 s/frame (pre-f9fad72)
- *   stack=INTERNAL, lut=PSRAM: encode ~55 s/frame (commit f9fad72)
- *   stack=INTERNAL, lut=INTERNAL: encode ~10 s/frame (this change)
+ * History: A prior version of this file placed the LUT in static BSS
+ * (`s_pixel_lut[65536]`) which gave the Pass 2 hot loop internal-SRAM
+ * speed (~25× faster vs PSRAM). It worked great for encode timing
+ * (~36 s vs ~270 s) but starved the SPI master's DMA-internal priv-
+ * buffer pool: the 64 KB BSS sits in HP L2MEM which is DMA-capable
+ * memory, and after the BSS landed `dma_int largest` dropped from
+ * ~6.4 KB to ~1.6 KB. That pushed `setup_dma_priv_buffer(1206)` over
+ * the edge and caused a `Load access fault` panic mid-capture every
+ * few SPI runs. Reverted; LUT is back in PSRAM and Pass 2 runs at
+ * the slower rate. The simulator (`p4_lut_location_t`) over-counts
+ * DMA-eligible memory — the BSS path passes its budget check but
+ * doesn't account for HP L2MEM == DMA pool sharing.
  *
- * Single static BSS array shared across all encode runs. Single-encoder
- * gating (s_ctx.is_encoding in app_gifs.c) keeps it from being touched
- * by two encoders concurrently. Costs 64 KB internal BSS; we recover
- * the budget by reverting gif_bg's static stack (it goes back to
- * heap-alloc, falls back to PSRAM, encodes slowly — acceptable for
- * background work). Validated on the host budget simulator, see
- * test/host_encode/test_e2e.c::proposed_with_bss_lut_meets_budget. */
-static uint8_t s_pixel_lut[65536] __attribute__((aligned(4)));
+ * Future fix: smaller LUT that fits in TCM (8 KB at 0x30100000,
+ * NOT DMA-capable so doesn't compete with SPI). Octree LUT or RGB444
+ * — both ~8 KB or smaller — are tracked in the simulator but
+ * unimplemented. */
 
 esp_err_t gif_encoder_pass1_finalize(gif_encoder_t *enc)
 {
     esp_err_t ret = gif_quantize_build_palette(enc->quantizer, &enc->palette);
     if (ret != ESP_OK) return ret;
 
-    enc->pixel_lut = s_pixel_lut;
+    /* PSRAM LUT — 64 KB pixel_lut for RGB565 → palette index. */
+    enc->pixel_lut = heap_caps_malloc(65536, MALLOC_CAP_SPIRAM);
+    if (!enc->pixel_lut) {
+        ESP_LOGE(TAG, "Failed to allocate 64KB pixel LUT");
+        return ESP_ERR_NO_MEM;
+    }
     gif_quantize_build_lut(&enc->palette, enc->pixel_lut);
 
     return ESP_OK;
@@ -870,7 +877,7 @@ void gif_encoder_destroy(gif_encoder_t *enc)
     if (enc->jpeg_buf) free(enc->jpeg_buf);
     if (enc->decode_buf) free(enc->decode_buf);
     if (enc->scaled_buf) heap_caps_free(enc->scaled_buf);
-    /* enc->pixel_lut points at the static BSS s_pixel_lut — don't free. */
+    if (enc->pixel_lut) heap_caps_free(enc->pixel_lut);
     enc->pixel_lut = NULL;
     if (enc->quantizer) gif_quantize_destroy(enc->quantizer);
     if (enc->jpeg_handle) jpeg_del_decoder_engine(enc->jpeg_handle);

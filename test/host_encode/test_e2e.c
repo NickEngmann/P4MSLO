@@ -96,17 +96,38 @@ SCENARIO(proposed_with_octree_lut_meets_budget)
     ASSERT(total <= 120 * 1000, "PROPOSED + OCTREE LUT ≤ 2 min");
 }
 
-SCENARIO(proposed_with_bss_lut_meets_budget)
+#include "p4_budget.h"
+
+SCENARIO(proposed_bss_lut_starves_dma_int)
 {
-    /* 64 KB pixel_lut as static BSS. Fastest but trades the gif_bg
-     * static stack to make room. Caveat: drops bg_worker hot path
-     * back to PSRAM stack. */
+    /* HARDWARE-VALIDATED REGRESSION: a 64 KB pixel_lut as static BSS
+     * makes encode fast (~80 s), but it lands in HP L2MEM which is
+     * the same physical region the SPI master pulls DMA-internal
+     * priv-buffers from. dma_int largest collapses 6.4 KB → 1.6 KB
+     * and the SPI master priv-RX alloc panics mid-capture.
+     *
+     * Test: simulate the PROPOSED catalog from RAW with the BSS LUT
+     * entry and assert the budget simulator catches the dma_int
+     * starvation (hard_fail > 0 on dma_int allocs). */
+    p4_mem_init(P4_MEM_MODEL_RAW);
+    int rc = p4_budget_simulate(P4_BUDGET_PROPOSED, P4_BUDGET_PROPOSED_COUNT,
+                                  P4_BUDGET_MODE_FROM_RAW, NULL);
+    P("budget rc: %d (expect < 0 — dma_int starved)", rc);
+    ASSERT(rc < 0, "BSS LUT should hard-fail dma_int budget on RAW model "
+                    "(simulator must catch what hardware showed)");
+}
+
+SCENARIO(proposed_with_bss_lut_meets_encode_budget)
+{
+    /* Encode timing-only check — BSS LUT IS fast at ~80 s. Caveat:
+     * the dma_int starvation regression is checked separately in
+     * proposed_bss_lut_starves_dma_int. Both must agree: encode
+     * fast on paper, but hardware-broken because of DMA pool. */
     pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_BSS_LUT);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
     int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(120 * 1000);
-    P("total: %d ms (%.1f s) — PROPOSED + 64 KB BSS LUT",
-      total, total/1000.0);
-    ASSERT(total <= 120 * 1000, "PROPOSED + BSS LUT ≤ 2 min");
+    P("encode total: %d ms (%.1f s)", total, total/1000.0);
+    ASSERT(total <= 120 * 1000, "encode itself fits the 2-min budget");
 }
 
 SCENARIO(photo_from_main_kicks_encode)
@@ -219,7 +240,8 @@ int main(void)
     RUN(proposed_stack_only_still_misses_budget);
     RUN(proposed_with_rgb444_lut_meets_budget);
     RUN(proposed_with_octree_lut_meets_budget);
-    RUN(proposed_with_bss_lut_meets_budget);
+    RUN(proposed_with_bss_lut_meets_encode_budget);
+    RUN(proposed_bss_lut_starves_dma_int);
     RUN(photo_from_main_kicks_encode);
     RUN(photo_from_camera_then_navigate_to_main);
     RUN(multiple_photos_in_succession);

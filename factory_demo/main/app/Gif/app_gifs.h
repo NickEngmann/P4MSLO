@@ -157,6 +157,29 @@ void app_gifs_set_gallery_open(bool open);
  */
 bool app_gifs_gallery_ever_opened(void);
 
+/**
+ * @brief Acquire the shared 32 KB tjpgd workspace.
+ *
+ * Used by show_jpeg() (LVGL task), decode_jpeg_crop_to_canvas()
+ * (encode task — .p4ms direct-JPEG save), and gif_encoder.c::
+ * decode_and_scale_jpeg() (encode task — full-res frame decode).
+ *
+ * The on-device internal-RAM budget can't afford TWO 32 KB tjpgd
+ * workspaces, so we share one. The three call sites are never
+ * actually concurrent within a single encode run — the encoder calls
+ * happen on the encode task in sequence, and show_jpeg only fires
+ * from the LVGL task (which is on Core 0 vs encode on Core 1). The
+ * mutex guards against the gallery-during-encode case.
+ *
+ * Worst-case mutex hold: ~1.7 s per encoder frame decode. show_jpeg
+ * blocks for that long if it hits during encode.
+ *
+ * Returns the workspace pointer + size on success; returns NULL on
+ * timeout (caller must abort the decode).
+ */
+uint8_t *app_gifs_acquire_tjpgd_work(uint32_t timeout_ms, size_t *out_size);
+void     app_gifs_release_tjpgd_work(void);
+
 #ifdef __cplusplus
 }
 #endif

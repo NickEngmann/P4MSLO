@@ -534,10 +534,36 @@ esp_err_t app_pimslo_init(void)
         MALLOC_CAP_SPIRAM);
     if (ret != pdPASS) return ESP_FAIL;
 
-    /* GIF encode queue task on Core 1 (CPU bound — dithering + LZW) */
-    ret = xTaskCreatePinnedToCore(
-        pimslo_encode_queue_task, "pimslo_gif", 16384, NULL, 4, NULL, 1);
-    if (ret != pdPASS) return ESP_FAIL;
+    /* GIF encode queue task on Core 1 (CPU bound — dithering + LZW).
+     *
+     * Stack pinned to internal RAM via xTaskCreateStaticPinnedToCore
+     * + a BSS-resident buffer. The default `xTaskCreatePinnedToCore`
+     * calls `pvPortMalloc(16384)` which on this board silently falls
+     * back to PSRAM whenever the largest free internal block is < 16
+     * KB — and post-boot the largest free internal block is ~7 KB at
+     * every point, so the fallback fires every time. PSRAM stack
+     * means every push, every local read, every function-call frame
+     * access during the encoder per-pixel hot loop is a ~100-200 ns
+     * access. Net effect on Pass 2: ~12 s/frame (internal stack)
+     * blooms to ~55 s/frame (PSRAM stack), turning a ~95 s encode
+     * into a ~5-7 min one.
+     *
+     * Static allocation places the 16 KB stack in BSS — the linker
+     * reserves it in DRAM at link time, before any heap fragmentation
+     * happens. We can afford this BSS footprint because the encoder
+     * + tjpgd refactor freed 32 KB (gif_encoder.c::tjwork dropped,
+     * shared with app_gifs.c::s_tjpgd_work) and 32 KB
+     * (gif_encoder.c::file_buf moved to PSRAM via EXT_RAM_BSS_ATTR).
+     * Net: -32 -32 +16 = -48 KB internal BSS. Validated against the
+     * host budget simulator (test/host_encode/test_budget) before
+     * flashing — see CLAUDE-MOCK.md. */
+    static StaticTask_t s_pimslo_enc_q_tcb;
+    static StackType_t s_pimslo_enc_q_stack[16384 / sizeof(StackType_t)];
+    TaskHandle_t enc_q_task = xTaskCreateStaticPinnedToCore(
+        pimslo_encode_queue_task, "pimslo_gif",
+        sizeof(s_pimslo_enc_q_stack) / sizeof(StackType_t),
+        NULL, 4, s_pimslo_enc_q_stack, &s_pimslo_enc_q_tcb, 1);
+    if (!enc_q_task) return ESP_FAIL;
 
     s_initialized = true;
     ESP_LOGI(TAG, "PIMSLO subsystem initialized (queue depth=%d)", PIMSLO_QUEUE_DEPTH);

@@ -20,6 +20,8 @@
 #include "driver/ppa.h"
 #include "bsp/display.h"
 #include "gif_tjpgd.h"
+#include "esp_attr.h"   /* EXT_RAM_BSS_ATTR */
+#include "app_gifs.h"   /* app_gifs_acquire_tjpgd_work / release */
 
 /* SIMD-accelerated functions (gif_simd.S) */
 extern void gif_simd_distribute_below(int16_t *err_nxt, const int16_t *errors, int count);
@@ -150,16 +152,26 @@ static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
 
     /* Use tjpgd for header parsing AND decoding — it handles both 4:2:0
      * and 4:2:2 subsampling. The ESP32-P4 HW decoder can't handle 4:2:2
-     * JPEGs from the OV3660 cameras. */
+     * JPEGs from the OV3660 cameras.
+     *
+     * Workspace is shared with show_jpeg / decode_jpeg_crop_to_canvas
+     * via app_gifs's mutex. Saves 32 KB internal BSS — see CLAUDE.md
+     * "Pipeline Timing" for why that matters. */
+    size_t tjwork_size = 0;
+    uint8_t *tjwork = app_gifs_acquire_tjpgd_work(5000, &tjwork_size);
+    if (!tjwork) {
+        ESP_LOGE(TAG, "tjpgd workspace acquire timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
     tjpgd_ctx_t tjctx = {
         .data = jpeg_data, .size = jpeg_size, .pos = 0,
     };
     JDEC jdec;
-    static uint8_t tjwork[32768] __attribute__((aligned(4)));
-
-    JRESULT jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, sizeof(tjwork), &tjctx);
+    JRESULT jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, tjwork_size, &tjctx);
     if (jres != JDR_OK) {
         ESP_LOGE(TAG, "JPEG header parse failed: %d", jres);
+        app_gifs_release_tjpgd_work();
         return ESP_FAIL;
     }
 
@@ -214,10 +226,11 @@ static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
     tjctx.crop_w = crop ? src_w : 0;  /* 0 = no crop */
     tjctx.crop_h = crop ? src_h : 0;
 
-    jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, sizeof(tjwork), &tjctx);
+    jres = gif_jd_prepare(&jdec, tjpgd_input, tjwork, tjwork_size, &tjctx);
     if (jres == JDR_OK) {
         jres = gif_jd_decomp(&jdec, tjpgd_output, 0);
     }
+    app_gifs_release_tjpgd_work();
     if (jres != JDR_OK) {
         ESP_LOGE(TAG, "JPEG decode failed: tjpgd error %d", jres);
         return ESP_FAIL;
@@ -443,8 +456,12 @@ esp_err_t gif_encoder_pass2_begin(gif_encoder_t *enc, const char *output_path)
         ESP_LOGE(TAG, "Cannot create %s", output_path);
         return ESP_FAIL;
     }
-    /* Use 32KB write buffer to reduce SD card syscalls */
-    static char file_buf[32768];
+    /* 32 KB stdio buffer to reduce SD syscalls. Lives in PSRAM via
+     * EXT_RAM_BSS_ATTR — fwrite is SD-bound (~250 KB/s on this card),
+     * so PSRAM access is way faster than the bottleneck. Saves 32 KB
+     * of internal BSS that the encoder task's BSS-resident stack
+     * needs. */
+    static char EXT_RAM_BSS_ATTR file_buf[32768];
     setvbuf(enc->fp, file_buf, _IOFBF, sizeof(file_buf));
 
     write_gif_header(enc);

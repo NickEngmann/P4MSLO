@@ -13,6 +13,12 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_SPIRAM_MEMTEST=n
+# Allow EXT_RAM_BSS_ATTR statics to land in PSRAM. Used on
+# gif_encoder.c::file_buf (32 KB stdio fwrite buffer for the GIF
+# output FILE*) to free up internal BSS for the pimslo_encode_queue
+# task's static 16 KB stack. SD throughput (~250 KB/s) is the
+# bottleneck for fwrite, so PSRAM access is way faster than that.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=5584

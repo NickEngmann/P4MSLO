@@ -58,6 +58,29 @@ static const char *TAG = "app_gifs";
 static uint8_t s_tjpgd_work[32768] __attribute__((aligned(4)));
 static SemaphoreHandle_t s_tjpgd_mutex = NULL;
 
+/* Lazy-init the mutex on first acquire — gif_encoder.c uses this
+ * during PIMSLO encode, which can run before the gallery has been
+ * opened (and thus before app_gifs_init() has fired). */
+static void ensure_tjpgd_mutex(void)
+{
+    if (!s_tjpgd_mutex) s_tjpgd_mutex = xSemaphoreCreateMutex();
+}
+
+uint8_t *app_gifs_acquire_tjpgd_work(uint32_t timeout_ms, size_t *out_size)
+{
+    ensure_tjpgd_mutex();
+    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return NULL;
+    }
+    if (out_size) *out_size = sizeof(s_tjpgd_work);
+    return s_tjpgd_work;
+}
+
+void app_gifs_release_tjpgd_work(void)
+{
+    if (s_tjpgd_mutex) xSemaphoreGive(s_tjpgd_mutex);
+}
+
 /* Compile-time switch for per-step timing in the gallery play_current /
  * show_jpeg hot paths. Off by default (zero overhead — the compiler
  * elides the esp_log_timestamp() calls and the ESP_LOGI lines). Flip
@@ -2470,6 +2493,13 @@ esp_err_t app_gifs_create_pimslo(int frame_delay_ms, float parallax)
 
     s_ctx.is_encoding = true;
 
+    /* The legacy `pimslo` serial cmd path. Heap-alloc'd 16 KB stack
+     * lands in PSRAM (slow encoder). The hot path is the photo_btn
+     * flow which goes through pimslo_encode_queue_task (static BSS
+     * stack — see app_pimslo.c). Don't make pimslo_enc static here
+     * because we recreate the task every cmd invocation, and reusing
+     * a StaticTask_t while the previous instance is still in IDLE
+     * cleanup races. */
     BaseType_t ret = xTaskCreatePinnedToCore(
         pimslo_encode_task, "pimslo_enc", 16384, params, 5, NULL, 1);
     if (ret != pdPASS) {
@@ -2895,13 +2925,19 @@ void app_gifs_start_background_worker(void)
     if (s_ctx.canvas_width <= 0)  s_ctx.canvas_width  = BSP_LCD_H_RES;
     if (s_ctx.canvas_height <= 0) s_ctx.canvas_height = BSP_LCD_V_RES;
 
-    BaseType_t r = xTaskCreatePinnedToCore(
-        /* 16 KB stack — matches pimslo_encode_queue_task because this
-         * task calls the same app_gifs_encode_pimslo_from_dir pipeline.
-         * 8 KB overflowed the stack on pass 1 pre-palette work. */
-        bg_worker_task, "gif_bg", 16384, NULL, 2, &s_bg_worker, 1);
-    if (r != pdPASS) {
+    /* Static BSS stack — same rationale as pimslo_encode_queue_task in
+     * app_pimslo.c. The bg worker calls app_gifs_encode_pimslo_from_dir
+     * which has the same per-pixel hot loop; PSRAM stack would slow it
+     * 4-5×. Single instance, never deleted, so static reuse is safe.
+     * 16 KB matches pimslo_encode_queue_task; 8 KB overflowed the stack
+     * on pass 1 pre-palette work. */
+    static StaticTask_t s_bg_worker_tcb;
+    static StackType_t s_bg_worker_stack[16384 / sizeof(StackType_t)];
+    s_bg_worker = xTaskCreateStaticPinnedToCore(
+        bg_worker_task, "gif_bg",
+        sizeof(s_bg_worker_stack) / sizeof(StackType_t),
+        NULL, 2, s_bg_worker_stack, &s_bg_worker_tcb, 1);
+    if (!s_bg_worker) {
         ESP_LOGE(TAG, "Failed to start BG worker");
-        s_bg_worker = NULL;
     }
 }

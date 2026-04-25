@@ -224,11 +224,40 @@ echo "cam_wifi_off all" > /dev/ttyACM1
 **SPI capture reliability — 10/10 4-camera back-to-back at 10 MHz**: with `DISABLE_WIFI=1` on all 4 S3s and the master config in this branch, `tests/e2e/_spi_20shot.py` consistently gets 4-of-4 cameras returning JPEGs across 10+ consecutive `spi_pimslo` runs. The fixes that landed this baseline: (a) ISR-driven trigger on GPIO34 with a CS re-queue gap (`8bb11b7`), (b) 64-byte aligned `s_chunk_rx` + 64-byte aligned `s_scratch_tx/rx` for status polls (`c835c28`), (c) `chunk_rx` claimed eagerly at `spi_camera_init` while DMA-internal pool is fresh, (d) `tx_buffer = NULL` on the chunked-RX path (the slave ignores MOSI; halves DMA-internal demand from 8 KB to 4 KB). Anything that erodes any of those reverts the system to flaky / panicky territory — the diagnostic signal is `setup_dma_priv_buffer(1206): Failed to allocate priv RX buffer` followed by a `Load access fault`.
 
 ### How It Works
-1. **Photo button** → takes P4 camera photo + triggers background SPI capture
-2. **SPI capture task** (Core 0) → GPIO34 trigger → receives 4 JPEGs via SPI → saves to `/sdcard/p4mslo/P4M0001/pos{1-4}.jpg`
-3. **GIF encode queue** (Core 1) → picks up capture folders → encodes PIMSLO GIF → saves to `/sdcard/p4mslo_gifs/P4M0001.gif` → deletes raw JPEGs
 
-User can take photos every ~3-4 seconds. GIF encoding happens asynchronously in background.
+The pipeline is split across **three tasks on two cores** so the
+user-visible "saving" overlay clears as soon as the SPI transfer
+finishes — they don't wait for SD writes or GIF encode.
+
+```
+Core 0                              Core 1
+──────                              ──────
+pimslo_cap (8 KB internal)          pimslo_save (6 KB PSRAM stack)
+  GPIO34 trigger                      fwrite 4× pos*.jpg to SD
+  SPI receive 4× JPEG (~2 s)          copy P4 photo → preview dir
+  hand JPEG bufs to save_queue        enqueue GIF job
+  realloc viewfinder, return to wait
+  ↓ s_capturing=false (overlay clears here, ~3 s after photo button)
+                                    pimslo_encode_queue_task
+                                      "pimslo_gif" (16 KB BSS internal)
+                                      load 4 JPEGs from SD
+                                      generate .p4ms (4 tjpgd decodes)
+                                      run GIF encoder (Pass 1 + Pass 2)
+                                      → .gif on SD, gallery rescans
+
+                                    gif_bg (16 KB BSS internal)
+                                      pre-render missing .p4ms
+                                      re-encode stale captures
+                                      yields when user nav's gallery
+```
+
+1. **Photo button** → P4 camera photo + GPIO34 trigger
+2. **SPI capture task (Core 0)** → receives 4 JPEGs → enqueues save_job → reallocates viewfinder. **Saving overlay clears here (~3 s)**.
+3. **Save task (Core 1)** → writes 4× pos*.jpg to SD (~6-12 s, invisible) → enqueues GIF job
+4. **Encode task (Core 1)** → generates .p4ms (~7 s) then runs GIF encoder (~140 s)
+5. **Gallery** shows the entry as "PROCESSING" immediately, promotes to playable .gif when encode finishes
+
+User can fire **the next photo every ~3 s** (SPI-bound). The .gif takes ~2.5 min to finalize but that runs entirely in background.
 
 ### Manual Serial Commands
 ```bash
@@ -254,7 +283,8 @@ status
 - **tjpgd** software decoder (standalone from LVGL, renamed to `gif_jd_prepare`/`gif_jd_decomp`)
 - Handles 4:2:0 AND 4:2:2 subsampled JPEGs
 - Decodes directly into crop-sized output buffer (no full-image intermediate)
-- ~2.2s per frame at 2560×1920
+- ~1.7-1.9 s per JPEG at 2560×1920 → 1824×1920 RGB565 in the encoder hot path (file-level -O2 in `factory_demo/CMakeLists.txt` + tjpgd workspace shared in internal BSS via mutex)
+- ~1.7 s per JPEG at 2560×1920 → 240×240 canvas in the .p4ms preview path (`decode_jpeg_crop_to_canvas`, output-cell-driven nearest-neighbor downscale)
 - ESP32-P4 HW JPEG decoder only works with 4:2:0 — cannot be used for OV5640/OV3660
 
 ### SPI Bus Architecture
@@ -291,30 +321,70 @@ status
 
 ### Pipeline Timing (OV5640, 4 cameras working)
 
-Two regimes depending on which task runs the encode:
+All numbers are from the current build on hardware (commit `1ac42a1`,
+2026-04-25). The encoder runs on `pimslo_encode_queue_task` with a
+16 KB BSS-resident static stack in internal RAM, which is what makes
+the per-pixel hot loop fast enough to land here.
 
-**Legacy `pimslo` serial command (on-demand task with internal stack)**
+**User-visible "saving..." overlay (foreground)**
 
 | Step | Time |
 |------|------|
-| GPIO34 trigger + OV5640 capture | ~600ms |
-| SPI transfer × 4 cameras @ 10MHz | ~1,700ms |
-| Save 4 JPEGs to SD card | ~800ms |
-| **Capture + save total** | **~3,100ms** |
-| | |
-| Direct-JPEG .p4ms save (4 × tjpgd crop decode @ scale=0) | ~6-10s |
-| GIF pass 1: palette (4 decodes) | ~7s |
-| GIF pass 2: 4 forward frames @ ~12s/frame | ~50s |
-| GIF pass 2: 2 replayed frames | ~18s |
-| **GIF encode total** | **~85-95s** |
+| GPIO34 trigger + OV5640 capture (overlapped with P4 photo save) | ~600 ms |
+| SPI transfer × 4 cameras @ 16 MHz | ~1.7-2.2 s |
+| Viewfinder buffer free + camera realloc | ~0.5 s |
+| **User-visible saving total** | **~2-3 s** |
 
-**photo_btn flow (`pimslo_encode_queue_task` with PSRAM stack — slower)**
+`app_pimslo_is_capturing()` returns `s_capturing` only — the SD-write
+phase is invisible to the user. The save task hands off the JPEG
+buffers and continues fwriting in the background while the user can
+already fire the next photo. Photo cadence is now SPI-bound (~3 s),
+not save-bound.
 
-The persistent `pimslo_encode_queue_task` declares a 16 KB stack, which is larger than the largest contiguous free internal block on this board (~7 KB at any point post-boot). FreeRTOS silently falls back to PSRAM, and every stack access during decode/dither/LZW takes ~100-200 ns instead of an internal-RAM cycle. Net effect: each tjpgd decode jumps from ~1.7 s → ~18 s, and Pass 2 per-frame from ~12 s → ~55 s. A real photo→encode cycle on this board is **~5-7 minutes** end to end.
+**Background save (Core 1, invisible)**
 
-Live captures still feel responsive — the user only waits ~3 s for the capture overlay to clear (SPI transfer). The slow part runs in background and the gallery shows the JPEG preview immediately as a "PROCESSING" entry until the .gif finalizes.
+| Step | Time |
+|------|------|
+| `pimslo_save_task` writes 4 × pos*.jpg (~500 KB each at ~250 KB/s) | ~6-12 s |
+| Copy P4 photo → preview dir | ~250 ms |
+| Enqueue GIF job | ~ms |
 
-To recover the ~95s number you'd need to either (a) free 16 KB contiguous internal RAM (would require dropping `s_tjpgd_work`'s 32 KB BSS or `gif_encoder.c::tjwork`'s 32 KB BSS — both are required for tjpgd's hot-loop tables), or (b) restructure the encoder so the hot LZW loop runs on a separate worker thread with a smaller stack that fits internal. Open work item.
+**GIF encode (Core 1, invisible until finalized)**
+
+| Step | Time |
+|------|------|
+| Load 4 JPEGs from SD | ~1 s |
+| `.p4ms` generation (4 × tjpgd → 240×240 canvas @ ~1.7 s each) | ~7 s |
+| GIF Pass 1: palette build + setup | ~10-15 s |
+| GIF Pass 2: 4 forward frames + 2 replayed (per frame: 1.9 s decode + 22 s dither/LZW) | ~140 s |
+| **GIF encode total** | **~150-160 s (~2.5 min)** |
+
+`.p4ms` is written before the GIF encoder starts so the gallery can
+flash the 240×240 still instantly while the .gif still finalizes.
+Output sizes: ~9 MB per .gif at 1824×1920×6 frames, 460 KB per .p4ms.
+
+**Why ~140 s and not ~95 s** — the encoder's per-Pass-2-frame
+`err_cur`/`err_nxt` Floyd-Steinberg buffers (11.5 KB × 2) are now
+allocated from PSRAM unconditionally instead of trying internal first.
+Internal-RAM allocation under concurrent capture+encode+SD was the
+binding source of dma_int fragmentation that fired
+`setup_dma_priv_buffer(1206)` and `sdmmc_write_sectors: not enough
+mem (0x101)` panics. PSRAM access on the dither hot loop costs
+~75 ns/access ≈ 1.5 s/frame ≈ 10 s/encode. Acceptable trade for
+panic-free operation. The TCM-resident pixel_lut and the row_cache
+(3.8 KB internal, kept) keep the actual hot-path lookups fast.
+
+**Photo cadence the user feels**
+
+| Action | Time |
+|------|------|
+| Take a photo, see "saving..." | ~2-3 s |
+| Take next photo (SPI-bound) | every ~3 s |
+| Gallery shows entry as "PROCESSING" | immediately |
+| Entry promotes to playable .gif | ~150 s after capture |
+
+10 back-to-back `spi_pimslo` captures verified **10/10 × 4/4 cameras
+healthy** on this build, no priv_buf panics, no heap corruption.
 
 ### SD Card Layout
 ```
@@ -385,7 +455,7 @@ To recover the ~95s number you'd need to either (a) free 16 KB contiguous intern
 - **P4 camera sensor init failures are non-fatal** — `app_video_stream_init` is no longer wrapped in `ESP_ERROR_CHECK`. If the OV2710's SCCB probe fails (ribbon loose, rail dip), main.c logs a loud error and continues booting. The rest of the UI works; only the live viewfinder is dark. Previously this path crashed + reboot-looped, flashing the display every ~1 s.
 - **Sparse PIMSLO camera positions** — when SPI captures succeed non-consecutively (e.g. cams 1, 3, 4 succeed but 2 fails), the encoder loads into a compact `jpeg_data[0..num_cams-1]` array but tracks each JPEG's true camera position in `src_pos[]`. Parallax crops and filesystem reads use `src_pos[i]` so the resulting GIF still reflects the correct perspective spread.
 - **Sub-2-cam captures are dropped at the capture task** — if fewer than 2 cameras return usable JPEGs, `pimslo_capture_task` deletes the preview + partial capture dir and skips enqueueing. Prevents the "PROCESSING forever" orphan entry users saw when a failed capture would show up in the gallery with no way to encode.
-- **PIMSLO capture → save → GIF encode runs on 3 tasks** — capture task (Core 0) owns the SPI transfer only; it enqueues raw JPEG buffers to `s_save_queue` and immediately clears `s_capturing` + reallocates viewfinder buffers. `pimslo_save_task` (Core 1, 6 KB stack, prio 4) drains the queue: fwrite 4 × pos{1-4}.jpg, save preview, enqueue GIF job. `pimslo_encode_queue_task` (Core 1, 16 KB, prio 4) runs the actual GIF encode. The `s_saving` flag keeps `app_pimslo_is_capturing()` truthy across the capture→save handoff so the "saving..." overlay stays visible. Shrinks the user-visible overlay duration from ~15-20 s (SPI + inline SD writes) to ~3 s (SPI only) — they can fire the next photo while the save + encode continue in the background. Reinstated after the AI-detection removal eliminated the heap-corruption race that forced inline saves.
+- **PIMSLO capture → save → GIF encode runs on 3 tasks** — capture task (Core 0) owns the SPI transfer only; it enqueues raw JPEG buffers to `s_save_queue` and immediately clears `s_capturing` + reallocates viewfinder buffers. `pimslo_save_task` (Core 1, 6 KB PSRAM stack, prio 4) drains the queue: fwrite 4 × pos{1-4}.jpg, save preview, enqueue GIF job. `pimslo_encode_queue_task` ("pimslo_gif", Core 1, 16 KB BSS-internal static stack, prio 4) runs the actual GIF encode (.p4ms generation + Pass 1 palette + Pass 2 dither/LZW). `s_saving` is still set/cleared by the save task for telemetry but is NO LONGER returned by `app_pimslo_is_capturing()` — the saving overlay tracks only `s_capturing` (the SPI-transfer phase). User-visible overlay = SPI capture + viewfinder realloc ≈ **2-3 s**. Save (~6-12 s) and encode (~150 s) run invisibly in the background. Photo cadence is now SPI-bound, not save-bound. The gallery shows JPEG-only entries with a "PROCESSING" badge until the .gif finalizes.
 - **JPEG integrity check before save** — `pimslo_capture_task` verifies SOI (`FF D8`) and EOI (`FF D9`) markers on each SPI-returned JPEG before writing to SD. Corrupted transfers (truncated / mid-stream bit flip) get dropped with a `corrupted JPEG (SOI=0 EOI=1)` log.
 - **Gallery "QUEUED" vs "PROCESSING" badge** — JPEG-only entries show "PROCESSING" when `app_pimslo_encoding_capture_num()` matches their stem, "QUEUED" otherwise. Text is set each time `app_gifs_play_current()` runs.
 - **Empty-album / SD-error overlay** — `s_ctx.empty_label` is a centered lv_label shown when `app_gifs_get_count() == 0`. Text swaps between "Album empty / Take a photo from the camera" and "SD card not detected / Insert a card and reboot" based on `ui_extra_get_sd_card_mounted()`. Refreshed via `app_gifs_refresh_empty_overlay()`.

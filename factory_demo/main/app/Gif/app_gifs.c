@@ -2944,27 +2944,37 @@ void app_gifs_start_background_worker(void)
     if (s_ctx.canvas_width <= 0)  s_ctx.canvas_width  = BSP_LCD_H_RES;
     if (s_ctx.canvas_height <= 0) s_ctx.canvas_height = BSP_LCD_V_RES;
 
-    /* gif_bg stack lives in PSRAM via xTaskCreatePinnedToCoreWithCaps.
+    /* gif_bg stack: BSS-resident static internal RAM via
+     * xTaskCreateStaticPinnedToCore.
      *
-     * Why PSRAM? After the s_pixel_lut BSS landed (64 KB internal),
-     * the largest free internal block dropped to ~15 KB. Plain
-     * xTaskCreatePinnedToCore allocates the stack via pvPortMalloc
-     * which hardcodes MALLOC_CAP_INTERNAL — it doesn't fall back to
-     * PSRAM, so a 16 KB stack request fails with "Failed to start BG
-     * worker" and the bg pre-render / re-encode paths go silent.
+     * Was PSRAM (via xTaskCreatePinnedToCoreWithCaps + MALLOC_CAP_
+     * SPIRAM). PSRAM stacks have two problems: (1) every push/local-
+     * read in the encoder hot loop is ~100-200 ns, blowing pre-pass-2
+     * timing 5-7×, (2) more importantly per the v5.5.x heap-debug
+     * research, FreeRTOS's stack-canary detector does NOT reliably
+     * cover PSRAM stacks — a stack overflow into the adjacent PSRAM
+     * heap block silently corrupts the next free-block header and
+     * fires later as a tlsf::remove_free_block panic with a garbage
+     * MTVAL. That's the open bug we've been chasing in tests 08/09.
      *
-     * Using WithCaps + MALLOC_CAP_SPIRAM forces the stack to PSRAM.
-     * Cost: bg encodes run at ~5-7 min (PSRAM-stack penalty applies
-     * to gif_bg's per-pixel hot loop) — acceptable since bg work is
-     * background. The foreground photo_btn path uses
-     * pimslo_encode_queue_task which keeps its INTERNAL-stack static
-     * BSS allocation and benefits from the new internal-RAM
-     * pixel_lut. */
-    BaseType_t r = xTaskCreatePinnedToCoreWithCaps(
-        bg_worker_task, "gif_bg", 16384, NULL, 2, &s_bg_worker, 1,
-        MALLOC_CAP_SPIRAM);
-    if (r != pdPASS) {
+     * Moved to BSS now that the encoder's 64 KB pixel_lut is in TCM
+     * (commit a206f6e) — that freed up exactly the internal-RAM
+     * headroom this 16 KB stack needs. The mock's PROPOSED catalog
+     * (test/mocks/p4_budget.c) has already been validating the
+     * combination "TCM LUT + gif_bg static BSS + pimslo_gif static
+     * BSS" against the dma_int budget for several iterations.
+     *
+     * If gif_bg's 16 KB BSS later starves dma_int again (e.g. when
+     * we add another internal-resident static), revert this and put
+     * the canary back in via CONFIG_ESP_SYSTEM_HW_STACK_GUARD which
+     * IS reliable for PSRAM stacks (unlike the FreeRTOS canary). */
+    static StaticTask_t s_gif_bg_tcb;
+    static StackType_t s_gif_bg_stack[16384 / sizeof(StackType_t)];
+    s_bg_worker = xTaskCreateStaticPinnedToCore(
+        bg_worker_task, "gif_bg",
+        sizeof(s_gif_bg_stack) / sizeof(StackType_t),
+        NULL, 2, s_gif_bg_stack, &s_gif_bg_tcb, 1);
+    if (!s_bg_worker) {
         ESP_LOGE(TAG, "Failed to start BG worker");
-        s_bg_worker = NULL;
     }
 }

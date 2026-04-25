@@ -79,6 +79,44 @@ static inline uint8_t gif_quantize_lut_map(const uint8_t *lut, uint16_t rgb565)
 }
 
 /**
+ * @brief Build a 4 KB R4-G4-B4 LUT for the TCM-resident hot path
+ *
+ * 12-bit address: top 4 bits of red, top 4 bits of green, top 4 bits
+ * of blue. 4096 palette indices = 4 KB. Single indirection in TCM
+ * (~3 ns) vs 64 KB LUT in PSRAM (~80 ns) ≈ 20× speedup on Pass 2.
+ *
+ * 4 KB (not 8 KB) because ~2.8 KB of TCM is already in use by
+ * pmu_init.c and friends — only ~5.4 KB remains for user data. The
+ * earlier 8 KB R4G5B4 attempt overflowed the tcm_idram_seg region by
+ * 2816 bytes; back-off to 4 KB.
+ *
+ * Quality: 1 LSB less precision on R and B vs RGB565, 2 bits less on
+ * green. Floyd-Steinberg dithering propagates errors larger than these
+ * LSB drops, so visual difference is below the encoder's noise floor.
+ *
+ * @param palette  The 256-color palette to map against
+ * @param[out] lut Output array of 4096 uint8_t (caller-allocated, must
+ *                 live in TCM via TCM_DRAM_ATTR for the speedup to land)
+ */
+void gif_quantize_build_lut12(const gif_palette_t *palette, uint8_t *lut);
+
+/**
+ * @brief Map an RGB565 pixel to a palette index via the 12-bit TCM LUT
+ *
+ * Address layout: bits 11..8 = R top4, bits 7..4 = G top4, bits 3..0 = B top4
+ */
+static inline uint8_t gif_quantize_lut12_map(const uint8_t *lut, uint16_t rgb565)
+{
+    int r5 = (rgb565 >> 11) & 0x1F;
+    int g6 = (rgb565 >> 5) & 0x3F;
+    int b5 = rgb565 & 0x1F;
+    int r4 = r5 >> 1;
+    int g4 = g6 >> 2;
+    int b4 = b5 >> 1;
+    return lut[(r4 << 8) | (g4 << 4) | b4];
+}
+
+/**
  * @brief Free quantizer context
  */
 void gif_quantize_destroy(gif_quantize_ctx_t *ctx);

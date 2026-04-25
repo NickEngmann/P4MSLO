@@ -313,6 +313,45 @@ void gif_quantize_build_lut(const gif_palette_t *palette, uint8_t *lut)
     ESP_LOGI(TAG, "LUT built");
 }
 
+void gif_quantize_build_lut12(const gif_palette_t *palette, uint8_t *lut)
+{
+    ESP_LOGI(TAG, "Building R4G4B4 → palette LUT (4096 entries, TCM)...");
+
+    int pr[256], pg[256], pb[256];
+    for (int i = 0; i < palette->count; i++) {
+        pr[i] = palette->entries[i].r;
+        pg[i] = palette->entries[i].g;
+        pb[i] = palette->entries[i].b;
+    }
+    int count = palette->count;
+
+    for (uint32_t addr = 0; addr < 4096; addr++) {
+        int r4 = (addr >> 8) & 0x0F;
+        int g4 = (addr >> 4) & 0x0F;
+        int b4 = addr & 0x0F;
+        int r = (r4 << 4) | r4;
+        int g = (g4 << 4) | g4;
+        int b = (b4 << 4) | b4;
+
+        int best_idx = 0;
+        int best_dist = INT32_MAX;
+        for (int i = 0; i < count; i++) {
+            int dr = r - pr[i];
+            int dg = g - pg[i];
+            int db = b - pb[i];
+            int dist = dr * dr + dg * dg + db * db;
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = i;
+                if (dist == 0) break;
+            }
+        }
+        lut[addr] = (uint8_t)best_idx;
+    }
+
+    ESP_LOGI(TAG, "12-bit LUT built");
+}
+
 void gif_quantize_destroy(gif_quantize_ctx_t *ctx)
 {
     if (!ctx) return;

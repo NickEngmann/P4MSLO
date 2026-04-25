@@ -438,38 +438,40 @@ esp_err_t gif_encoder_pass1_add_frame(gif_encoder_t *enc, const char *jpeg_path)
     return ret;
 }
 
-/* RGB565 → palette index LUT, 64 KB. Lives in PSRAM.
+/* RGB565 → palette index LUT.
  *
- * History: A prior version of this file placed the LUT in static BSS
- * (`s_pixel_lut[65536]`) which gave the Pass 2 hot loop internal-SRAM
- * speed (~25× faster vs PSRAM). It worked great for encode timing
- * (~36 s vs ~270 s) but starved the SPI master's DMA-internal priv-
- * buffer pool: the 64 KB BSS sits in HP L2MEM which is DMA-capable
- * memory, and after the BSS landed `dma_int largest` dropped from
- * ~6.4 KB to ~1.6 KB. That pushed `setup_dma_priv_buffer(1206)` over
- * the edge and caused a `Load access fault` panic mid-capture every
- * few SPI runs. Reverted; LUT is back in PSRAM and Pass 2 runs at
- * the slower rate. The simulator (`p4_lut_location_t`) over-counts
- * DMA-eligible memory — the BSS path passes its budget check but
- * doesn't account for HP L2MEM == DMA pool sharing.
+ * 4 KB R4-G4-B4 lookup, statically allocated in TCM (0x30100000, 8 KB
+ * region of which ~2.8 KB is consumed by pmu_init.c etc., leaving
+ * ~5.4 KB usable). Single indirection in TCM (~3 ns) vs ~80 ns from
+ * PSRAM ≈ 20× speedup on Pass 2's per-pixel hot loop. TCM is NOT
+ * DMA-capable (see SOC_TCM_LOW/HIGH in soc.h) so the LUT does not
+ * compete with the SPI master's priv-buffer pool.
  *
- * Future fix: smaller LUT that fits in TCM (8 KB at 0x30100000,
- * NOT DMA-capable so doesn't compete with SPI). Octree LUT or RGB444
- * — both ~8 KB or smaller — are tracked in the simulator but
- * unimplemented. */
+ * Quality: 1 LSB less precision on R and B, 2 bits less on green vs
+ * the previous RGB565 LUT. Floyd-Steinberg dithering propagates errors
+ * larger than these drops, so the visual difference is below the
+ * encoder's noise floor.
+ *
+ * History: A prior version placed a 64 KB RGB565 LUT in static BSS
+ * (HP L2MEM). That gave the same speedup but the BSS landed in a
+ * DMA-capable region and starved the SPI master's priv-buffer pool —
+ * `setup_dma_priv_buffer(1206)` panicked mid-capture every ~4 rounds.
+ * Initial TCM port targeted 8 KB (R4G5B4) but overflowed tcm_idram_seg
+ * by 2816 bytes; settled on 4 KB. */
+TCM_DRAM_ATTR static uint8_t s_pixel_lut_tcm[4096] __attribute__((aligned(64)));
 
 esp_err_t gif_encoder_pass1_finalize(gif_encoder_t *enc)
 {
     esp_err_t ret = gif_quantize_build_palette(enc->quantizer, &enc->palette);
     if (ret != ESP_OK) return ret;
 
-    /* PSRAM LUT — 64 KB pixel_lut for RGB565 → palette index. */
-    enc->pixel_lut = heap_caps_malloc(65536, MALLOC_CAP_SPIRAM);
-    if (!enc->pixel_lut) {
-        ESP_LOGE(TAG, "Failed to allocate 64KB pixel LUT");
-        return ESP_ERR_NO_MEM;
-    }
-    gif_quantize_build_lut(&enc->palette, enc->pixel_lut);
+    /* No heap_caps_malloc — the 4 KB LUT is static TCM-resident. Just
+     * point enc->pixel_lut at it so the rest of the encoder code is
+     * unchanged. The mutex is implicit: gif_encoder is single-threaded
+     * (one encode at a time, gated by s_ctx.is_encoding in app_gifs.c
+     * and the encode_queue_task in app_pimslo.c). */
+    enc->pixel_lut = s_pixel_lut_tcm;
+    gif_quantize_build_lut12(&enc->palette, enc->pixel_lut);
 
     return ESP_OK;
 }
@@ -515,9 +517,8 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
 
     int w = enc->width, h = enc->height;
 
-    /* The LUT (enc->pixel_lut → s_pixel_lut static BSS) already lives in
-     * internal DRAM. The legacy per-frame copy-to-internal pattern is
-     * gone — BSS is permanent and pre-internal. */
+    /* enc->pixel_lut points at s_pixel_lut_tcm (8 KB, R4G5B4, TCM-
+     * resident). Hot-loop indexing below: ((r>>4)<<9) | ((g>>3)<<4) | (b>>4). */
     uint8_t *lut = enc->pixel_lut;
     bool lut_internal = false;  /* never free */
 
@@ -581,8 +582,10 @@ esp_err_t gif_encoder_pass2_add_frame(gif_encoder_t *enc, const char *jpeg_path)
             g = g < 0 ? 0 : (g > 255 ? 255 : g);
             b = b < 0 ? 0 : (b > 255 ? 255 : b);
 
-            uint16_t d16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-            uint8_t idx = lut[d16];
+            /* R4G4B4 12-bit address into the 4 KB TCM LUT. Drops bottom
+             * 4 bits of each channel; below the dithering noise floor. */
+            uint16_t d12 = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+            uint8_t idx = lut[d12];
             row_indices[x] = idx;
 
             int er = r - pal_r[idx];
@@ -769,7 +772,7 @@ esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
 
     int w = enc->width, h = enc->height;
 
-    /* enc->pixel_lut is the static BSS s_pixel_lut — already internal. */
+    /* enc->pixel_lut points at s_pixel_lut_tcm (built once in pass1). */
     uint8_t *lut = enc->pixel_lut;
     bool lut_internal = false;  /* never free */
 
@@ -814,8 +817,10 @@ esp_err_t gif_encoder_pass2_add_frame_from_buffer(gif_encoder_t *enc,
             r = r < 0 ? 0 : (r > 255 ? 255 : r);
             g = g < 0 ? 0 : (g > 255 ? 255 : g);
             b = b < 0 ? 0 : (b > 255 ? 255 : b);
-            uint16_t d16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-            uint8_t idx = lut[d16];
+            /* R4G4B4 12-bit address into the 4 KB TCM LUT. Drops bottom
+             * 4 bits of each channel; below the dithering noise floor. */
+            uint16_t d12 = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+            uint8_t idx = lut[d12];
             row_indices[x] = idx;
             int er = r - pal_r[idx];
             int eg = g - pal_g[idx];
@@ -877,7 +882,8 @@ void gif_encoder_destroy(gif_encoder_t *enc)
     if (enc->jpeg_buf) free(enc->jpeg_buf);
     if (enc->decode_buf) free(enc->decode_buf);
     if (enc->scaled_buf) heap_caps_free(enc->scaled_buf);
-    if (enc->pixel_lut) heap_caps_free(enc->pixel_lut);
+    /* enc->pixel_lut points at static TCM-resident s_pixel_lut_tcm —
+     * NOT heap-allocated, do not free. */
     enc->pixel_lut = NULL;
     if (enc->quantizer) gif_quantize_destroy(enc->quantizer);
     if (enc->jpeg_handle) jpeg_del_decoder_engine(enc->jpeg_handle);

@@ -352,3 +352,40 @@ stuck at status 0x00 (unresponsive to `cam_reboot`); per CLAUDE.md
 power-cycle of the S3 boards to recover. Architecture validation
 ran via the legacy `pimslo` serial cmd (encodes from existing SD
 fixtures) which doesn't need cameras.
+
+## What landed in commit 79c09f9 — BSS pixel_lut
+
+The simulator's PROPOSED_BSS_LUT path was applied. Headline result
+on hardware via legacy `pimslo` serial cmd:
+
+| step                    | f9fad72 (LUT in PSRAM) | 79c09f9 (LUT in BSS) |
+|-------------------------|------------------------|----------------------|
+| Pass 2 frame timing     | decode=1571 encode=55328 ms | decode=1605 encode=2030 ms |
+| Pass 2 LZW speedup      | —                      | **27×**              |
+| Total 4-cam encode      | ~270 s (4.5 min)       | **36.7 s**           |
+| vs 2-min target         | ✗                      | ✓                    |
+
+The 64 KB pixel_lut is now a static BSS array (`s_pixel_lut`). The
+per-pixel LUT read in the dither+LZW hot loop hits internal SRAM
+instead of PSRAM, which on this chip is ~5-7× faster cold + cache-warm.
+
+Trade-offs documented in the commit:
+
+  - dma_int largest dropped 23552 → 6400 (back to baseline-low). Tight
+    for LCD priv-TX scratch but functional.
+  - int largest dropped 31744 → 15360. The legacy `pimslo` /
+    `spi_pimslo` serial-cmd encode task (`pimslo_enc`) and the bg
+    worker (`gif_bg`) both used to be heap-alloc'd 16 KB stacks; that
+    no longer fits internal so they had to switch to
+    `xTaskCreatePinnedToCoreWithCaps(MALLOC_CAP_SPIRAM)`. Both now run
+    on PSRAM stack (slower) — acceptable since they're test/background
+    paths, not user-facing.
+  - Foreground photo_btn flow (`pimslo_encode_queue_task`) keeps its
+    static BSS stack AND benefits from the new internal LUT.
+
+Mock simulator delta: PROPOSED_BSS_LUT scenario in `test_e2e` predicted
+80 s total; hardware measured 36.7 s. The simulator's penalty model
+was conservative on the LUT side (5.5× PSRAM penalty applied to the
+nominal 10 s/frame); reality is closer to 27× speedup which the model
+underestimated. That's a useful calibration data point — the next
+catalog update should bump LUT_PENALTY_PSRAM_PCT closer to ~2700.

@@ -89,3 +89,11 @@ CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
 # _xesppie; the Zb extensions would emit instructions the hardware
 # doesn't have. Toolchain supports Zb (GCC 14 -march=help lists
 # zba/zbb/...) but the silicon doesn't.
+#
+# Heap poisoning was tried (CONFIG_HEAP_POISONING_COMPREHENSIVE=y) to
+# catch the intermittent tlsf::remove_free_block panic on long e2e
+# sequences. Outcome: boot hung at LVGL task start, never reached
+# `Camera initialized`. The poisoning's ~16 B/alloc canary overhead
+# pushed something over a threshold during LVGL init. Reverted.
+# Future try: CONFIG_HEAP_POISONING_LIGHT=y instead — half the
+# overhead, still catches most overruns.

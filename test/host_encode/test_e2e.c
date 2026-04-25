@@ -52,25 +52,68 @@ SCENARIO(baseline_arch_misses_budget)
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(/* cams */ 4);
     ASSERT(r.cams_usable == 4, "expected 4/4 cams");
     int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(600 * 1000);
-    P("total: %d ms (%.1f s) — baseline arch (PSRAM stack)", total, total/1000.0);
-    ASSERT(total > 120 * 1000, "expected baseline > 2 min (PSRAM stack penalty)");
+    P("total: %d ms (%.1f s) — baseline arch (PSRAM stack + PSRAM LUT)",
+      total, total/1000.0);
+    ASSERT(total > 200 * 1000, "expected baseline > 200 s (worst case)");
 }
 
-SCENARIO(proposed_arch_meets_budget)
+SCENARIO(proposed_stack_only_still_misses_budget)
 {
+    /* PROPOSED = commit f9fad72: stack moved to INTERNAL but LUT still
+     * PSRAM. The Pass 2 LZW hot loop is LUT-bound, not stack-bound,
+     * so this only halves the encode time — still over 2 min. */
     pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(600 * 1000);
+    P("total: %d ms (%.1f s) — PROPOSED stack-only (LUT still PSRAM)",
+      total, total/1000.0);
+    /* Should still be over 2 min, but materially faster than BASELINE. */
+    ASSERT(total > 120 * 1000, "PROPOSED-stack-only still over 2 min (LUT-bound)");
+    ASSERT(total < 300 * 1000, "PROPOSED-stack-only should be ~260 s, not 5+ min");
+}
+
+SCENARIO(proposed_with_rgb444_lut_meets_budget)
+{
+    /* RGB444 LUT — 4 KB in internal RAM. Slightly lossy quantization
+     * but the encoder dithers to compensate. Cheapest fix. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_RGB444);
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
     int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(120 * 1000);
-    P("total: %d ms (%.1f s) — proposed arch (INTERNAL stack)", total, total/1000.0);
-    ASSERT(total <= 120 * 1000, "expected proposed ≤ 2 min");
-    ASSERT(gallery_count() == 1, "expected 1 gallery entry after encode");
-    const gallery_entry_t *e = gallery_current();
-    ASSERT(e && e->has_gif && e->has_p4ms, "entry should have both .gif and .p4ms");
+    P("total: %d ms (%.1f s) — PROPOSED + RGB444 LUT (4 KB)",
+      total, total/1000.0);
+    ASSERT(total <= 120 * 1000, "PROPOSED + RGB444 LUT ≤ 2 min");
+}
+
+SCENARIO(proposed_with_octree_lut_meets_budget)
+{
+    /* Octree LUT — 8 KB hierarchical. No quality loss but the per-
+     * pixel lookup is 3-4 indirections. Best balance. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(120 * 1000);
+    P("total: %d ms (%.1f s) — PROPOSED + OCTREE LUT (8 KB)",
+      total, total/1000.0);
+    ASSERT(total <= 120 * 1000, "PROPOSED + OCTREE LUT ≤ 2 min");
+}
+
+SCENARIO(proposed_with_bss_lut_meets_budget)
+{
+    /* 64 KB pixel_lut as static BSS. Fastest but trades the gif_bg
+     * static stack to make room. Caveat: drops bg_worker hot path
+     * back to PSRAM stack. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_BSS_LUT);
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(120 * 1000);
+    P("total: %d ms (%.1f s) — PROPOSED + 64 KB BSS LUT",
+      total, total/1000.0);
+    ASSERT(total <= 120 * 1000, "PROPOSED + BSS LUT ≤ 2 min");
 }
 
 SCENARIO(photo_from_main_kicks_encode)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    /* Use the OCTREE arch — best balance of fits-in-budget and no
+     * quality loss. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     ui_extra_set_current_page(UI_PAGE_MAIN);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
     pimslo_sim_wait_idle(120 * 1000);
@@ -80,7 +123,7 @@ SCENARIO(photo_from_main_kicks_encode)
 
 SCENARIO(photo_from_camera_then_navigate_to_main)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     ui_extra_set_current_page(UI_PAGE_CAMERA);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
     /* On CAMERA, encode_should_defer returns true. The save_task
@@ -93,7 +136,7 @@ SCENARIO(photo_from_camera_then_navigate_to_main)
 
 SCENARIO(multiple_photos_in_succession)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     ui_extra_set_current_page(UI_PAGE_MAIN);
     for (int i = 0; i < 3; i++) {
         pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
@@ -105,7 +148,7 @@ SCENARIO(multiple_photos_in_succession)
 
 SCENARIO(photo_with_too_few_cams_dropped)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     pimslo_sim_force_capture_fail(1, /* cams returned */ 1);
     ui_extra_set_current_page(UI_PAGE_MAIN);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
@@ -116,7 +159,7 @@ SCENARIO(photo_with_too_few_cams_dropped)
 
 SCENARIO(bg_worker_recovers_jpeg_only_captures)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     /* Simulate prior boot leaving a JPEG-only entry on SD. */
     gallery_record_capture("P4M0001", /*gif*/ false, /*jpeg*/ true, /*p4ms*/ false);
     ASSERT(gallery_count() == 1, "1 jpeg-only entry");
@@ -130,7 +173,7 @@ SCENARIO(bg_worker_recovers_jpeg_only_captures)
 
 SCENARIO(bg_worker_pre_renders_p4ms)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     /* Existing .gif without .p4ms (interrupted .p4ms save). */
     gallery_record_capture("P4M0042", true, true, false);
     ASSERT(!gallery_current()->has_p4ms, "p4ms missing initially");
@@ -142,7 +185,7 @@ SCENARIO(bg_worker_pre_renders_p4ms)
 
 SCENARIO(bg_worker_yields_on_gallery_page)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     gallery_record_capture("P4M0001", false, true, false);
     ui_extra_set_current_page(UI_PAGE_GIFS);
     bg_worker_kick();
@@ -152,7 +195,7 @@ SCENARIO(bg_worker_yields_on_gallery_page)
 
 SCENARIO(memory_after_encode_returns_to_steady)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
     size_t int_before = pimslo_sim_internal_largest();
     size_t psr_before = pimslo_sim_psram_largest();
     P("before: int_largest=%zu psram_largest=%zu", int_before, psr_before);
@@ -173,7 +216,10 @@ SCENARIO(memory_after_encode_returns_to_steady)
 int main(void)
 {
     RUN(baseline_arch_misses_budget);
-    RUN(proposed_arch_meets_budget);
+    RUN(proposed_stack_only_still_misses_budget);
+    RUN(proposed_with_rgb444_lut_meets_budget);
+    RUN(proposed_with_octree_lut_meets_budget);
+    RUN(proposed_with_bss_lut_meets_budget);
     RUN(photo_from_main_kicks_encode);
     RUN(photo_from_camera_then_navigate_to_main);
     RUN(multiple_photos_in_succession);

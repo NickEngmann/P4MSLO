@@ -5,12 +5,41 @@
 #include "p4_timing.h"
 #include <stdio.h>
 
+static int stack_penalty(p4_stack_location_t stack)
+{
+    return (stack == P4_STACK_PSRAM)
+           ? P4_TIMING_STACK_PENALTY_PSRAM_PCT
+           : P4_TIMING_STACK_PENALTY_INTERNAL_PCT;
+}
+
+static int lut_penalty(p4_lut_location_t lut)
+{
+    switch (lut) {
+        case P4_LUT_PSRAM:    return P4_TIMING_LUT_PENALTY_PSRAM_PCT;
+        case P4_LUT_OCTREE:   return P4_TIMING_LUT_PENALTY_OCTREE_PCT;
+        case P4_LUT_RGB444:   return P4_TIMING_LUT_PENALTY_RGB444_PCT;
+        case P4_LUT_INTERNAL:
+        default:              return P4_TIMING_LUT_PENALTY_INTERNAL_PCT;
+    }
+}
+
 static int apply_penalty(int nominal_ms, p4_stack_location_t stack)
 {
-    int pct = (stack == P4_STACK_PSRAM)
-              ? P4_TIMING_STACK_PENALTY_PSRAM_PCT
-              : P4_TIMING_STACK_PENALTY_INTERNAL_PCT;
-    return (nominal_ms * pct) / 100;
+    return (nominal_ms * stack_penalty(stack)) / 100;
+}
+
+/* Pass 2 LZW+dither: dominated by per-pixel LUT reads, NOT by stack.
+ * Hardware confirmed: with stack=INTERNAL but LUT=PSRAM, the encode
+ * step stayed at ~55 s/frame. Stack only matters for decode/setup;
+ * LUT is the binding constraint for the per-pixel hot loop. So we
+ * pick the LARGER penalty rather than multiplying. */
+static int apply_pass2_penalty(int nominal_ms, p4_stack_location_t stack,
+                                p4_lut_location_t lut)
+{
+    int s = stack_penalty(stack);
+    int l = lut_penalty(lut);
+    int worst = (s > l) ? s : l;
+    return (nominal_ms * worst) / 100;
 }
 
 p4_pipeline_timing_t p4_timing_estimate(p4_pipeline_params_t p)
@@ -20,18 +49,23 @@ p4_pipeline_timing_t p4_timing_estimate(p4_pipeline_params_t p)
     if (n < 2) n = 2;
     if (n > 4) n = 4;
 
-    /* .p4ms save: tjpgd decode 4 cams (one per camera). Stack-bound. */
+    /* .p4ms save: tjpgd decode 4 cams (one per camera). Stack-bound,
+     * LUT-independent (tjpgd doesn't use the pixel_lut). */
     if (p.save_p4ms) {
         t.p4ms_save_ms = apply_penalty(P4_TIMING_P4MS_PER_FRAME_MS * n, p.stack);
     }
 
-    /* Pass 1: palette accumulation, n decodes. Stack-bound. */
+    /* Pass 1: palette accumulation, n decodes. Stack-bound. Doesn't
+     * touch the per-encode pixel_lut. */
     t.pass1_ms = apply_penalty(P4_TIMING_PALETTE_PER_FRAME_MS * n, p.stack);
     t.pass1_ms += P4_TIMING_PALETTE_LUT_BUILD_MS;
 
-    /* Pass 2: forward — n frames decoded + LZW-encoded. Stack-bound. */
-    int per_frame_total = P4_TIMING_DECODE_PER_FRAME_MS + P4_TIMING_ENCODE_PER_FRAME_MS;
-    t.pass2_forward_ms = apply_penalty(per_frame_total * n, p.stack);
+    /* Pass 2: forward — n frames. Decode is stack-only; encode (dither
+     * + LZW) is stack × LUT. */
+    int decode_part = apply_penalty(P4_TIMING_DECODE_PER_FRAME_MS * n, p.stack);
+    int encode_part = apply_pass2_penalty(P4_TIMING_ENCODE_PER_FRAME_MS * n,
+                                           p.stack, p.lut);
+    t.pass2_forward_ms = decode_part + encode_part;
 
     /* Pass 2: reverse — (n-2) middle frames replayed from cache, no
      * LZW re-encode but the file write still costs SD throughput. */

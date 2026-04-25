@@ -5,27 +5,46 @@
 #include <stdio.h>
 #include "p4_timing.h"
 
+static void run(const char *label, p4_pipeline_params_t params, int target_ms)
+{
+    p4_pipeline_timing_t t = p4_timing_estimate(params);
+    printf("\n========== %s ==========\n", label);
+    p4_timing_print(t, stdout);
+    printf("  vs target %d ms (%d s): %s\n",
+           target_ms, target_ms / 1000,
+           (t.total_ms <= target_ms) ? "✓ PASS" : "✗ FAIL");
+}
+
 int main(void)
 {
-    printf("\n========== INTERNAL stack (PROPOSED — static BSS) ==========\n");
-    p4_pipeline_timing_t t_int = p4_timing_estimate((p4_pipeline_params_t){
-        .n_cams = 4, .stack = P4_STACK_INTERNAL, .save_p4ms = true,
-    });
-    p4_timing_print(t_int, stdout);
+    int target_ms = 120 * 1000;  /* 2 min */
 
-    printf("\n========== PSRAM stack (BASELINE — current FreeRTOS fallback) ==========\n");
-    p4_pipeline_timing_t t_psr = p4_timing_estimate((p4_pipeline_params_t){
-        .n_cams = 4, .stack = P4_STACK_PSRAM, .save_p4ms = true,
-    });
-    p4_timing_print(t_psr, stdout);
+    run("BASELINE — PSRAM stack, PSRAM LUT (original firmware)",
+        (p4_pipeline_params_t){ .n_cams = 4, .stack = P4_STACK_PSRAM,
+                                 .lut = P4_LUT_PSRAM, .save_p4ms = true },
+        target_ms);
 
-    int target_ms = 120 * 1000;
-    printf("\n=== Verdict (target ≤ %d ms / 2 min) ===\n", target_ms);
-    printf("  INTERNAL stack: %5.1f s  %s\n", t_int.total_ms / 1000.0,
-           (t_int.total_ms <= target_ms) ? "✓ PASS" : "✗ FAIL");
-    printf("  PSRAM stack:    %5.1f s  %s\n", t_psr.total_ms / 1000.0,
-           (t_psr.total_ms <= target_ms) ? "✓ PASS" : "✗ FAIL");
-    printf("  Speedup of INTERNAL vs PSRAM: %.1f×\n",
-           (double)t_psr.total_ms / t_int.total_ms);
+    run("PROPOSED (commit f9fad72) — INTERNAL stack, PSRAM LUT",
+        (p4_pipeline_params_t){ .n_cams = 4, .stack = P4_STACK_INTERNAL,
+                                 .lut = P4_LUT_PSRAM, .save_p4ms = true },
+        target_ms);
+
+    run("PROPOSED + RGB444 LUT (4 KB internal, slight quality loss)",
+        (p4_pipeline_params_t){ .n_cams = 4, .stack = P4_STACK_INTERNAL,
+                                 .lut = P4_LUT_RGB444, .save_p4ms = true },
+        target_ms);
+
+    run("PROPOSED + OCTREE LUT (8 KB internal, no quality loss)",
+        (p4_pipeline_params_t){ .n_cams = 4, .stack = P4_STACK_INTERNAL,
+                                 .lut = P4_LUT_OCTREE, .save_p4ms = true },
+        target_ms);
+
+    run("PROPOSED + 64 KB BSS LUT (drops gif_bg static stack)",
+        (p4_pipeline_params_t){ .n_cams = 4, .stack = P4_STACK_INTERNAL,
+                                 .lut = P4_LUT_INTERNAL, .save_p4ms = true },
+        target_ms);
+
+    printf("\n=== Best smaller-LUT path that hits the 2-min budget ===\n");
+    printf("  Look for the first ✓ PASS above. That's the recommendation.\n");
     return 0;
 }

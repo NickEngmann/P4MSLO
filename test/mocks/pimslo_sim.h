@@ -144,8 +144,13 @@ void pimslo_sim_reset(void);
 
 /* Configure the architecture to test. */
 typedef enum {
-    PIMSLO_ARCH_BASELINE,   /* current firmware: 96 KB BSS, PSRAM stack */
-    PIMSLO_ARCH_PROPOSED,   /* shared tjpgd + PSRAM file_buf + static BSS stack */
+    PIMSLO_ARCH_BASELINE,           /* original firmware: PSRAM stack, PSRAM LUT */
+    PIMSLO_ARCH_PROPOSED,           /* commit f9fad72: INTERNAL stack, PSRAM LUT (LUT
+                                     * still doesn't fit internal — Pass 2 LZW slow) */
+    PIMSLO_ARCH_PROPOSED_OCTREE,    /* PROPOSED + 8 KB octree LUT in internal */
+    PIMSLO_ARCH_PROPOSED_RGB444,    /* PROPOSED + 4 KB RGB444 LUT in internal */
+    PIMSLO_ARCH_PROPOSED_BSS_LUT,   /* PROPOSED + 64 KB pixel_lut as static BSS
+                                     * (drops the gif_bg static stack to make room) */
 } pimslo_sim_arch_t;
 
 void pimslo_sim_set_architecture(pimslo_sim_arch_t arch);

@@ -2,6 +2,19 @@
  * on x86 — we don't care about timing identity, just correctness. */
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
+
+/* Host stubs for the shared tjpgd workspace API exported by app_gifs.c
+ * on device. Single-threaded host harness, no contention, so a static
+ * buffer + no mutex is fine. */
+static uint8_t s_host_tjpgd_work[32768] __attribute__((aligned(4)));
+uint8_t *app_gifs_acquire_tjpgd_work(uint32_t timeout_ms, size_t *out_size)
+{
+    (void)timeout_ms;
+    if (out_size) *out_size = sizeof(s_host_tjpgd_work);
+    return s_host_tjpgd_work;
+}
+void app_gifs_release_tjpgd_work(void) {}
 
 void gif_simd_memzero_s16(int16_t *buf, int count) {
     memset(buf, 0, (size_t)count * sizeof(int16_t));

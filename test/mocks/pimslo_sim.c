@@ -119,10 +119,27 @@ void pimslo_sim_set_architecture(pimslo_sim_arch_t a) { s_arch = a; }
 
 /* The arch determines whether the encoder task's stack lives in
  * INTERNAL (proposed: BSS-resident) or PSRAM (baseline: FreeRTOS
- * fallback). That's THE knob. */
+ * fallback). That's the original knob.
+ *
+ * The follow-up knob is LUT placement. PROPOSED has the stack fixed
+ * but the 64 KB pixel_lut still lives in PSRAM (won't fit the new
+ * 31 KB largest internal block). The LUT_FIX architectures replace
+ * it with a smaller alternative. */
 static p4_stack_location_t encoder_stack_location(void)
 {
-    return (s_arch == PIMSLO_ARCH_PROPOSED) ? P4_STACK_INTERNAL : P4_STACK_PSRAM;
+    return (s_arch == PIMSLO_ARCH_BASELINE) ? P4_STACK_PSRAM : P4_STACK_INTERNAL;
+}
+
+static p4_lut_location_t encoder_lut_location(void)
+{
+    switch (s_arch) {
+        case PIMSLO_ARCH_BASELINE:        return P4_LUT_PSRAM;
+        case PIMSLO_ARCH_PROPOSED:        return P4_LUT_PSRAM;
+        case PIMSLO_ARCH_PROPOSED_OCTREE: return P4_LUT_OCTREE;
+        case PIMSLO_ARCH_PROPOSED_RGB444: return P4_LUT_RGB444;
+        case PIMSLO_ARCH_PROPOSED_BSS_LUT: return P4_LUT_INTERNAL;
+        default: return P4_LUT_PSRAM;
+    }
 }
 
 /* ========================================================================
@@ -183,7 +200,8 @@ static int run_encode_pipeline(int n_cams, const char *stem)
 
     s_is_encoding = true;
     p4_pipeline_timing_t t = p4_timing_estimate((p4_pipeline_params_t){
-        .n_cams = n_cams, .stack = encoder_stack_location(), .save_p4ms = true,
+        .n_cams = n_cams, .stack = encoder_stack_location(),
+        .lut = encoder_lut_location(), .save_p4ms = true,
     });
 
     /* Allocate encoder buffers (PSRAM). */

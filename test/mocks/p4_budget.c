@@ -221,6 +221,23 @@ const p4_component_t P4_BUDGET_PROPOSED[] = {
               "places it in DRAM at fixed address. Recovers ~95 s "
               "encode timing (vs ~5-7 min with PSRAM stack)." },
 
+    /* NEW: static BSS-resident stack for gif_bg (background worker). */
+    { .name = "task: gif_bg STATIC BSS STACK (16 KB)",
+      .pool = P4_POOL_INT, .psram_fallback_ok = false,
+      .lifetime = P4_LIFETIME_BSS, .size_bytes = 16384,
+      .note = "Same xTaskCreateStaticPinnedToCore treatment — gif_bg "
+              "calls app_gifs_encode_pimslo_from_dir, same hot loop. "
+              "Single instance, never deleted, so static reuse is "
+              "trivially safe." },
+
+    /* TCB headers for the two static tasks (sizeof StaticTask_t ≈ 350 B
+     * on RV32, two of them ≈ 0x160 from the .map). */
+    { .name = "tcb: pimslo_gif + gif_bg StaticTask_t",
+      .pool = P4_POOL_INT, .psram_fallback_ok = false,
+      .lifetime = P4_LIFETIME_BSS, .size_bytes = 700,
+      .note = "Two StaticTask_t headers — small, but counted to keep "
+              "the BSS arithmetic honest." },
+
     /* The rest is unchanged from BASELINE — copy-pasted minus the
      * three CHANGED entries above. */
 
@@ -255,9 +272,8 @@ const p4_component_t P4_BUDGET_PROPOSED[] = {
     /* NOTE: pimslo_gif stack is now STATIC BSS (above), not heap-alloc.
      * Keep the entry out of the runtime task list so we don't double-count. */
 
-    { .name = "task: gif_bg (16 KB stack)",
-      .pool = P4_POOL_INT, .psram_fallback_ok = true,
-      .lifetime = P4_LIFETIME_PER_TASK_LIFE, .size_bytes = 16384 },
+    /* gif_bg stack is now STATIC BSS (above) too — keep it out of the
+     * runtime task list so we don't double-count. */
 
     { .name = "task: serial_cmd (16 KB stack)",
       .pool = P4_POOL_INT, .psram_fallback_ok = true,

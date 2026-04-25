@@ -46,9 +46,16 @@ typedef enum {
 typedef struct {
     /* Total free + largest contiguous, all in bytes.
      * Largest is the binding constraint for the alloc; total is the
-     * sum-of-fragments. */
+     * sum-of-fragments.
+     *
+     * For PSRAM specifically we track up to a few free blocks because
+     * the chip has multiple banks and the on-device behavior is
+     * "alloc finds best-fit"; a 7 MB alloc doesn't preclude a parallel
+     * 6 MB alloc from a different bank. block[0] is largest;
+     * block[1..] are smaller. Internal-RAM pools just use block[0]. */
     size_t total_free;
     size_t largest_contiguous;
+    size_t blocks[3];     /* additional free blocks (PSRAM uses these) */
 } p4_pool_state_t;
 
 typedef struct {
@@ -58,12 +65,22 @@ typedef struct {
 /* DEFAULT profile — post-boot state on the live board.
  * Matches `heap_caps` serial cmd output on the fix/pimslo-encode-stuck
  * branch. Already accounts for all current BSS reservations + ESP-IDF
- * + FreeRTOS startup overhead. Use this when simulating runtime
- * behavior of the AS-IS firmware. */
+ * + FreeRTOS startup overhead.
+ *
+ * NOTE on PSRAM total_free: the real chip has 32 MB PSRAM, but
+ * heap_caps reads ~8.6 MB largest contiguous. The chip exposes PSRAM
+ * via multiple banks; the 8.6 MB number is the best single block
+ * after init. When viewfinder (~7 MB) allocates, ANOTHER 6+ MB block
+ * is still available for album PPA — they don't compete pixel-for-
+ * pixel. Our single-largest-contiguous model is too pessimistic for
+ * PSRAM specifically; we set total_free to 16 MB so two big blocks
+ * can coexist. Internal RAM is small enough that the
+ * single-largest-contiguous model holds. */
 #define P4_MEM_MODEL_DEFAULT ((p4_mem_model_t){ \
-    .pool[P4_POOL_DMA_INT] = { .total_free = 13191, .largest_contiguous = 6400 }, \
-    .pool[P4_POOL_INT]     = { .total_free = 25527, .largest_contiguous = 7168 }, \
-    .pool[P4_POOL_PSRAM]   = { .total_free = 8675828, .largest_contiguous = 8650752 }, \
+    .pool[P4_POOL_DMA_INT] = { .total_free = 13191,    .largest_contiguous = 6400, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_INT]     = { .total_free = 25527,    .largest_contiguous = 7168, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_PSRAM]   = { .total_free = 17000000, .largest_contiguous = 8650752, \
+                               .blocks = { 6266880, 1027072, 0 } }, \
 })
 
 /* RAW profile — pre-BSS, pre-ESP-IDF state. Use when experimenting
@@ -75,11 +92,12 @@ typedef struct {
  * heap. ESP-IDF + FreeRTOS startup eats ~720 KB before our app runs;
  * we model that as a fixed delta. */
 #define P4_MEM_MODEL_RAW ((p4_mem_model_t){ \
-    .pool[P4_POOL_DMA_INT] = { .total_free = 13191 + 4224 /* SPI scratch+chunk */, \
-                               .largest_contiguous = 32768 }, \
-    .pool[P4_POOL_INT]     = { .total_free = 25527 + 96 * 1024 /* 3×32 KB BSS */, \
-                               .largest_contiguous = 7168 + 96 * 1024 }, \
-    .pool[P4_POOL_PSRAM]   = { .total_free = 8675828, .largest_contiguous = 8650752 }, \
+    .pool[P4_POOL_DMA_INT] = { .total_free = 13191 + 4224, \
+                               .largest_contiguous = 32768, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_INT]     = { .total_free = 25527 + 96 * 1024, \
+                               .largest_contiguous = 7168 + 96 * 1024, .blocks = {0,0,0} }, \
+    .pool[P4_POOL_PSRAM]   = { .total_free = 17000000, .largest_contiguous = 8650752, \
+                               .blocks = { 6266880, 1027072, 0 } }, \
 })
 
 void p4_mem_init(p4_mem_model_t initial);

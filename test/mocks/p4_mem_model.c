@@ -122,13 +122,53 @@ void p4_mem_assert_no_leaks(void)
     }
 }
 
+/* Find the smallest free block ≥ size (best-fit). Returns block
+ * index 0..3 (where 0 is largest_contiguous). On no-fit, returns -1. */
+static int find_block_for(p4_pool_state_t *p, size_t size)
+{
+    /* Build sorted block list including largest_contiguous + blocks[]. */
+    size_t blks[4] = { p->largest_contiguous, p->blocks[0], p->blocks[1], p->blocks[2] };
+    int best = -1;
+    size_t best_sz = SIZE_MAX;
+    for (int i = 0; i < 4; i++) {
+        if (blks[i] >= size && blks[i] < best_sz) {
+            best = i; best_sz = blks[i];
+        }
+    }
+    return best;
+}
+
+static void shrink_pool_after_alloc(p4_pool_t pool, size_t size)
+{
+    p4_pool_state_t *p = &s_model.pool[pool];
+    int blk = find_block_for(p, size);
+    p->total_free -= size;
+    if (blk == 0) {
+        p->largest_contiguous -= size;
+    } else if (blk > 0) {
+        p->blocks[blk - 1] -= size;
+    }
+    /* After consuming, the largest may not be largest anymore — sort. */
+    size_t pool_blks[4] = { p->largest_contiguous, p->blocks[0], p->blocks[1], p->blocks[2] };
+    /* simple insertion sort, descending */
+    for (int i = 1; i < 4; i++) {
+        for (int j = i; j > 0 && pool_blks[j-1] < pool_blks[j]; j--) {
+            size_t t = pool_blks[j]; pool_blks[j] = pool_blks[j-1]; pool_blks[j-1] = t;
+        }
+    }
+    p->largest_contiguous = pool_blks[0];
+    p->blocks[0] = pool_blks[1];
+    p->blocks[1] = pool_blks[2];
+    p->blocks[2] = pool_blks[3];
+}
+
 static void *do_alloc(size_t size, p4_pool_t pool, bool zeroed, size_t align)
 {
     if (pool >= P4_POOL_COUNT) return NULL;
-    /* Largest-contiguous is the binding constraint. The actual on-device
-     * allocator (FreeRTOS / TLSF) returns NULL when no single free block
-     * can satisfy the request, regardless of total free. */
-    if (size > s_model.pool[pool].largest_contiguous) {
+    /* Try to find any free block that can hold `size`. PSRAM may have
+     * multiple sizable blocks; INT pools generally only use blocks[0]
+     * which is largest_contiguous. */
+    if (find_block_for(&s_model.pool[pool], size) < 0) {
         s_alloc_fail[pool]++;
         return NULL;
     }
@@ -150,12 +190,7 @@ static void *do_alloc(size_t size, p4_pool_t pool, bool zeroed, size_t align)
 
     s_active_count++;
     s_active_bytes[pool] += size;
-    s_model.pool[pool].total_free -= size;
-    if (s_model.pool[pool].largest_contiguous >= size) {
-        s_model.pool[pool].largest_contiguous -= size;
-    } else {
-        s_model.pool[pool].largest_contiguous = 0;
-    }
+    shrink_pool_after_alloc(pool, size);
     return p;
 }
 
@@ -177,9 +212,21 @@ void p4_mem_free(void *p)
     s_active_count--;
     s_model.pool[pool].total_free += size;
     /* Largest-contiguous: grow back by `size` (conservative — real
-     * heap may coalesce or not). Don't exceed the original starting
-     * value to avoid drift over many alloc/free cycles. */
+     * heap may coalesce or not). For PSRAM, also consider promoting
+     * a smaller block to "largest" if the freed bytes refill it past
+     * the current largest. */
     s_model.pool[pool].largest_contiguous += size;
+    /* Re-sort blocks. */
+    {
+        p4_pool_state_t *pp = &s_model.pool[pool];
+        size_t b[4] = { pp->largest_contiguous, pp->blocks[0], pp->blocks[1], pp->blocks[2] };
+        for (int i = 1; i < 4; i++)
+            for (int j = i; j > 0 && b[j-1] < b[j]; j--) {
+                size_t t = b[j]; b[j] = b[j-1]; b[j-1] = t;
+            }
+        pp->largest_contiguous = b[0];
+        pp->blocks[0] = b[1]; pp->blocks[1] = b[2]; pp->blocks[2] = b[3];
+    }
 
     free(s_live[slot].ptr);
     s_live[slot].ptr = NULL;

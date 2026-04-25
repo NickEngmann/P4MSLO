@@ -40,3 +40,18 @@ add_executable(test_phases
     ${MOCK_DIR}/p4_phases.c
 )
 target_include_directories(test_phases PRIVATE ${MOCK_DIR})
+
+add_executable(test_timing
+    test_timing.c
+    ${MOCK_DIR}/p4_timing.c
+)
+target_include_directories(test_timing PRIVATE ${MOCK_DIR})
+
+add_executable(test_e2e
+    test_e2e.c
+    ${MOCK_DIR}/p4_mem_model.c
+    ${MOCK_DIR}/p4_budget.c
+    ${MOCK_DIR}/p4_timing.c
+    ${MOCK_DIR}/pimslo_sim.c
+)
+target_include_directories(test_e2e PRIVATE ${MOCK_DIR})

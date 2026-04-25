@@ -1,0 +1,294 @@
+# CLAUDE-MOCK.md — Host-side architecture validation
+
+The on-device PIMSLO pipeline lives across several files, has tight
+internal RAM constraints, and runs a 5-7 minute encode cycle that
+makes hardware iteration painful. This doc covers the **host mock
+harness** that lets us validate architecture decisions in <1 second
+without flashing.
+
+The harness lives in `test/mocks/` (the simulator library) and
+`test/host_encode/` (the test runners + main scripts).
+
+## TL;DR — running it
+
+```bash
+test/host_encode/run.sh           # build + run all 5 host tests
+test/host_encode/run.sh --rebuild # force a clean build first
+```
+
+Expected output ends with `HOST SUITE: ALL PASS` (~2 seconds).
+
+## The five test runners
+
+| Runner | What it validates |
+|--------|---|
+| `host_encode` | The actual `gif_encoder.c` + `gif_lzw.c` + `gif_quantize.c` + `gif_tjpgd.c` source files compiled against host stubs, driven against the 4 fixture JPEGs in `debug_gifs/`. Compiled with `-fsanitize=address,undefined` so heap-corruption / use-after-free / OOB write bugs in the encoder fire here too. 50× back-to-back stress run. **Validates: encoder code is memory-clean.** |
+| `test_budget` | Every known sized allocation on the device (LCD, LVGL, SPI camera, all task stacks, encoder buffers, viewfinder, album PPA, etc.) has an entry in the `P4_BUDGET_BASELINE` catalog. The simulator runs them through the constrained allocator and reports which fall back to PSRAM and which hard-fail. Compares BASELINE vs PROPOSED architecture catalogs side-by-side. **Validates: the proposed memory layout is feasible.** |
+| `test_phases` | Walks through the full PIMSLO photo→encode lifecycle as a sequence of alloc/free events: boot → capture → save → free viewfinder → encoder_create → pass1×4 → pass2×4 → encoder_destroy → realloc viewfinder. Catches order-dependent bugs ("forgot to free viewfinder before allocating scaled_buf"). **Validates: lifecycle ordering is correct.** |
+| `test_timing` | Predicts end-to-end encode duration for both stack regimes (INTERNAL vs PSRAM) using measured per-frame numbers from the device. Confirms PROPOSED arch hits the < 2 min target while BASELINE doesn't. **Validates: the timing fix actually fixes the timing.** |
+| `test_e2e` | Ten user-visible scenarios mirroring the on-device e2e tests: photo from MAIN, photo from CAMERA + nav, multiple photos, too-few-cams drop, bg worker recovery, gallery yield, memory steady state, etc. **Validates: user-facing flows work end-to-end.** |
+
+## The simulator library
+
+### `p4_mem_model.{h,c}` — constrained allocator
+
+`heap_caps_*` equivalents that fail when an allocation exceeds the
+pool's largest contiguous block, mirroring the on-device FreeRTOS /
+TLSF behavior. PSRAM is modeled with up to 4 free blocks because the
+chip has multiple banks (a 7 MB alloc doesn't preclude a parallel
+6 MB alloc); INTERNAL pools just track a single largest_contiguous.
+
+Two preset memory models:
+
+  - `P4_MEM_MODEL_DEFAULT` — post-boot snapshot. `dma_int largest=6400`,
+    `int largest=7168`, `psram largest=8650752` plus a 6 MB second PSRAM
+    block. Numbers are direct reads from the `heap_caps` serial cmd on
+    the live board. Use this when simulating runtime behavior of the
+    AS-IS firmware.
+
+  - `P4_MEM_MODEL_RAW` — pre-BSS, pre-ESP-IDF state. Use when
+    experimenting with "what if I add or remove N KB of BSS?": start
+    RAW, run the catalog (BSS items drain the pools first), then
+    runtime allocs see the resulting headroom.
+
+The allocator tracks:
+  - active alloc count + bytes per pool
+  - alloc fail count per pool (binding-constraint failures)
+  - per-pool `total_free` and `largest_contiguous` after each event
+
+### `p4_budget.{h,c}` — component catalog + simulator
+
+Two catalogs:
+
+  - **`P4_BUDGET_BASELINE`** — current firmware on `fix/pimslo-encode-stuck`.
+    Three 32 KB BSS hogs in internal RAM (`s_tjpgd_work`, `tjwork.1`,
+    `file_buf.0`); pimslo_gif task's 16 KB stack falls back to PSRAM
+    because the largest free internal block is ~7 KB.
+
+  - **`P4_BUDGET_PROPOSED`** — the surgical fix:
+    1. **Drop `gif_encoder.c::tjwork`** (32 KB), share `s_tjpgd_work`
+       via mutex (never used concurrently within an encode pipeline).
+    2. **Move `gif_encoder.c::file_buf` to PSRAM** via
+       `EXT_RAM_BSS_ATTR` (it's a stdio fwrite buffer; SD throughput
+       is the bottleneck, not PSRAM access).
+    3. **Add 16 KB BSS-resident static stack** for pimslo_gif via
+       `xTaskCreateStaticPinnedToCore` (replaces the heap-alloc that
+       always lands in PSRAM).
+    Net BSS delta: -32 -32 +16 = -48 KB internal BSS freed.
+
+`p4_budget_simulate(catalog, n, mode, report)` runs each entry against
+the current memory model and reports which pool each ended up in. The
+two modes:
+  - `P4_BUDGET_MODE_AS_IS` — BSS items are markers (already baked into
+    `DEFAULT` model state).
+  - `P4_BUDGET_MODE_FROM_RAW` — BSS items deduct from pool size; lets
+    us experiment with adding/dropping BSS.
+
+`test_budget` runs three scenarios (BASELINE/AS_IS, BASELINE/RAW,
+PROPOSED/RAW) and prints the comparison. The PROPOSED column shows
+**5 fewer PSRAM-fallback events** than BASELINE; specifically,
+pimslo_gif's stack stays in INTERNAL.
+
+### `p4_phases.{h,c}` — phased lifecycle simulator
+
+Walks through alloc/free/check events in order. Catches
+order-dependent bugs that the static budget can't see — e.g. forgot
+to `app_video_stream_free_buffers()` before `gif_encoder_create()`
+allocates its 7 MB scaled_buf.
+
+`P4_PHASES_PIMSLO_FLOW` is the pre-baked event sequence for a
+photo→encode cycle:
+
+```
+PHASE  boot — permanents
+ALLOC  LVGL canvas
+ALLOC  LVGL DMA staging
+ALLOC  SPI chunk_rx, scratch_tx, scratch_rx
+ALLOC  viewfinder buf (7 MB)
+ALLOC  album PPA buf  (6 MB)
+
+PHASE  photo_btn fired — capture
+PHASE  save — pos*.jpg fwrite (4× 500 KB transient)
+
+PHASE  encode pipeline begins
+FREE   viewfinder buf
+FREE   album PPA buf
+
+PHASE  encoder_create
+ALLOC  encoder scaled_buf (7 MB)
+ALLOC  encoder pixel_lut  (64 KB)
+
+PHASE  encode_pass1 — palette accumulation, 4 cams
+ALLOC/FREE pass1 jpeg buf 1..4
+
+PHASE  encode_pass2 — frame encode
+ALLOC  pass2 frame N jpeg
+ALLOC  pass2 err_cur, err_nxt, row_cache
+FREE   ... in reverse
+
+PHASE  encoder_destroy
+FREE   encoder pixel_lut, scaled_buf
+
+PHASE  post-encode — viewfinder + album realloc
+ALLOC  viewfinder buf
+ALLOC  album PPA buf
+
+PHASE  idle — system steady state
+CHECK  dma_int largest ≥ 1024
+CHECK  psram   largest ≥ 8 MB  (this fails — known PSRAM fragmentation)
+```
+
+The test_phases output shows every alloc with its outcome (which pool
+it landed in, how the largest contiguous block changed). This is the
+diagnostic you read when an architectural change makes a runtime
+allocation fail unexpectedly.
+
+### `p4_timing.{h,c}` — encode-duration model
+
+Estimates pipeline duration based on:
+  - number of cameras returning usable JPEGs (2-4)
+  - encoder task stack location (INTERNAL vs PSRAM)
+  - whether .p4ms direct-JPEG save runs
+
+Numbers from on-device measurement:
+  - INTERNAL stack (legacy `pimslo` serial cmd path):
+    decode ~1.7 s, encode ~10 s, total ~12 s/frame
+  - PSRAM stack (photo_btn flow on the AS-IS firmware):
+    decode ~18 s, encode ~37 s, total ~55 s/frame
+
+Model uses a single `P4_TIMING_STACK_PENALTY_PSRAM_PCT = 460%` factor
+applied to all stack-bound work. Predicts:
+  - INTERNAL stack 4-cam encode: **~80 s** (under 2 min target ✓)
+  - PSRAM stack 4-cam encode: **~295 s** (over by 2.5 min ✗)
+
+Matches the device's 82 s observed via legacy `pimslo` cmd vs 5-7 min
+observed via photo_btn flow (`pimslo_encode_queue_task` with PSRAM stack).
+
+### `pimslo_sim.{h,c}` — end-to-end pipeline simulator
+
+Glues the constrained allocator + budget catalog + phase simulator +
+timing model into a unified API that mirrors the on-device PIMSLO
+subsystem structure.
+
+**Mirrored device state:**
+  - `ui_extra_get_current_page()` / `ui_extra_set_current_page()` for
+    page transitions (UI_PAGE_MAIN / CAMERA / GIFS / SETTINGS / ...)
+  - Gallery state: entries (with stems, .gif/.jpeg/.p4ms presence),
+    current_index, is_encoding, is_playing, gallery_ever_opened
+  - `encode_should_defer()` mirrors `app_pimslo.c::encode_should_defer`
+    (CAMERA/INTERVAL/VIDEO/encoding ⇒ defer)
+  - Capture counter assigning P4Mxxxx stems
+  - Encode queue (capacity 8)
+  - Background worker (.p4ms pre-render + JPEG-only re-encode)
+
+**Operations:**
+  - `pimslo_sim_photo_btn(n_cams)` — simulates a button press; runs
+    capture (1700 ms × n_cams) + save (~1700 ms × n_cams) and queues
+    the encode.
+  - `pimslo_sim_wait_idle(max_ms)` — drains the encode queue. If
+    `encode_should_defer()` returns true (user on a camera page), the
+    queue waits.
+  - `bg_worker_kick()` — runs one bg_worker pass (pre-renders missing
+    .p4ms, re-encodes JPEG-only orphans).
+
+**Architecture switch:**
+  - `pimslo_sim_set_architecture(PIMSLO_ARCH_BASELINE)` — encoder
+    stack lives in PSRAM (current firmware behavior).
+  - `pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED)` — encoder
+    stack lives in INTERNAL via static BSS (the fix).
+
+The timing model's stack penalty fires off this switch, so flipping
+between BASELINE and PROPOSED demonstrates the speedup directly.
+
+## How to use it for architecture work
+
+The promise: **don't iterate on hardware**. Cycle is:
+
+  1. Have an architecture idea ("what if we move file_buf to PSRAM?").
+  2. Add it to `P4_BUDGET_PROPOSED` in `p4_budget.c`.
+  3. `cd test/host_encode/build && make && ./test_budget`. Read the
+     output: did the allocations fall where you expected? Did
+     pimslo_gif still avoid the PSRAM fallback?
+  4. If timing matters, run `./test_timing` and check the predicted
+     total.
+  5. If lifecycle ordering matters, add events to
+     `P4_PHASES_PIMSLO_FLOW` and run `./test_phases`.
+  6. If you want to validate a user-visible flow, add a scenario to
+     `test_e2e.c`.
+  7. Only when all four runners pass: apply the change to the
+     firmware and flash. Run `tests/e2e/run_fast.sh`.
+
+If the hardware test fails, iterate on the simulator first — repro the
+failure as a new test scenario, fix it under the simulator, then
+re-flash. Each simulator iteration is < 1 second; each hardware
+iteration is 5+ minutes.
+
+## What the simulator does NOT model
+
+  - **Real concurrency / FreeRTOS scheduling.** The simulator runs
+    everything on a single virtual thread; encode "runs" by advancing
+    a virtual clock by the timing model's prediction. Race-condition
+    bugs (e.g. two tasks fighting for the tjpgd mutex with bad timing)
+    won't reproduce here. Layer pthreads + the timing model on top if
+    you need this.
+
+  - **ESP-IDF JPEG HW decoder internals.** The on-device "Store
+    Access Fault inside `tlsf_control_functions.h:374`" panic
+    originates inside the HW decoder calloc — the encoder pipeline
+    itself is clean (50× ASan stress shows no diagnostics). If you
+    chase that panic, the simulator can show you that the encoder
+    side is innocent but it can't reproduce the panic itself.
+
+  - **Real LVGL rendering.** `bsp_display_lock`, canvas mutations,
+    actual ST7789 SPI flushes — none of that runs. The simulator
+    tracks the canvas BUFFER as an allocation but doesn't pump frames
+    through it. For UI-rendering bugs use `test/simulator/` (the
+    LVGL+SDL2 simulator).
+
+  - **Real SD I/O timing.** `fwrite` on host is fast; the simulator
+    uses a 250 KB/s rate model in `pimslo_sim.c::pimslo_sim_photo_btn`
+    that reflects the on-device throughput.
+
+  - **The S3 cameras.** SPI capture is a single virtual operation
+    that returns N JPEGs (where N is the parameter). `force_capture_fail()`
+    lets you simulate the partial-failure case.
+
+## File layout
+
+```
+test/
+├── mocks/
+│   ├── p4_mem_model.{h,c}       constrained allocator
+│   ├── p4_budget.{h,c}          BASELINE + PROPOSED catalogs
+│   ├── p4_phases.{h,c}          phased lifecycle simulator
+│   ├── p4_timing.{h,c}          encode-duration model
+│   ├── pimslo_sim.{h,c}         unified sim (page state, gallery,
+│   │                            tasks, bg worker)
+│   ├── esp_heap_caps.h          libc-backed heap_caps_* shims
+│   ├── esp_log.h                printf-backed ESP_LOG* + clock-backed
+│   │                            esp_log_timestamp
+│   ├── esp_err.h                ESP_OK / ESP_FAIL / ESP_ERR_*
+│   ├── esp_private/esp_cache_private.h    stub
+│   ├── driver/jpeg_decode.h     stubs (HW decoder is unused)
+│   ├── driver/ppa.h             stubs (PPA is unused on encode path)
+│   └── ... (existing mocks for the other host tests)
+└── host_encode/
+    ├── CMakeLists.txt
+    ├── run.sh                   build + run-all driver
+    ├── host_encode_main.c       runs gif_encoder against fixture JPEGs
+    ├── gif_simd_stub.c          host stub for gif_simd.S
+    ├── test_budget.c            runs the budget catalog scenarios
+    ├── test_phases.c            runs the phased lifecycle
+    ├── test_timing.c            prints predicted encode duration
+    └── test_e2e.c               10 end-to-end scenarios
+```
+
+## Updating the catalog when firmware changes
+
+If you change a buffer size, allocation pool, or task stack size in
+the firmware, also update the matching entry in
+`test/mocks/p4_budget.c`. The catalogs are the single source of
+truth for the simulator — wrong numbers there mean the predictions
+are wrong. Verify against `factory_demo/build/factory_demo.map` for
+BSS placements and against `heap_caps` serial cmd output for the
+runtime model.

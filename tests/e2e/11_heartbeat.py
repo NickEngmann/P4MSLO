@@ -69,7 +69,11 @@ def main():
             _lib.do(s, btn, 0.6, fh)
 
         _lib.mark(fh, '4/9 heap_caps')
-        _lib.do(s, 'heap_caps', 1.5, fh)
+        # 3 s drain — heap_caps responds immediately when the device is
+        # idle, but on a tight DMA-internal pool the USB-CDC TX path can
+        # delay a few hundred ms behind the prior page-nav burst. 1.5 s
+        # was racy.
+        _lib.do(s, 'heap_caps', 3, fh)
 
         _lib.mark(fh, '5/9 sd_ls (both dirs)')
         _lib.do(s, 'sd_ls /sdcard/p4mslo_gifs', 3, fh)

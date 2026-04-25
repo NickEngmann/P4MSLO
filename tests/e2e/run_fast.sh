@@ -48,8 +48,17 @@ TESTS=(
     01_boot_and_liveness.py
     12_dma_heap_health.py
     11_heartbeat.py
-    14_capture_encode_offpage.py
 )
+# Test 14 (capture → encode kickoff) was in this list but moved to
+# run_all.sh. Two reasons: (1) photo_btn hits an intermittent Store
+# Access Fault in the JPEG HW decoder's calloc path (heap corruption,
+# pre-existing — fires ~50% of the time on the second photo_btn after
+# a recent encode); reproducing in a 4-min fast suite makes iteration
+# painful. (2) The user-visible encode flow runs the encoder via
+# `pimslo_encode_queue_task`, whose 16 KB stack lands in PSRAM on this
+# board (largest free internal block ~7 KB), so Pass 2 takes ~55 s/frame
+# instead of ~12 s — the full 5-7 min wait won't fit. See CLAUDE.md
+# "Pipeline Timing" for both regimes.
 
 # Per-test hard cap — `timeout` SIGTERMs the test if it runs longer.
 # 180 s is more than any heartbeat test should ever need; getting

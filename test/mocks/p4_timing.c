@@ -15,11 +15,12 @@ static int stack_penalty(p4_stack_location_t stack)
 static int lut_penalty(p4_lut_location_t lut)
 {
     switch (lut) {
-        case P4_LUT_PSRAM:    return P4_TIMING_LUT_PENALTY_PSRAM_PCT;
-        case P4_LUT_OCTREE:   return P4_TIMING_LUT_PENALTY_OCTREE_PCT;
-        case P4_LUT_RGB444:   return P4_TIMING_LUT_PENALTY_RGB444_PCT;
+        case P4_LUT_PSRAM:        return P4_TIMING_LUT_PENALTY_PSRAM_PCT;
+        case P4_LUT_OCTREE_HPRAM: return P4_TIMING_LUT_PENALTY_OCTREE_HPRAM_PCT;
+        case P4_LUT_OCTREE_TCM:   return P4_TIMING_LUT_PENALTY_OCTREE_TCM_PCT;
+        case P4_LUT_RGB444:       return P4_TIMING_LUT_PENALTY_RGB444_PCT;
         case P4_LUT_INTERNAL:
-        default:              return P4_TIMING_LUT_PENALTY_INTERNAL_PCT;
+        default:                  return P4_TIMING_LUT_PENALTY_INTERNAL_PCT;
     }
 }
 

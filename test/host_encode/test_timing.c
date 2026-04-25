@@ -34,9 +34,14 @@ int main(void)
                                  .lut = P4_LUT_RGB444, .save_p4ms = true },
         target_ms);
 
-    run("PROPOSED + OCTREE LUT (8 KB internal, no quality loss)",
+    run("PROPOSED + OCTREE LUT in TCM (8 KB, no quality loss, SPI safe)",
         (p4_pipeline_params_t){ .n_cams = 4, .stack = P4_STACK_INTERNAL,
-                                 .lut = P4_LUT_OCTREE, .save_p4ms = true },
+                                 .lut = P4_LUT_OCTREE_TCM, .save_p4ms = true },
+        target_ms);
+
+    run("PROPOSED + OCTREE LUT in HP L2MEM (8 KB, REJECTED — SPI risk)",
+        (p4_pipeline_params_t){ .n_cams = 4, .stack = P4_STACK_INTERNAL,
+                                 .lut = P4_LUT_OCTREE_HPRAM, .save_p4ms = true },
         target_ms);
 
     run("PROPOSED + 64 KB BSS LUT (drops gif_bg static stack)",

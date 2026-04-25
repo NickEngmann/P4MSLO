@@ -133,11 +133,12 @@ static p4_stack_location_t encoder_stack_location(void)
 static p4_lut_location_t encoder_lut_location(void)
 {
     switch (s_arch) {
-        case PIMSLO_ARCH_BASELINE:        return P4_LUT_PSRAM;
-        case PIMSLO_ARCH_PROPOSED:        return P4_LUT_PSRAM;
-        case PIMSLO_ARCH_PROPOSED_OCTREE: return P4_LUT_OCTREE;
-        case PIMSLO_ARCH_PROPOSED_RGB444: return P4_LUT_RGB444;
-        case PIMSLO_ARCH_PROPOSED_BSS_LUT: return P4_LUT_INTERNAL;
+        case PIMSLO_ARCH_BASELINE:              return P4_LUT_PSRAM;
+        case PIMSLO_ARCH_PROPOSED:              return P4_LUT_PSRAM;
+        case PIMSLO_ARCH_PROPOSED_OCTREE_HPRAM: return P4_LUT_OCTREE_HPRAM;
+        case PIMSLO_ARCH_PROPOSED_OCTREE_TCM:   return P4_LUT_OCTREE_TCM;
+        case PIMSLO_ARCH_PROPOSED_RGB444:       return P4_LUT_RGB444;
+        case PIMSLO_ARCH_PROPOSED_BSS_LUT:      return P4_LUT_INTERNAL;
         default: return P4_LUT_PSRAM;
     }
 }

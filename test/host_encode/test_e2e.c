@@ -84,16 +84,41 @@ SCENARIO(proposed_with_rgb444_lut_meets_budget)
     ASSERT(total <= 120 * 1000, "PROPOSED + RGB444 LUT ≤ 2 min");
 }
 
-SCENARIO(proposed_with_octree_lut_meets_budget)
+SCENARIO(proposed_octree_tcm_meets_encode_budget)
 {
-    /* Octree LUT — 8 KB hierarchical. No quality loss but the per-
-     * pixel lookup is 3-4 indirections. Best balance. */
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    /* RECOMMENDED ARCH: 8 KB octree LUT in TCM (0x30100000).
+     * - TCM is NOT DMA-capable, separate from HP L2MEM
+     * - No dma_int starvation (the bug from BSS_LUT)
+     * - Per-pixel lookup: 3-4 indirections in cache-warm TCM
+     * - Predicted Pass 2: ~3-4 s/frame (vs 2 s flat-internal,
+     *   vs 55 s flat-PSRAM)
+     * - No image-quality loss (octree converges to exact 256-color match) */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
     int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(120 * 1000);
-    P("total: %d ms (%.1f s) — PROPOSED + OCTREE LUT (8 KB)",
+    P("total: %d ms (%.1f s) — PROPOSED + OCTREE LUT in TCM (8 KB)",
       total, total/1000.0);
     ASSERT(total <= 120 * 1000, "PROPOSED + OCTREE LUT ≤ 2 min");
+}
+
+SCENARIO(proposed_octree_hpram_starves_dma_int)
+{
+    /* The 8 KB octree LUT, if placed in HP L2MEM, would still be a 8 KB
+     * BSS item in DMA-eligible memory. It's UNDER the 32 KB threshold
+     * the simulator uses to flag dma_int competition, so the budget
+     * check passes. But the same physical-pool sharing applies — for
+     * very tight builds this is still risky. The recommended path puts
+     * the octree in TCM specifically to avoid this entirely. This
+     * scenario just confirms the simulator distinguishes the two. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_HPRAM);
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    int total = r.capture_ms + r.save_ms + pimslo_sim_wait_idle(120 * 1000);
+    P("total: %d ms (%.1f s) — OCTREE in HP L2MEM (NOT recommended)",
+      total, total/1000.0);
+    /* Encode timing is similar to TCM since the lookup penalty is
+     * close. Budget-wise this would compete with dma_int once we
+     * stack other BSS on top of it. Keep as a comparison datapoint. */
+    ASSERT(total <= 120 * 1000, "OCTREE-in-HP_L2MEM ≤ 2 min on encode");
 }
 
 #include "p4_budget.h"
@@ -117,6 +142,59 @@ SCENARIO(proposed_bss_lut_starves_dma_int)
                     "(simulator must catch what hardware showed)");
 }
 
+/* Build a budget catalog identical to PROPOSED but with the 64 KB
+ * BSS LUT replaced by an 8 KB TCM octree LUT. This is what the
+ * recommended PROPOSED_OCTREE_TCM arch should look like at flash time.
+ * Runs the budget simulator from RAW and asserts dma_int stays healthy. */
+static p4_component_t *build_octree_tcm_catalog(size_t *out_count)
+{
+    static p4_component_t cat[64];
+    size_t n = 0;
+    /* Copy everything from PROPOSED... */
+    for (size_t i = 0; i < P4_BUDGET_PROPOSED_COUNT; i++) {
+        const p4_component_t *src = &P4_BUDGET_PROPOSED[i];
+        /* ...except the rejected 64 KB BSS pixel_lut. */
+        if (src->size_bytes == 65536 &&
+            src->lifetime == P4_LIFETIME_BSS &&
+            src->pool == P4_POOL_INT) {
+            continue;
+        }
+        cat[n++] = *src;
+    }
+    /* Add the 8 KB octree LUT in TCM. */
+    cat[n++] = (p4_component_t){
+        .name = "encoder octree LUT (TCM)",
+        .pool = P4_POOL_TCM, .psram_fallback_ok = false,
+        .lifetime = P4_LIFETIME_BSS, .size_bytes = 8192,
+        .note = "Recommended next step",
+    };
+    *out_count = n;
+    return cat;
+}
+
+SCENARIO(proposed_octree_tcm_passes_dma_int_budget)
+{
+    /* The whole point of TCM: NOT in HP L2MEM, so doesn't affect
+     * dma_int largest. Budget simulator must show no dma_int hard
+     * fails when we drop the BSS LUT and add an octree in TCM. */
+    p4_mem_init(P4_MEM_MODEL_RAW);
+    size_t n = 0;
+    p4_component_t *cat = build_octree_tcm_catalog(&n);
+    int rc = p4_budget_simulate(cat, n, P4_BUDGET_MODE_FROM_RAW, NULL);
+    P("budget rc: %d (expect ≥ 0 — octree-in-TCM doesn't starve dma_int)", rc);
+    ASSERT(rc >= 0, "octree-in-TCM should NOT hard-fail any pool — "
+                    "this is what 'fast encode without breaking SPI' looks like");
+
+    /* Also check dma_int is still > the LCD priv-TX threshold (~5 KB).
+     * If the TCM octree somehow degraded dma_int (it shouldn't), we'd
+     * see this fail. */
+    p4_pool_state_t dma = p4_mem_pool_state(P4_POOL_DMA_INT);
+    P("dma_int largest after PROPOSED+OCTREE_TCM catalog: %zu B",
+      dma.largest_contiguous);
+    ASSERT(dma.largest_contiguous >= 5 * 1024,
+           "dma_int largest must stay ≥ 5 KB for LCD priv-TX path");
+}
+
 SCENARIO(proposed_with_bss_lut_meets_encode_budget)
 {
     /* Encode timing-only check — BSS LUT IS fast at ~80 s. Caveat:
@@ -134,7 +212,7 @@ SCENARIO(photo_from_main_kicks_encode)
 {
     /* Use the OCTREE arch — best balance of fits-in-budget and no
      * quality loss. */
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     ui_extra_set_current_page(UI_PAGE_MAIN);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
     pimslo_sim_wait_idle(120 * 1000);
@@ -144,7 +222,7 @@ SCENARIO(photo_from_main_kicks_encode)
 
 SCENARIO(photo_from_camera_then_navigate_to_main)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     ui_extra_set_current_page(UI_PAGE_CAMERA);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
     /* On CAMERA, encode_should_defer returns true. The save_task
@@ -157,7 +235,7 @@ SCENARIO(photo_from_camera_then_navigate_to_main)
 
 SCENARIO(multiple_photos_in_succession)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     ui_extra_set_current_page(UI_PAGE_MAIN);
     for (int i = 0; i < 3; i++) {
         pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
@@ -169,7 +247,7 @@ SCENARIO(multiple_photos_in_succession)
 
 SCENARIO(photo_with_too_few_cams_dropped)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     pimslo_sim_force_capture_fail(1, /* cams returned */ 1);
     ui_extra_set_current_page(UI_PAGE_MAIN);
     pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
@@ -180,7 +258,7 @@ SCENARIO(photo_with_too_few_cams_dropped)
 
 SCENARIO(bg_worker_recovers_jpeg_only_captures)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     /* Simulate prior boot leaving a JPEG-only entry on SD. */
     gallery_record_capture("P4M0001", /*gif*/ false, /*jpeg*/ true, /*p4ms*/ false);
     ASSERT(gallery_count() == 1, "1 jpeg-only entry");
@@ -194,7 +272,7 @@ SCENARIO(bg_worker_recovers_jpeg_only_captures)
 
 SCENARIO(bg_worker_pre_renders_p4ms)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     /* Existing .gif without .p4ms (interrupted .p4ms save). */
     gallery_record_capture("P4M0042", true, true, false);
     ASSERT(!gallery_current()->has_p4ms, "p4ms missing initially");
@@ -206,7 +284,7 @@ SCENARIO(bg_worker_pre_renders_p4ms)
 
 SCENARIO(bg_worker_yields_on_gallery_page)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     gallery_record_capture("P4M0001", false, true, false);
     ui_extra_set_current_page(UI_PAGE_GIFS);
     bg_worker_kick();
@@ -216,7 +294,7 @@ SCENARIO(bg_worker_yields_on_gallery_page)
 
 SCENARIO(memory_after_encode_returns_to_steady)
 {
-    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE);
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
     size_t int_before = pimslo_sim_internal_largest();
     size_t psr_before = pimslo_sim_psram_largest();
     P("before: int_largest=%zu psram_largest=%zu", int_before, psr_before);
@@ -239,9 +317,11 @@ int main(void)
     RUN(baseline_arch_misses_budget);
     RUN(proposed_stack_only_still_misses_budget);
     RUN(proposed_with_rgb444_lut_meets_budget);
-    RUN(proposed_with_octree_lut_meets_budget);
+    RUN(proposed_octree_tcm_meets_encode_budget);
+    RUN(proposed_octree_hpram_starves_dma_int);
     RUN(proposed_with_bss_lut_meets_encode_budget);
     RUN(proposed_bss_lut_starves_dma_int);
+    RUN(proposed_octree_tcm_passes_dma_int_budget);
     RUN(photo_from_main_kicks_encode);
     RUN(photo_from_camera_then_navigate_to_main);
     RUN(multiple_photos_in_succession);

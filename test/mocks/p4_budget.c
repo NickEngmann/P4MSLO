@@ -238,22 +238,45 @@ const p4_component_t P4_BUDGET_PROPOSED[] = {
       .note = "Two StaticTask_t headers — small, but counted to keep "
               "the BSS arithmetic honest." },
 
-    /* CANDIDATE NEXT STEP: 64 KB pixel_lut as static BSS. This is the
-     * fastest-encode option but consumes a chunky 64 KB of internal
-     * DRAM that the heap will lose. Test the full PROPOSED catalog
-     * with this enabled to verify the heap can still fit a fallback
-     * 16 KB stack (gif_bg if we kept it heap-alloc'd) plus LCD/CDC
-     * scratch. */
-    { .name = "encoder pixel_lut STATIC BSS (next step)",
+    /* HARDWARE-REJECTED: 64 KB pixel_lut as static BSS in INTERNAL.
+     * Looked good on paper (fast Pass 2 LZW), but HP L2MEM is shared
+     * with the DMA-internal pool — dma_int largest collapsed from
+     * ~6.4 KB to ~1.6 KB and the SPI master priv-RX alloc panicked
+     * mid-capture. Kept in the catalog as a flag to the simulator so
+     * the dma_int starvation gets caught before flashing again. */
+    { .name = "encoder pixel_lut STATIC BSS (HARDWARE-REJECTED)",
       .pool = P4_POOL_INT, .psram_fallback_ok = false,
       .lifetime = P4_LIFETIME_BSS, .size_bytes = 65536,
-      .note = "Replaces the per-encode PSRAM heap_caps_malloc(65536). "
-              "Pass 2 LZW becomes ~14 s/frame instead of ~55 s/frame "
-              "(LUT reads on internal DRAM are ~10× faster than PSRAM). "
-              "Cost: -64 KB internal heap. Mitigation: drop gif_bg's "
-              "static stack (heap-alloc'd 16 KB falls back to PSRAM, "
-              "bg encodes go back to ~5 min — acceptable since they're "
-              "background)." },
+      .note = "DO NOT ENABLE. Reverted in commit 72e06bd. The simulator "
+              "now flags this via the BSS-mirror-into-dma_int rule "
+              "(any INTERNAL BSS over 32 KB deducts the excess from "
+              "dma_int) — re-running test_budget shows dma_int hard-"
+              "fails. Replaced by the next entry: octree LUT in TCM." },
+
+    /* PROPOSED FIX: 8 KB octree LUT in TCM. TCM lives at 0x30100000,
+     * is NOT DMA-capable, and is a separate physical region from HP
+     * L2MEM. Putting the LUT here gives internal-RAM speed for the
+     * per-pixel lookup WITHOUT competing with the SPI master's DMA
+     * pool. Octree gives ~2× slower per-lookup vs a flat 64 KB table
+     * (3-4 indirections per pixel) but cache-warm in TCM, so net
+     * effect is much better than PSRAM-resident flat LUT.
+     *
+     * 8 KB sizing: octree depth 8 (one level per RGB888 bit) with one
+     * 4-byte node per occupied cell. 256 palette entries → ~256 leaf
+     * nodes + ~256 inner nodes + tiny root indexing = ~2 KB minimum,
+     * 8 KB worst-case for sparse palettes. Fits the entire 8 KB TCM
+     * budget. */
+    { .name = "encoder octree LUT (TCM static)",
+      .pool = P4_POOL_TCM, .psram_fallback_ok = false,
+      .lifetime = P4_LIFETIME_BSS, .size_bytes = 8192,
+      .note = "Replaces the 64 KB flat pixel_lut. TCM doesn't share "
+              "with dma_int — SPI stays healthy. Per-pixel lookup is "
+              "3-4 indirections (vs 1 for flat LUT) but all in TCM "
+              "which is cache-warm + fast. Predicted Pass 2: ~3 s/frame "
+              "(vs 2 s for flat-internal, vs 55 s for flat-PSRAM). "
+              "Section attribute: __attribute__((section(\".tcm.bss\"))) — "
+              "linker script `tcm_idram_seg` is already set up at "
+              "0x30100000 / 0x2000 in factory_demo's .map." },
 
     /* The rest is unchanged from BASELINE — copy-pasted minus the
      * three CHANGED entries above. */

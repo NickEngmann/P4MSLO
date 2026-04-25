@@ -99,6 +99,7 @@ static const char *pool_name(p4_pool_t p)
         case P4_POOL_DMA_INT: return "dma_int";
         case P4_POOL_INT:     return "int";
         case P4_POOL_PSRAM:   return "psram";
+        case P4_POOL_TCM:     return "tcm";
         default:              return "?";
     }
 }

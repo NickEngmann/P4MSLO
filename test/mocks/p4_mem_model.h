@@ -37,9 +37,21 @@
 #include <stdio.h>
 
 typedef enum {
-    P4_POOL_DMA_INT = 0,  /* DMA-capable internal RAM */
+    P4_POOL_DMA_INT = 0,  /* DMA-capable internal RAM (HP L2MEM, shared
+                           * physically with INT — internal BSS deducts
+                           * from both per the budget mirror logic) */
     P4_POOL_INT     = 1,  /* general internal RAM (BSS goes here at link) */
     P4_POOL_PSRAM   = 2,
+    P4_POOL_TCM     = 3,  /* Tightly-Coupled Memory at 0x30100000.
+                           * 8 KB total. NOT DMA-capable, separate from
+                           * HP L2MEM, so BSS placed here doesn't compete
+                           * with the SPI master's DMA-internal pool.
+                           * Perfect home for an octree LUT or any small
+                           * hot-loop static that we want internal-RAM
+                           * speed for without starving SPI. Section
+                           * attribute: __attribute__((section(".tcm.bss")))
+                           * (linker-script defined; pre-cleared at boot
+                           * so functionally a normal BSS region). */
     P4_POOL_COUNT
 } p4_pool_t;
 
@@ -101,6 +113,7 @@ typedef struct {
     .pool[P4_POOL_INT]     = { .total_free = 25527,    .largest_contiguous = 7168, .blocks = {0,0,0} }, \
     .pool[P4_POOL_PSRAM]   = { .total_free = 17000000, .largest_contiguous = 8650752, \
                                .blocks = { 6266880, 1027072, 0 } }, \
+    .pool[P4_POOL_TCM]     = { .total_free = 8192,     .largest_contiguous = 8192, .blocks = {0,0,0} }, \
 })
 
 /* RAW profile — pre-BSS, pre-ESP-IDF state. Use when experimenting
@@ -118,6 +131,7 @@ typedef struct {
                                .largest_contiguous = 7168 + 96 * 1024, .blocks = {0,0,0} }, \
     .pool[P4_POOL_PSRAM]   = { .total_free = 17000000, .largest_contiguous = 8650752, \
                                .blocks = { 6266880, 1027072, 0 } }, \
+    .pool[P4_POOL_TCM]     = { .total_free = 8192,     .largest_contiguous = 8192, .blocks = {0,0,0} }, \
 })
 
 void p4_mem_init(p4_mem_model_t initial);

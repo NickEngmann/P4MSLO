@@ -37,11 +37,18 @@ typedef enum {
  * even AFTER the stack moved to internal. So LUT placement is the
  * remaining big knob. */
 typedef enum {
-    P4_LUT_INTERNAL,    /* LUT fits in internal RAM — Pass 2 fast */
-    P4_LUT_PSRAM,       /* LUT in PSRAM — Pass 2 slow */
-    P4_LUT_OCTREE,      /* small (~8 KB) hierarchical LUT in internal,
-                         * 3-4 indirections per lookup but cache-warm */
-    P4_LUT_RGB444,      /* 4 KB RGB444 LUT in internal — quality loss */
+    P4_LUT_INTERNAL,     /* LUT fits in HP L2MEM — Pass 2 fast.
+                          * REJECTED: starves SPI's dma_int pool. */
+    P4_LUT_PSRAM,        /* LUT in PSRAM — Pass 2 slow.
+                          * Current state on commit 72e06bd. */
+    P4_LUT_OCTREE_HPRAM, /* 8 KB hierarchical LUT in HP L2MEM. Same
+                          * SPI conflict as INTERNAL — included only
+                          * for comparison; do not ship. */
+    P4_LUT_OCTREE_TCM,   /* 8 KB hierarchical LUT in TCM (0x30100000).
+                          * NOT DMA-capable, separate from HP L2MEM, so
+                          * SPI master priv-RX pool stays healthy. The
+                          * recommended path. ~3 s/frame for Pass 2. */
+    P4_LUT_RGB444,       /* 4 KB RGB444 LUT in internal — quality loss */
 } p4_lut_location_t;
 
 /* Per-frame timing baseline (with INTERNAL stack + INTERNAL LUT),
@@ -70,10 +77,17 @@ typedef enum {
  *          estimated; could be measured if we ever build it
  *   130  = RGB444 LUT (4 KB table, 1 lookup, cache-warm) — slight
  *          extra channel-shrink ops vs RGB565 */
-#define P4_TIMING_LUT_PENALTY_INTERNAL_PCT 100
-#define P4_TIMING_LUT_PENALTY_PSRAM_PCT    2750  /* 55s / 2s = 27.5× — measured */
-#define P4_TIMING_LUT_PENALTY_OCTREE_PCT   200
-#define P4_TIMING_LUT_PENALTY_RGB444_PCT   130
+#define P4_TIMING_LUT_PENALTY_INTERNAL_PCT     100  /* nominal */
+#define P4_TIMING_LUT_PENALTY_PSRAM_PCT        2750 /* measured 27.5× */
+#define P4_TIMING_LUT_PENALTY_OCTREE_HPRAM_PCT 200  /* HP L2MEM, 4 indir */
+#define P4_TIMING_LUT_PENALTY_OCTREE_TCM_PCT   180  /* TCM is closer to
+                                                     * the core than HP
+                                                     * L2MEM; load latency
+                                                     * is 1-2 cycles vs
+                                                     * ~3-4 for L2MEM hit.
+                                                     * Slightly faster
+                                                     * per-indirection. */
+#define P4_TIMING_LUT_PENALTY_RGB444_PCT       130  /* 4 KB, 1 lookup */
 
 /* Per-encode setup costs (one-time per run). */
 #define P4_TIMING_VIEWFINDER_FREE_MS      50

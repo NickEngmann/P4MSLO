@@ -144,13 +144,21 @@ void pimslo_sim_reset(void);
 
 /* Configure the architecture to test. */
 typedef enum {
-    PIMSLO_ARCH_BASELINE,           /* original firmware: PSRAM stack, PSRAM LUT */
-    PIMSLO_ARCH_PROPOSED,           /* commit f9fad72: INTERNAL stack, PSRAM LUT (LUT
-                                     * still doesn't fit internal — Pass 2 LZW slow) */
-    PIMSLO_ARCH_PROPOSED_OCTREE,    /* PROPOSED + 8 KB octree LUT in internal */
-    PIMSLO_ARCH_PROPOSED_RGB444,    /* PROPOSED + 4 KB RGB444 LUT in internal */
-    PIMSLO_ARCH_PROPOSED_BSS_LUT,   /* PROPOSED + 64 KB pixel_lut as static BSS
-                                     * (drops the gif_bg static stack to make room) */
+    PIMSLO_ARCH_BASELINE,              /* original firmware: PSRAM stack, PSRAM LUT */
+    PIMSLO_ARCH_PROPOSED,              /* commit 72e06bd (current shipping):
+                                        * INTERNAL stack, PSRAM LUT. Encode slow
+                                        * (~4 min) but SPI healthy. */
+    PIMSLO_ARCH_PROPOSED_OCTREE_HPRAM, /* PROPOSED + 8 KB octree LUT in HP L2MEM.
+                                        * REJECTED — same dma_int starvation
+                                        * pattern as BSS_LUT, just smaller. */
+    PIMSLO_ARCH_PROPOSED_OCTREE_TCM,   /* PROPOSED + 8 KB octree LUT in TCM
+                                        * (0x30100000, 8 KB total, NOT DMA-
+                                        * capable). The recommended next step. */
+    PIMSLO_ARCH_PROPOSED_RGB444,       /* PROPOSED + 4 KB RGB444 LUT in HP L2MEM */
+    PIMSLO_ARCH_PROPOSED_BSS_LUT,      /* HARDWARE-REJECTED: 64 KB BSS LUT in
+                                        * HP L2MEM starves dma_int → SPI panic.
+                                        * Kept in the catalog for regression
+                                        * testing only. */
 } pimslo_sim_arch_t;
 
 void pimslo_sim_set_architecture(pimslo_sim_arch_t arch);

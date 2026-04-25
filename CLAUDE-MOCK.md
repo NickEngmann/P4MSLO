@@ -389,3 +389,80 @@ was conservative on the LUT side (5.5× PSRAM penalty applied to the
 nominal 10 s/frame); reality is closer to 27× speedup which the model
 underestimated. That's a useful calibration data point — the next
 catalog update should bump LUT_PENALTY_PSRAM_PCT closer to ~2700.
+
+## Reverted in commit 72e06bd — BSS LUT broke SPI
+
+Hardware showed the BSS LUT in HP L2MEM collapsed `dma_int largest`
+from 6.4 KB to 1.6 KB and the SPI master priv-RX alloc panicked
+mid-capture. Reverted. The simulator was updated to mirror INTERNAL
+BSS deductions into the dma_int pool when items exceed 32 KB, so
+the PROPOSED_BSS_LUT scenario now correctly hard-fails the budget
+simulator before any flash. The 32 KB threshold matches empirical
+observation: 8bb11b7 (the 100% SPI baseline) has three 32 KB BSS
+items in the same region without breaking SPI, but a single 64 KB
+item flips it.
+
+## TCM-octree path — RECOMMENDED next step (mock-validated)
+
+The encoder's per-pixel LUT lookup needs internal-RAM speed but
+shouldn't compete with SPI's DMA pool. Solution: put an 8 KB
+**octree LUT in TCM** (the Tightly-Coupled Memory at 0x30100000).
+TCM is:
+  - Separate from HP L2MEM (where the DMA pool lives)
+  - 8 KB total — exactly fits an octree-quantized 256-color palette LUT
+  - Closer to the core than HP L2MEM (1-2 cycle load latency)
+  - Pre-cleared at boot, so functionally a normal BSS region
+
+The simulator now models TCM as `P4_POOL_TCM`. Octree LUT lookups
+take 3-4 indirections per pixel (vs 1 for the flat 64 KB LUT) but
+all in cache-warm TCM, so the per-pixel cost is roughly 1.8× the
+flat-internal nominal — still 15× faster than PSRAM-resident.
+
+### Predicted timings (test_timing output)
+
+| arch                                           | total | budget |
+|------------------------------------------------|-------|--------|
+| BASELINE (PSRAM stack + PSRAM LUT)             | 331 s | ✗      |
+| PROPOSED (commit 72e06bd, current shipping)    | 260 s | ✗      |
+| PROPOSED + RGB444 LUT (4 KB internal, lossy)   |  50 s | ✓      |
+| **PROPOSED + OCTREE LUT in TCM (8 KB)**        | **54 s** | **✓** |
+| PROPOSED + OCTREE LUT in HP L2MEM (rejected)   |  56 s | ✓ but SPI risk |
+| PROPOSED + 64 KB BSS LUT (rejected)            |  48 s | ✓ but SPI broken |
+
+### dma_int budget under PROPOSED_OCTREE_TCM
+
+| catalog                            | dma_int largest |
+|------------------------------------|-----------------|
+| BASELINE / RAW                     |  ~32 KB         |
+| PROPOSED with BSS_LUT (rejected)   |   1.6 KB ✗      |
+| **PROPOSED with octree-in-TCM**    | **27.6 KB ✓**   |
+
+The budget simulator scenario `proposed_octree_tcm_passes_dma_int_budget`
+asserts dma_int stays ≥ 5 KB (LCD priv-TX threshold). Currently passes.
+
+### What the firmware change looks like
+
+When ready to ship (after this mock prototyping):
+
+1. In `gif_encoder.c`:
+   - Drop the `heap_caps_malloc(65536, MALLOC_CAP_SPIRAM)` for `pixel_lut`.
+   - Replace with a static octree built into a
+     `__attribute__((section(".tcm.bss")))` array, ~8 KB.
+   - Replace per-pixel `idx = lut[d16]` with
+     `idx = octree_lookup(octree, r, g, b)` — 3-4 indirections.
+2. In `gif_quantize.c`:
+   - New `gif_quantize_build_octree(palette, octree)` that fills the
+     TCM array from the 256-color palette.
+3. No linker script change needed — `tcm_idram_seg` is already
+   configured at `0x30100000 / 0x2000` per `factory_demo.map`.
+
+The octree algorithm (iterate RGB888 high bits, descend tree by
+branch index, leaves point to palette index) is well-known.
+Implementation effort: ~2-3 hours for the forward port + a unit
+test against the host fixtures in `debug_gifs/`.
+
+After flash:
+- `run_fast.sh` should pass (SPI healthy because dma_int intact)
+- Encode timing should land near 54 s on the legacy `pimslo` path
+- photo_btn flow's internal-stack `pimslo_encode_queue_task` should
+  hit the same number once cameras are 4/4 reliable

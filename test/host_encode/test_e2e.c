@@ -539,6 +539,96 @@ SCENARIO(rapid_burst_captures_all_eventually_encode)
 }
 
 /* ------------------------------------------------------------------ */
+SCENARIO(album_decoder_released_during_encode)
+{
+    /* When the encoder runs, it must drop the ~6 MB PPA buffer that
+     * the album view holds — otherwise the encoder's own 7 MB scaled
+     * buffer alloc collides with album in PSRAM. Mirrors the
+     * app_album_release_jpeg_decoder() / reacquire dance in
+     * app_gifs.c:1232 + 1290. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    album_decoder_init();  /* user opens album page first */
+    ASSERT(album_ppa_held(), "album holds PPA after init");
+    ASSERT(album_release_count() == 0, "no release before encode");
+
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    ASSERT(r.cams_usable == 4, "captured 4/4");
+    pimslo_sim_wait_idle(120 * 1000);
+
+    ASSERT(album_release_count() == 1, "encoder released PPA exactly once");
+    ASSERT(album_reacquire_count() == 1, "encoder reacquired PPA after");
+    ASSERT(album_ppa_held(), "PPA restored after encode");
+    /* HW decoder handle MUST stay alive through the dance — repeated
+     * destroy/recreate panics with `no memory for jpeg decode rxlink`
+     * under PSRAM fragmentation. */
+    ASSERT(album_hw_decoder_alive(), "HW decoder kept alive across release/reacquire");
+}
+
+SCENARIO(album_reacquire_failure_is_non_fatal)
+{
+    /* If PSRAM is fragmented when the encoder tries to give the album
+     * its buffer back, reacquire returns false. The album degrades —
+     * no full-res preview — but the rest of the UI keeps working.
+     * Encode pipeline state must NOT get stuck. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    album_decoder_init();
+    album_force_next_reacquire_fail(1);
+
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(120 * 1000);
+
+    ASSERT(!gallery_is_encoding(), "encoder cleared encoding flag despite reacquire failure");
+    ASSERT(album_reacquire_fail_count() == 1, "reacquire fail recorded");
+    ASSERT(!album_ppa_held(), "PPA still detached after fail");
+    /* Next encode should still try to release/reacquire — the fail is
+     * not a permanent state. Use force_fail(0) (default) to confirm
+     * it can recover on the next pass. */
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(120 * 1000);
+    ASSERT(album_ppa_held(), "second encode reacquired PPA successfully");
+    ASSERT(gallery_count() == 2, "both photos in gallery");
+}
+
+SCENARIO(album_dance_alloc_releases_psram_for_encoder)
+{
+    /* The whole point of the dance: holding the 6 MB PPA + the 7 MB
+     * encoder scaled_buf simultaneously busts PSRAM headroom. Verify
+     * that PSRAM largest-block grows by ~6 MB after release. Mirrors
+     * the "Free PSRAM after releasing buffers" log line at
+     * app_gifs.c:1233. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    album_decoder_init();
+    size_t before_release = pimslo_sim_psram_largest();
+    album_decoder_release_ppa();
+    size_t after_release = pimslo_sim_psram_largest();
+    ASSERT(after_release >= before_release + (5 * 1024 * 1024),
+           "release_ppa frees ~6 MB back into PSRAM");
+    /* Restore for cleanliness. */
+    album_decoder_reacquire_ppa();
+}
+
+SCENARIO(concurrent_encodes_serialize_decoder_dance)
+{
+    /* Two encodes back-to-back: each must release+reacquire. The
+     * encode_queue_task processes one at a time, so the dance happens
+     * sequentially. Total: 2 releases + 2 reacquires. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    album_decoder_init();
+
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+
+    ASSERT(gallery_count() == 2, "both encodes finished");
+    ASSERT(album_release_count() == 2, "released once per encode");
+    ASSERT(album_reacquire_count() == 2, "reacquired once per encode");
+    ASSERT(album_ppa_held(), "PPA restored at the end");
+}
+
+/* ------------------------------------------------------------------ */
 int main(void)
 {
     RUN(baseline_arch_misses_budget);
@@ -568,6 +658,11 @@ int main(void)
     RUN(reset_clears_gallery_and_pages);
     RUN(p4ms_persists_after_encode_for_instant_replay);
     RUN(rapid_burst_captures_all_eventually_encode);
+
+    RUN(album_decoder_released_during_encode);
+    RUN(album_reacquire_failure_is_non_fatal);
+    RUN(album_dance_alloc_releases_psram_for_encoder);
+    RUN(concurrent_encodes_serialize_decoder_dance);
 
     printf("\n=== Results ===\n  PASS: %d\n  FAIL: %d\n", passed, fails);
     return (fails > 0) ? 1 : 0;

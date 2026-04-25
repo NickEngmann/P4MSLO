@@ -97,6 +97,37 @@ size_t pimslo_sim_internal_largest(void);
 size_t pimslo_sim_psram_largest(void);
 
 /* ========================================================================
+ * Album JPEG decoder dance (mirrors app_album.c)
+ *
+ * Single ESP32-P4 hardware JPEG decoder — the album viewer holds it +
+ * a ~6 MB PPA output buffer in PSRAM. The encoder must release the PPA
+ * buffer before its own ~7 MB scaled buffer alloc, then reacquire after.
+ *
+ * The HW decoder handle itself is persistent (release does NOT destroy
+ * it — repeated create/destroy panics with "no memory for jpeg decode
+ * rxlink"). Reacquire of the PPA buffer is allowed to fail gracefully
+ * if PSRAM is fragmented; the album degrades to "no full-res preview"
+ * but the rest of the UI keeps working.
+ *
+ * The mock tracks two state bits so tests can assert the dance happens:
+ *   - s_album.ppa_held : PPA buffer currently allocated
+ *   - s_album.hw_decoder_alive : decoder handle still valid
+ * ======================================================================== */
+void   album_decoder_init(void);            /* allocates HW decoder + PPA buf */
+void   album_decoder_release_ppa(void);     /* drop PPA, keep HW alive */
+bool   album_decoder_reacquire_ppa(void);   /* re-alloc PPA — may fail */
+bool   album_ppa_held(void);
+bool   album_hw_decoder_alive(void);
+size_t album_ppa_size(void);                /* 1920×1088×3 ≈ 6 MB */
+int    album_release_count(void);           /* tally for assertions */
+int    album_reacquire_count(void);
+int    album_reacquire_fail_count(void);
+
+/* Force the next N album reacquire calls to fail (simulates PSRAM
+ * fragmentation). */
+void   album_force_next_reacquire_fail(int n);
+
+/* ========================================================================
  * Task pipeline (mirrors app_pimslo.c)
  *
  * Each task has a stack location attribute. Tasks pinned to a core

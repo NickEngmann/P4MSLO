@@ -128,6 +128,65 @@ size_t pimslo_sim_psram_largest(void) {
 }
 
 /* ========================================================================
+ * Album JPEG decoder model (mirrors app_album.c::album_ctx)
+ * ======================================================================== */
+#define ALBUM_PPA_BYTES (1920 * 1088 * 3)  /* ~6 MB PSRAM */
+
+static struct {
+    void  *ppa_buffer;
+    bool   hw_decoder_alive;
+    int    release_count;
+    int    reacquire_count;
+    int    reacquire_fail_count;
+    int    force_fail_remaining;
+} s_album;
+
+void album_decoder_init(void)
+{
+    /* HW decoder handle is just a flag — no PSRAM cost. PPA buffer is
+     * the ~6 MB allocation. In real firmware, this happens once when
+     * the user first enters the album page. Tests that don't open the
+     * album never call this. */
+    if (!s_album.ppa_buffer) {
+        s_album.ppa_buffer = p4_mem_malloc(ALBUM_PPA_BYTES, P4_POOL_PSRAM);
+    }
+    s_album.hw_decoder_alive = true;
+}
+void album_decoder_release_ppa(void)
+{
+    if (s_album.ppa_buffer) {
+        p4_mem_free(s_album.ppa_buffer);
+        s_album.ppa_buffer = NULL;
+    }
+    /* HW decoder STAYS ALIVE — comment in app_album.c:891 explains why. */
+    s_album.release_count++;
+}
+bool album_decoder_reacquire_ppa(void)
+{
+    s_album.reacquire_count++;
+    if (s_album.force_fail_remaining > 0) {
+        s_album.force_fail_remaining--;
+        s_album.reacquire_fail_count++;
+        return false;
+    }
+    if (!s_album.ppa_buffer) {
+        s_album.ppa_buffer = p4_mem_malloc(ALBUM_PPA_BYTES, P4_POOL_PSRAM);
+        if (!s_album.ppa_buffer) {
+            s_album.reacquire_fail_count++;
+            return false;
+        }
+    }
+    return true;
+}
+bool   album_ppa_held(void)              { return s_album.ppa_buffer != NULL; }
+bool   album_hw_decoder_alive(void)      { return s_album.hw_decoder_alive; }
+size_t album_ppa_size(void)              { return ALBUM_PPA_BYTES; }
+int    album_release_count(void)         { return s_album.release_count; }
+int    album_reacquire_count(void)       { return s_album.reacquire_count; }
+int    album_reacquire_fail_count(void)  { return s_album.reacquire_fail_count; }
+void   album_force_next_reacquire_fail(int n) { s_album.force_fail_remaining = n; }
+
+/* ========================================================================
  * Architecture switch
  * ======================================================================== */
 static pimslo_sim_arch_t s_arch = PIMSLO_ARCH_BASELINE;
@@ -213,16 +272,21 @@ static bool encode_should_defer(void)
 
 static int run_encode_pipeline(int n_cams, const char *stem)
 {
-    /* Free viewfinder + album PPA. */
-    /* (in-mem model — we just track the encoder's allocations). */
-
     s_is_encoding = true;
+
+    /* Drop ~6 MB PPA buffer to make PSRAM available — matches the
+     * app_album_release_jpeg_decoder() call in app_gifs.c:1232. The HW
+     * decoder handle stays alive (release does NOT destroy it). */
+    album_decoder_release_ppa();
+
     p4_pipeline_timing_t t = p4_timing_estimate((p4_pipeline_params_t){
         .n_cams = n_cams, .stack = encoder_stack_location(),
         .lut = encoder_lut_location(), .save_p4ms = true,
     });
 
-    /* Allocate encoder buffers (PSRAM). */
+    /* Allocate encoder buffers (PSRAM). The 7 MB scaled_buf is what
+     * the PPA-release was making room for — without that release, the
+     * PIMSLO encoder collides with album. */
     void *scaled_buf = p4_mem_malloc(1824 * 1920 * 2, P4_POOL_PSRAM);
     void *pixel_lut  = p4_mem_malloc(65536, P4_POOL_PSRAM);
 
@@ -230,6 +294,11 @@ static int run_encode_pipeline(int n_cams, const char *stem)
 
     if (scaled_buf) p4_mem_free(scaled_buf);
     if (pixel_lut)  p4_mem_free(pixel_lut);
+
+    /* Mirror app_gifs.c:1290 — try to reacquire the PPA buffer. Failure
+     * is non-fatal: the album view degrades to no full-res preview, the
+     * rest of the UI keeps working. */
+    album_decoder_reacquire_ppa();
 
     s_is_encoding = false;
 
@@ -324,6 +393,7 @@ void pimslo_sim_init(void)
     s_bg_pre_render_count = s_bg_re_encode_count = 0;
     s_encode_queue_head = s_encode_queue_tail = 0;
     s_sim_clock_ms = 0;
+    memset(&s_album, 0, sizeof(s_album));
 }
 
 void pimslo_sim_shutdown(void)

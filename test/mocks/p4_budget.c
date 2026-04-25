@@ -176,13 +176,13 @@ const p4_component_t P4_BUDGET_BASELINE[] = {
               "scaled_buf each time — adds another ~3 s/frame. ~3.8 KB "
               "DOES usually fit in INTERNAL after boot." },
 
-    /* ---- Album HW JPEG decoder (CM) ---- */
-    { .name = "album HW JPEG decoder PPA buffer (~6 MB)",
-      .pool = P4_POOL_PSRAM, .psram_fallback_ok = false,
-      .lifetime = P4_LIFETIME_PERMANENT, .size_bytes = 1920 * 1088 * 3,
-      .note = "app_album.c::album_ctx.ppa_buffer. Released before "
-              "encode (frees PSRAM headroom for encoder scaled_buf), "
-              "reacquired after." },
+    /* The album HW JPEG decoder PPA buffer (1920×1088×3 ≈ 6 MB PSRAM)
+     * is on-demand — only allocated after the user enters the album
+     * page (UI_PAGE_ALBUM). Tests that exercise the encoder's
+     * release/reacquire dance call album_decoder_init() explicitly to
+     * stand it up. Excluded from the BASELINE budget because the
+     * PIMSLO gallery (UI_PAGE_GIFS) is the default user destination
+     * and most users never enter the legacy P4-photo album. */
 };
 
 const size_t P4_BUDGET_BASELINE_COUNT =

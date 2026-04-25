@@ -90,10 +90,12 @@ CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
 # doesn't have. Toolchain supports Zb (GCC 14 -march=help lists
 # zba/zbb/...) but the silicon doesn't.
 #
-# Heap poisoning was tried (CONFIG_HEAP_POISONING_COMPREHENSIVE=y) to
-# catch the intermittent tlsf::remove_free_block panic on long e2e
-# sequences. Outcome: boot hung at LVGL task start, never reached
-# `Camera initialized`. The poisoning's ~16 B/alloc canary overhead
-# pushed something over a threshold during LVGL init. Reverted.
-# Future try: CONFIG_HEAP_POISONING_LIGHT=y instead — half the
-# overhead, still catches most overruns.
+# Heap poisoning to catch the intermittent tlsf::remove_free_block
+# panic on long e2e sequences. COMPREHENSIVE was tried first and
+# hung boot at LVGL init (canary overhead too high for L2MEM
+# headroom on this board). LIGHT fills only HEAD canaries on alloc
+# and checks them on free — half the overhead, still catches the
+# common "write past end of allocation" pattern that's the most
+# likely cause given the research findings on PSRAM-stack-overflow
+# producing exactly this MTVAL panic signature.
+CONFIG_HEAP_POISONING_LIGHT=y

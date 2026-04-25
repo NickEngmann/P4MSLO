@@ -603,11 +603,24 @@ uint16_t app_pimslo_encoding_capture_num(void)
 
 bool app_pimslo_is_capturing(void)
 {
-    /* Either the SPI capture task is pulling JPEGs from the S3s, or
-     * the save task is flushing them to SD. Both states show "saving"
-     * to the user since from their perspective the picture isn't done
-     * landing until both phases have run. */
-    return s_capturing || s_saving;
+    /* Tracks ONLY the SPI-capture phase (s_capturing), not the
+     * subsequent SD save (s_saving). The "saving" overlay clears as
+     * soon as the SPI transfer finishes (~2-3 s), even though the
+     * background save task still has another ~5-7 s of fwrite work
+     * to drain. From the user's perspective they can fire the next
+     * photo as soon as the viewfinder comes back — which is exactly
+     * when s_capturing flips false (after app_video_stream_realloc_
+     * buffers in the capture task). The save task processes the
+     * queued job in the background; pimslo_save_job_t carries its
+     * own copies of the JPEG buffers, so the next capture cycle is
+     * fully decoupled.
+     *
+     * Cuts user-visible "saving" time from ~9-10 s to ~2-3 s. The
+     * gallery shows a "PROCESSING" badge on the JPEG-only entry until
+     * the .gif finalizes, which is the existing behavior the user
+     * already understands (see CLAUDE.md "Gallery 'QUEUED' vs
+     * 'PROCESSING' badge"). */
+    return s_capturing;
 }
 
 #define P4_PHOTO_DIR "/sdcard/esp32_p4_pic_save"

@@ -749,17 +749,32 @@ static int jpeg_crop_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
     const int ow = c->canvas_w;
     const int oh = c->canvas_h;
 
-    /* Output Y range: out_y whose src_y (= cy + out_y * ch / oh) lands
-     * in [rect->top, rect->bottom]. Rearranged:
-     *    out_y_lo = ceil((rect->top    - cy) * oh / ch)
-     *    out_y_hi = floor((rect->bottom - cy) * oh / ch)
-     * Clamp to [0, oh). */
+    /* Output Y range: out_y whose src_y (= cy + (out_y * ch) / oh) lands
+     * in [rect->top, rect->bottom]. The forward map is
+     *    cropped_y = floor(out_y * ch / oh)
+     * so the inverse must be the consistent inverse of FLOOR, NOT the
+     * floor of the inverse:
+     *    out_y_lo = smallest out_y where floor(out_y * ch / oh) >= rel_top
+     *             = ceil(rel_top * oh / ch)               [rel_top >= 0]
+     *    out_y_hi = largest out_y where floor(out_y * ch / oh) <= rel_bot
+     *             = floor((rel_bot + 1) * oh / ch) - 1
+     *             = ((rel_bot + 1) * oh - 1) / ch         [integer div, rel_bot >= 0]
+     *
+     * The earlier `(rel_bot * oh) / ch` form was the floor of the
+     * inverse, which loses one canvas cell per MCU when the source
+     * pixel that should serve it sits exactly on a multi-of-MCU-width
+     * boundary. Concretely on a 1824 → 240 horizontal downscale, that
+     * dropped out_x = 2 between MCU [320..335] and MCU [336..351],
+     * leaving the canvas's 0x10 fill visible as vertical dark bars on
+     * .p4ms previews. The earlier comment in this file claimed this
+     * was already fixed — the rewrite was correct in spirit but the
+     * upper-bound formula stayed wrong. */
     int rel_top = rect->top - cy;
     int rel_bot = rect->bottom - cy;
     int out_y_lo = (rel_top <= 0) ? 0
                                   : (rel_top * oh + ch - 1) / ch;
     int out_y_hi = (rel_bot <  0) ? -1
-                                  : (rel_bot * oh) / ch;
+                                  : ((rel_bot + 1) * oh - 1) / ch;
     if (out_y_hi >= oh) out_y_hi = oh - 1;
 
     int rel_left  = rect->left  - cx;
@@ -767,7 +782,7 @@ static int jpeg_crop_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
     int out_x_lo = (rel_left  <= 0) ? 0
                                     : (rel_left  * ow + cw - 1) / cw;
     int out_x_hi = (rel_right <  0) ? -1
-                                    : (rel_right * ow) / cw;
+                                    : ((rel_right + 1) * ow - 1) / cw;
     if (out_x_hi >= ow) out_x_hi = ow - 1;
 
     for (int out_y = out_y_lo; out_y <= out_y_hi; out_y++) {

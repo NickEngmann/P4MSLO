@@ -79,6 +79,23 @@ bool gallery_is_playing(void)  { return s_is_playing; }
 bool gallery_was_ever_opened(void) { return s_gallery_ever_opened; }
 void gallery_mark_opened(void) { s_gallery_ever_opened = true; }
 
+void gallery_delete_current(void)
+{
+    if (s_current_index < 0 || s_current_index >= s_n_entries) return;
+    /* Shift everything after the deleted slot down. */
+    for (int i = s_current_index; i < s_n_entries - 1; i++) {
+        s_entries[i] = s_entries[i + 1];
+    }
+    s_n_entries--;
+    memset(&s_entries[s_n_entries], 0, sizeof(s_entries[s_n_entries]));
+    /* Clamp index — if we deleted the last entry, step back to the
+     * new last entry (or to 0 if the gallery is now empty). Mirrors
+     * app_gifs_delete_current()'s behavior. */
+    if (s_current_index >= s_n_entries) {
+        s_current_index = s_n_entries > 0 ? s_n_entries - 1 : 0;
+    }
+}
+
 void gallery_record_capture(const char *stem, bool has_gif, bool has_jpeg, bool has_p4ms)
 {
     /* Update if existing, else insert. */

@@ -84,6 +84,12 @@ void gallery_mark_opened(void);   /* called when user enters UI_PAGE_GIFS */
 /* Inserts entry by writing to the simulated SD layout. */
 void gallery_record_capture(const char *stem, bool has_gif, bool has_jpeg, bool has_p4ms);
 
+/* Mirrors app_gifs_delete_current: removes the current entry from the
+ * list (drops the simulated .gif/.p4ms/.jpeg files), clamps current
+ * index to remain valid. Called by tests that exercise the delete-
+ * modal flow. */
+void gallery_delete_current(void);
+
 /* ========================================================================
  * Memory-snapshot helpers — useful in test assertions
  * ======================================================================== */

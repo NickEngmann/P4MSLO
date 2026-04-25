@@ -311,6 +311,233 @@ SCENARIO(memory_after_encode_returns_to_steady)
     ASSERT(psr_after >= 1 * 1024 * 1024, "PSRAM should have ≥ 1 MB largest after encode");
 }
 
+/* ------------------------------------------------------------------
+ * Gallery flows + p4ms regression coverage.
+ * ------------------------------------------------------------------ */
+
+SCENARIO(foreground_encode_produces_both_gif_and_p4ms)
+{
+    /* The user-facing path: photo_btn → encode runs on the foreground
+     * pimslo_encode_queue_task → BOTH .gif AND .p4ms land on disk for
+     * the same capture. The .p4ms is the small preview the gallery
+     * flashes BEFORE the GIF starts decoding (CLAUDE.md "Gallery JPEG
+     * preview decode"). If the encoder pipeline regresses and stops
+     * producing .p4ms, the gallery shows a delay-of-N-seconds blank
+     * canvas instead of an instant still. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(120 * 1000);
+    ASSERT(gallery_count() == 1, "1 entry after photo_btn");
+    const gallery_entry_t *e = gallery_current();
+    ASSERT(e != NULL, "current entry exists");
+    ASSERT(e->has_gif,  ".gif should exist (foreground encode path)");
+    ASSERT(e->has_p4ms, ".p4ms should exist (Direct-JPEG inline save)");
+    ASSERT(e->has_jpeg, "P4 preview .jpg should exist");
+    ASSERT(e->type == GALLERY_ENTRY_GIF, "type promoted to GIF after encode");
+    /* Stem matches what photo_btn assigned. */
+    ASSERT(strcmp(e->stem, r.stem) == 0, "stem matches the capture");
+}
+
+SCENARIO(gallery_nav_next_prev_across_entries)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    /* Take 3 photos → 3 entries. */
+    for (int i = 0; i < 3; i++) {
+        pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+        ASSERT(r.cams_usable == 4, "each photo should get 4/4");
+    }
+    pimslo_sim_wait_idle(360 * 1000);
+    ASSERT(gallery_count() == 3, "expected 3 entries");
+    ASSERT(gallery_current_index() == 0, "fresh scan starts at 0");
+
+    /* Walk forward. */
+    gallery_next();
+    ASSERT(gallery_current_index() == 1, "next: 0→1");
+    gallery_next();
+    ASSERT(gallery_current_index() == 2, "next: 1→2");
+    gallery_next();
+    ASSERT(gallery_current_index() == 2, "next at end clamps");
+
+    /* Walk back. */
+    gallery_prev();
+    ASSERT(gallery_current_index() == 1, "prev: 2→1");
+    gallery_prev();
+    ASSERT(gallery_current_index() == 0, "prev: 1→0");
+    gallery_prev();
+    ASSERT(gallery_current_index() == 0, "prev at start clamps");
+}
+
+SCENARIO(gallery_entries_sorted_by_stem)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    /* Insert out of order to verify gallery_scan sorts by stem. */
+    gallery_record_capture("P4M0042", true, true, true);
+    gallery_record_capture("P4M0001", true, true, true);
+    gallery_record_capture("P4M0099", true, true, true);
+    gallery_scan();
+    ASSERT(gallery_count() == 3, "3 entries");
+    /* current_index resets to 0 after scan; first entry should be P4M0001. */
+    const gallery_entry_t *e = gallery_current();
+    ASSERT(e && strcmp(e->stem, "P4M0001") == 0, "scan sorts by stem");
+}
+
+SCENARIO(jpeg_only_entry_shows_processing_state)
+{
+    /* Mirrors what the gallery sees right after a capture: a save just
+     * dropped a JPEG-only entry, encode is still queued/running. UI
+     * should be able to identify these as "not yet a GIF". */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_CAMERA);  /* defers encode */
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    /* On CAMERA the encode is queued but doesn't run. Gallery now has
+     * a JPEG-only entry. */
+    ASSERT(gallery_count() == 1, "save task created the entry");
+    const gallery_entry_t *e = gallery_current();
+    ASSERT(e->has_jpeg && !e->has_gif,
+           "should show as JPEG-preview-only (PROCESSING badge in UI)");
+    ASSERT(e->type == GALLERY_ENTRY_JPEG, "type is JPEG until encode finishes");
+    /* Once we leave CAMERA, encode runs and the entry promotes. */
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_wait_idle(120 * 1000);
+    e = gallery_current();
+    ASSERT(e->has_gif, "promoted to GIF after encode");
+    ASSERT(e->type == GALLERY_ENTRY_GIF, "type updated");
+}
+
+SCENARIO(encode_allowed_on_gifs_page_foreground)
+{
+    /* CLAUDE.md "Allow on GIFS (the PIMSLO gallery)": the foreground
+     * encode pipeline IS allowed to run when the user is on the
+     * gallery page. Only camera-type pages defer. This covers the
+     * "go to album right after capture" UX. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_mark_opened();
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(120 * 1000);
+    ASSERT(gallery_count() == 1, "encode should run on UI_PAGE_GIFS");
+    ASSERT(gallery_current()->has_gif, "expected .gif");
+}
+
+SCENARIO(encode_defers_on_video_mode)
+{
+    /* CAMERA / INTERVAL_CAM / VIDEO_MODE: viewfinder owns ~7 MB
+     * scaled_buf — encoder's own 7 MB scaled_buf can't coexist. The
+     * encoder defers until user leaves the camera-type page. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_VIDEO_MODE);
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    /* Encode queued but waiting. */
+    ui_extra_set_current_page(UI_PAGE_SETTINGS);
+    pimslo_sim_wait_idle(120 * 1000);
+    ASSERT(gallery_count() == 1, "encode should run after leaving VIDEO_MODE");
+}
+
+SCENARIO(gallery_delete_removes_entry_and_clamps_index)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    /* Seed three entries directly. */
+    gallery_record_capture("P4M0001", true, true, true);
+    gallery_record_capture("P4M0002", true, true, true);
+    gallery_record_capture("P4M0003", true, true, true);
+    gallery_scan();
+    ASSERT(gallery_count() == 3, "three entries");
+
+    /* Delete the middle entry — current_index stays at 0
+     * (we haven't moved), gallery shrinks to 2. */
+    gallery_next();  /* index 0 → 1 (P4M0002) */
+    ASSERT(strcmp(gallery_current()->stem, "P4M0002") == 0, "on middle");
+    gallery_delete_current();
+    ASSERT(gallery_count() == 2, "2 entries after delete");
+    /* After delete, index should still be 1 (which is now P4M0003). */
+    ASSERT(strcmp(gallery_current()->stem, "P4M0003") == 0,
+           "delete-middle leaves index pointing at next entry");
+
+    /* Delete the last entry — current_index should clamp back to 0. */
+    gallery_delete_current();
+    ASSERT(gallery_count() == 1, "1 entry");
+    ASSERT(gallery_current_index() == 0, "index clamps after delete-last");
+    ASSERT(strcmp(gallery_current()->stem, "P4M0001") == 0,
+           "remaining entry is the first one");
+
+    /* Delete the only remaining entry — gallery empty. */
+    gallery_delete_current();
+    ASSERT(gallery_count() == 0, "empty gallery after deleting last");
+    ASSERT(gallery_current() == NULL, "no current entry");
+}
+
+SCENARIO(reset_clears_gallery_and_pages)
+{
+    /* pimslo_sim_reset is what tests use between scenarios — verify
+     * it actually wipes everything so cross-test contamination can't
+     * silently break a later scenario. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    gallery_record_capture("P4M9999", true, true, true);
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_mark_opened();
+    ASSERT(gallery_count() == 1, "seeded");
+    ASSERT(gallery_was_ever_opened(), "marked opened");
+    ASSERT(ui_extra_get_current_page() == UI_PAGE_GIFS, "on gifs");
+
+    pimslo_sim_reset();
+
+    ASSERT(gallery_count() == 0, "reset clears entries");
+    ASSERT(!gallery_was_ever_opened(), "reset clears ever-opened flag");
+    ASSERT(ui_extra_get_current_page() == UI_PAGE_MAIN, "reset → MAIN");
+}
+
+SCENARIO(p4ms_persists_after_encode_for_instant_replay)
+{
+    /* The .p4ms file exists so the gallery can flash a 240×240 still
+     * INSTANTLY when the user lands on an entry, before the slow LZW
+     * decode of the full GIF kicks in. Regression check: after the
+     * encoder destroys its state and the heap returns to steady, the
+     * .p4ms entry must STILL be there (it's on SD, not encoder heap). */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(120 * 1000);
+    const gallery_entry_t *e = gallery_current();
+    ASSERT(e && e->has_p4ms, "p4ms should exist post-encode");
+
+    /* Simulate a page transition + scan — the "user enters gallery
+     * after capture" flow. p4ms should still be there. */
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_mark_opened();
+    gallery_scan();
+    e = gallery_current();
+    ASSERT(e && e->has_p4ms,
+           "p4ms persists across page transitions / rescans");
+}
+
+SCENARIO(rapid_burst_captures_all_eventually_encode)
+{
+    /* User burst-presses photo_btn 5 times. Save task queues each;
+     * encode_queue_task drains one at a time. All 5 should make it
+     * through. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    for (int i = 0; i < 5; i++) {
+        pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+        ASSERT(r.cams_usable == 4, "each burst photo gets 4/4");
+    }
+    /* Five 54s encodes back-to-back = ~270s of encode time. */
+    pimslo_sim_wait_idle(600 * 1000);
+    ASSERT(gallery_count() == 5, "all 5 burst photos make it to gallery");
+    /* Verify each has both .gif and .p4ms. */
+    for (int i = 0; i < 5; i++) {
+        const gallery_entry_t *e = NULL;
+        /* Walk to entry i */
+        while (gallery_current_index() < i) gallery_next();
+        while (gallery_current_index() > i) gallery_prev();
+        e = gallery_current();
+        ASSERT(e && e->has_gif && e->has_p4ms,
+               "every burst entry should have .gif + .p4ms");
+    }
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -330,6 +557,17 @@ int main(void)
     RUN(bg_worker_pre_renders_p4ms);
     RUN(bg_worker_yields_on_gallery_page);
     RUN(memory_after_encode_returns_to_steady);
+
+    RUN(foreground_encode_produces_both_gif_and_p4ms);
+    RUN(gallery_nav_next_prev_across_entries);
+    RUN(gallery_entries_sorted_by_stem);
+    RUN(jpeg_only_entry_shows_processing_state);
+    RUN(encode_allowed_on_gifs_page_foreground);
+    RUN(encode_defers_on_video_mode);
+    RUN(gallery_delete_removes_entry_and_clamps_index);
+    RUN(reset_clears_gallery_and_pages);
+    RUN(p4ms_persists_after_encode_for_instant_replay);
+    RUN(rapid_burst_captures_all_eventually_encode);
 
     printf("\n=== Results ===\n  PASS: %d\n  FAIL: %d\n", passed, fails);
     return (fails > 0) ? 1 : 0;

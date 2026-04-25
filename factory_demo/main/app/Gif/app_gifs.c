@@ -829,6 +829,16 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
     if (r != JDR_OK) {
         ESP_LOGW(TAG, "decode_jpeg_crop: prepare jdr=%d sz=%ld path=%s", r, sz, jpeg_path);
     } else {
+        /* Always scale=0. The local gif_tjpgd.c is compiled with
+         * JD_USE_SCALE=0 so any scale>0 returns JDR_PAR. Enabling it
+         * would bloat .text by ~8 KB and we'd need to revalidate the
+         * entire encoder/decoder stack against it. The current
+         * `jpeg_crop_out_cb` does an output-cell-driven nearest-neighbor
+         * downscale inside each MCU, so per-MCU cost is O(canvas cells
+         * touched) regardless of how much we're scaling. Measured:
+         * 2560×1920 OV5640 JPEG → 240×240 canvas in ~150 ms at -O2.
+         * If .p4ms save timing ever becomes a bottleneck, enabling
+         * JD_USE_SCALE and a scale=1 path is the optimization to try. */
         r = gif_jd_decomp(&jd, jpeg_crop_out_cb, 0);
         if (r != JDR_OK) {
             ESP_LOGW(TAG, "decode_jpeg_crop: decomp jdr=%d w=%u h=%u sz=%ld src_pos=%zu/%zu path=%s",

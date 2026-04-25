@@ -377,17 +377,24 @@ static void pimslo_save_task(void *param)
  * nothing else is holding big contiguous blocks.
  *
  * Defer on:
- *   - CAMERA / INTERVAL_CAM / VIDEO_MODE / AI_DETECT: viewfinder owns
- *     ~7 MB scaled_buf — absolute collision.
- *   - MAIN: camera is one click away; user clicking CAMERA while encode
- *     runs would see a failed viewfinder alloc.
+ *   - CAMERA / INTERVAL_CAM / VIDEO_MODE: viewfinder owns ~7 MB
+ *     scaled_buf — absolute collision.
  *
- * Allow on GIFS (the PIMSLO gallery): previously deferred, but that
- * blocks the expected UX of "take photo → go to ALBUM → watch it show
- * up as a GIF." The pimslo encode task now calls app_gifs_stop() +
- * app_gifs_flush_cache() before the 7 MB alloc, so the gallery's ~3.5
- * MB canvas cache is reclaimed. Playback auto-resumes via the
- * lv_async_call scan when the encode finishes.
+ * Allow on MAIN: a user who fires off photos and stays on MAIN is the
+ * common case (test 14, photo_btn from main, walking up to the device
+ * and pressing the trigger without entering the gallery). Deferring
+ * here meant the .gif never finalized until the user navigated to the
+ * album — captures piled up forever as JPEG-only entries with their
+ * ~3 MB of pos*.jpg sitting on SD untouched. The pre-existing risk of
+ * "user clicks CAMERA mid-encode → viewfinder realloc OOM" already
+ * applies on GIFS / USB / SETTINGS and is handled non-fatally by
+ * `ui_extra_redirect_to_main_page()` (the realloc just logs a
+ * warning and the next viewfinder frame retries).
+ *
+ * Allow on GIFS (the PIMSLO gallery): the pimslo encode task calls
+ * app_gifs_stop() + app_gifs_flush_cache() before the 7 MB alloc, so
+ * the gallery's ~3.5 MB canvas cache is reclaimed. Playback
+ * auto-resumes via the lv_async_call scan when the encode finishes.
  *
  * USB DISK / SETTINGS are fine — low display pressure. */
 static bool encode_should_defer(void)
@@ -395,9 +402,7 @@ static bool encode_should_defer(void)
     ui_page_t p = ui_extra_get_current_page();
     if (p == UI_PAGE_CAMERA ||
         p == UI_PAGE_INTERVAL_CAM ||
-        p == UI_PAGE_VIDEO_MODE ||
-        p == UI_PAGE_MAIN) return true;
-    if (!app_gifs_gallery_ever_opened()) return true;
+        p == UI_PAGE_VIDEO_MODE) return true;
     if (app_gifs_is_encoding()) return true;  /* album encoder uses same PSRAM */
     return false;
 }

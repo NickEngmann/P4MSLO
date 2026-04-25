@@ -216,6 +216,8 @@ echo "cam_wifi_off all" > /dev/ttyACM1
 
 **If SPI captures return 0/4 after a fresh OTA round**: suspect wiring on the silent cams (missing MISO series resistor, flaky CS). Do NOT run `POST /api/v1/factory-reset` to "recover" — it wipes the camera position NVS entry that maps device → pos 1-4.
 
+**SPI capture reliability — 10/10 4-camera back-to-back at 10 MHz**: with `DISABLE_WIFI=1` on all 4 S3s and the master config in this branch, `tests/e2e/_spi_20shot.py` consistently gets 4-of-4 cameras returning JPEGs across 10+ consecutive `spi_pimslo` runs. The fixes that landed this baseline: (a) ISR-driven trigger on GPIO34 with a CS re-queue gap (`8bb11b7`), (b) 64-byte aligned `s_chunk_rx` + 64-byte aligned `s_scratch_tx/rx` for status polls (`c835c28`), (c) `chunk_rx` claimed eagerly at `spi_camera_init` while DMA-internal pool is fresh, (d) `tx_buffer = NULL` on the chunked-RX path (the slave ignores MOSI; halves DMA-internal demand from 8 KB to 4 KB). Anything that erodes any of those reverts the system to flaky / panicky territory — the diagnostic signal is `setup_dma_priv_buffer(1206): Failed to allocate priv RX buffer` followed by a `Load access fault`.
+
 ### How It Works
 1. **Photo button** → takes P4 camera photo + triggers background SPI capture
 2. **SPI capture task** (Core 0) → GPIO34 trigger → receives 4 JPEGs via SPI → saves to `/sdcard/p4mslo/P4M0001/pos{1-4}.jpg`
@@ -284,21 +286,30 @@ status
 
 ### Pipeline Timing (OV5640, 4 cameras working)
 
+Two regimes depending on which task runs the encode:
+
+**Legacy `pimslo` serial command (on-demand task with internal stack)**
+
 | Step | Time |
 |------|------|
 | GPIO34 trigger + OV5640 capture | ~600ms |
-| SPI transfer × 4 cameras @ 16MHz | ~2,000ms |
+| SPI transfer × 4 cameras @ 10MHz | ~1,700ms |
 | Save 4 JPEGs to SD card | ~800ms |
-| **Capture + save total** | **~3,400ms** |
+| **Capture + save total** | **~3,100ms** |
 | | |
-| GIF pass 1: palette (4 decodes) | ~11s |
-| GIF pass 2: 4 forward frames | ~32s |
-| GIF pass 2: 2 replayed frames | ~7s |
-| **GIF encode total** | **~50s** |
-| | |
-| **Full pipeline (capture + encode)** | **~54s** |
+| Direct-JPEG .p4ms save (4 × tjpgd crop decode @ scale=0) | ~6-10s |
+| GIF pass 1: palette (4 decodes) | ~7s |
+| GIF pass 2: 4 forward frames @ ~12s/frame | ~50s |
+| GIF pass 2: 2 replayed frames | ~18s |
+| **GIF encode total** | **~85-95s** |
 
-GIF encoding runs in the background — the user only waits for the capture phase (~3.4s).
+**photo_btn flow (`pimslo_encode_queue_task` with PSRAM stack — slower)**
+
+The persistent `pimslo_encode_queue_task` declares a 16 KB stack, which is larger than the largest contiguous free internal block on this board (~7 KB at any point post-boot). FreeRTOS silently falls back to PSRAM, and every stack access during decode/dither/LZW takes ~100-200 ns instead of an internal-RAM cycle. Net effect: each tjpgd decode jumps from ~1.7 s → ~18 s, and Pass 2 per-frame from ~12 s → ~55 s. A real photo→encode cycle on this board is **~5-7 minutes** end to end.
+
+Live captures still feel responsive — the user only waits ~3 s for the capture overlay to clear (SPI transfer). The slow part runs in background and the gallery shows the JPEG preview immediately as a "PROCESSING" entry until the .gif finalizes.
+
+To recover the ~95s number you'd need to either (a) free 16 KB contiguous internal RAM (would require dropping `s_tjpgd_work`'s 32 KB BSS or `gif_encoder.c::tjwork`'s 32 KB BSS — both are required for tjpgd's hot-loop tables), or (b) restructure the encoder so the hot LZW loop runs on a separate worker thread with a smaller stack that fits internal. Open work item.
 
 ### SD Card Layout
 ```
@@ -331,7 +342,8 @@ GIF encoding runs in the background — the user only waits for the capture phas
 - **Gallery JPEG preview decode — slurp+scale, never per-byte-fread** — `show_jpeg()` in `app_gifs.c` reads the whole preview JPEG into a PSRAM buffer up front and hands tjpgd an in-memory pointer, and picks a tjpgd scale (0/1/2/3 = 1:1/1:2/1:4/1:8) that lands the decoded output close to the 240×240 canvas. Both matter. The original code did `fread` directly from the callback and forced scale 0 (native resolution, ~2M pixels for a 1920×1080 preview) with a naive per-src-pixel nearest-neighbor downscale; that was 14-20 s per preview on this board, which held `bsp_display_lock` inside `cmd_btn` long enough for the serial command queue to drain. Post-fix: ~650 ms at scale 2 (1920/4 = 480 px out). The hand-rolled `jpeg_out_cb` also iterates output cells (only the canvas cells this MCU contributes to) instead of every source pixel in the MCU — was O(MCU_bw·MCU_bh) per block, now O(canvas_cells_hit). For deeper timing, set `APP_GIFS_TIMING 1` at the top of `app_gifs.c` to turn on the `TIMING_MARK`/`TIMING_LOG` macros around `show_jpeg` / `slot_find_or_alloc` / `load_small_gif`.
 - **Serial command USB-CDC TX saturation during captures** — `cmd_respond` goes through `printf` → USB-CDC TX. When the CDC TX buffer fills (ESP-IDF's CDC driver has a small per-endpoint queue), the serial_cmd task blocks waiting to drain, which also prevents it from reading the next queued command. During a PIMSLO capture run, `spi_camera.c::poll_and_get_size()` was emitting a `Poll: status=…` ESP_LOGI every 50 ms of polling — 200-500 lines per capture. That was enough to stall the dispatch task long enough that rapid-fire `photo_btn` commands from the host dropped (test 08 was counting 3 received vs 4 sent). Demoted to ESP_LOGD so the output only shows up with `esp_log_level_set("spi_cam", ESP_LOG_DEBUG)` at runtime.
 - **LCD SPI priv TX buffer OOM → frozen LVGL** — LVGL's draw buffer lives in PSRAM (`buff_spiram=true`) and the ST7789 panel-io-spi device doesn't set `SPI_TRANS_DMA_USE_PSRAM` on its transactions, so the ESP-IDF SPI master falls into its per-flush "copy PSRAM source to a freshly-allocated DMA-capable internal scratch buffer" path. On this board the DMA-internal heap is tiny (~32 KB reserved by esp_psram + 18 KB regular RAM, of which most ends up claimed by FreeRTOS TCBs / managed-component scratch). Largest free block post-boot can drop to ~2 KB. A 4800-byte priv TX alloc then fails, `panel_st7789_draw_bitmap: io tx color failed` fires, the flush-ready callback never triggers, and taskLVGL busy-waits forever on `draw_buf->flushing` at `lv_refr.c:709`. Symptom: the screen stops refreshing, button presses still update LVGL state internally but the user sees a frozen UI. Fix in `common_components/esp32_p4_eye/esp32_p4_eye.c` uses `lvgl_port_display_cfg_t.trans_size = BSP_LCD_H_RES * 4` to make esp_lvgl_port allocate a permanent 1920-byte DMA-internal staging buffer at init. LVGL then does a PSRAM→internal memcpy through that buffer before handing the pointer to the LCD master, bypassing the per-flush alloc entirely. Debug via the `heap_caps` serial command (dumps `dma_int` free + largest-free-block).
-- **Background-task stacks live in PSRAM, not internal** — `pimslo_cap` (8 KB), `pimslo_save` (6 KB), `pimslo_gif` (16 KB) and `gif_bg` (16 KB) are all created with `xTaskCreatePinnedToCoreWithCaps(... MALLOC_CAP_SPIRAM)`. Default `xTaskCreatePinnedToCore` pulls the stack from internal RAM, and 46 KB of task-stack pressure is enough to starve the LCD SPI priv-TX path above. Safe: none of these tasks run from an ISR context. Observable win: before the PSRAM move, `gif_bg` was silently failing to start every boot (`Failed to start BG worker` error line that users were seeing for months); now it actually runs.
+- **Background-task stacks live in PSRAM, not internal** — `pimslo_save` (6 KB) is explicitly created with `xTaskCreatePinnedToCoreWithCaps(... MALLOC_CAP_SPIRAM)`. The other heavies (`pimslo_cap` 8 KB, `pimslo_gif` 16 KB, `gif_bg` 16 KB) call plain `xTaskCreatePinnedToCore` but FreeRTOS's allocator falls back to PSRAM whenever internal can't satisfy the request — and on this board the largest-free-internal block is ~7 KB at every point post-boot, so the fallback fires every time for the 16 KB allocations. Net: in practice all four task stacks live in PSRAM. Safe: none of these tasks run from an ISR context. Observable win: before this state, `gif_bg` was silently failing to start every boot (`Failed to start BG worker`); now it actually runs. Cost: every stack access during the encoder hot loop is a ~100-200 ns PSRAM access, which is the dominant reason Pass 2 went from ~8 s/frame (claim from the original `8f9092c` perf commit) to ~12-55 s/frame on the current board (see "Pipeline Timing" above for both regimes).
+- **`encode_should_defer()` allows MAIN page** — `app_pimslo.c::encode_should_defer()` only defers when the user is on CAMERA / INTERVAL_CAM / VIDEO_MODE (viewfinder owns ~7 MB scaled_buf — actual collision). MAIN was previously in the defer list, which combined with the `gallery_ever_opened` gate meant a user who pressed photo_btn from main without ever visiting the gallery → encode never fired. Captures piled up forever as JPEG-only entries. The MAIN gate and `gallery_ever_opened` gate are both removed; the encode pipeline calls `app_video_stream_free_buffers()` before its 7 MB alloc and tolerates a foreground CAMERA-page entry mid-encode (the camera-buffer realloc is best-effort and retries on next viewfinder frame).
 - **bg_worker starvation watchdog** — `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n` in `sdkconfig.defaults`. The `gif_bg` background task runs pure-compute LZW frame decode + palette work on Core 1 at prio 2. A single frame decode for a large GIF is ~700 ms of uninterrupted CPU; tuning any lower than that would mean chasing yields down into ESP-IDF / LVGL code we don't own. Simpler to disable the Core 1 idle watchdog. Core 0 idle wdt stays on (`CHECK_IDLE_TASK_CPU0` defaults to y), so genuinely stuck LVGL / video-stream tasks still fire.
 - **bg_worker must yield foreground** — `app_gifs_next / _prev` set `s_last_nav_ms` (gallery knob nav timestamp) and flip `s_bg_abort_current`. `bg_should_yield` returns true for 15 s after any nav, and the encode pipeline (`app_gifs_encode_pimslo_from_dir`) polls `s_bg_abort_current` at the top + between each JPEG load. `bg_encode_safe_page()` intentionally omits `UI_PAGE_GIFS` — a 50 s PIMSLO encode on the gallery page pins the JPEG decoder + 7 MB of PSRAM + SD I/O and makes gallery nav feel dead for tens of seconds. Stale captures only get re-encoded once the user leaves the gallery for ALBUM / USB / SETTINGS. Pre-rendering of `.p4ms` previews (the other bg path) still runs on any page, with a `vTaskDelay(pdMS_TO_TICKS(100))` between frames to give IDLE1 real run time.
 - **SPI camera RX chunk — single 4 KB buffer, permanent, NULL tx** — `spi_camera.c` uses `spi_device_transmit` with `tx_buffer=NULL` for the receive-only JPEG pull (the S3 slave ignores MOSI during the DATA phase anyway). That halves the DMA-internal requirement from 8 KB (tx+rx) to 4 KB (rx only). The single `chunk_rx` buffer is allocated on first use via `heap_caps_malloc(..., MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)` and held forever — no per-capture heap churn, no OOM once the pool has fragmented. Before the change, "OOM for SPI chunk buffers" fired on every single capture regardless of whether the S3 cameras responded with JPEGs, and all 4 slots returned FAILED even when the slaves clearly had JPEGs ready.

@@ -6,3 +6,5 @@
 #define DRAM_ATTR
 #define RTC_DATA_ATTR
 #define RTC_RODATA_ATTR
+#define TCM_DRAM_ATTR
+#define TCM_IRAM_ATTR

@@ -290,6 +290,33 @@ static int run_encode_pipeline(int n_cams, const char *stem)
     void *scaled_buf = p4_mem_malloc(1824 * 1920 * 2, P4_POOL_PSRAM);
     void *pixel_lut  = p4_mem_malloc(65536, P4_POOL_PSRAM);
 
+    /* Pass 2 frame churn — 4 forward frames + 2 replay frames. Each
+     * frame allocates err_cur (11.5 KB), err_nxt (11.5 KB), row_cache
+     * (3.8 KB), row_indices (1.9 KB) — all from INTERNAL with PSRAM
+     * fallback — and frees at end of frame. We model the alloc/free
+     * pair to expose the fragmentation pressure on internal_largest:
+     * if alloc lands in INTERNAL and the pool can't accommodate
+     * concurrent capture-task allocations, the budget catches it. */
+    enum { FRAMES_PER_ENCODE = 6 };
+    for (int frame = 0; frame < FRAMES_PER_ENCODE; frame++) {
+        void *err_cur = p4_mem_malloc(11520, P4_POOL_INT);
+        void *err_nxt = p4_mem_malloc(11520, P4_POOL_INT);
+        void *row_cache   = p4_mem_malloc(3840, P4_POOL_INT);
+        void *row_indices = p4_mem_malloc(1920, P4_POOL_INT);
+
+        /* PSRAM fallback if internal can't satisfy. Mirrors the real
+         * encoder's `if (!err_cur || !err_nxt) { ... heap_caps_calloc(
+         * MALLOC_CAP_SPIRAM) }` pattern. */
+        if (!err_cur) err_cur = p4_mem_malloc(11520, P4_POOL_PSRAM);
+        if (!err_nxt) err_nxt = p4_mem_malloc(11520, P4_POOL_PSRAM);
+        if (!row_indices) row_indices = p4_mem_malloc(1920, P4_POOL_PSRAM);
+
+        if (err_cur)     p4_mem_free(err_cur);
+        if (err_nxt)     p4_mem_free(err_nxt);
+        if (row_cache)   p4_mem_free(row_cache);
+        if (row_indices) p4_mem_free(row_indices);
+    }
+
     s_sim_clock_ms += t.total_ms;
 
     if (scaled_buf) p4_mem_free(scaled_buf);

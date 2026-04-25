@@ -539,6 +539,48 @@ SCENARIO(rapid_burst_captures_all_eventually_encode)
 }
 
 /* ------------------------------------------------------------------ */
+SCENARIO(long_sequence_internal_largest_does_not_shrink)
+{
+    /* Hardware repro: tests 08 / 09 panic in tlsf::remove_free_block
+     * around capture #20+ after long sequences of camera-page entries +
+     * photos. Hypothesis: per-frame err_cur/err_nxt/row_cache alloc-free
+     * churn (24 cycles per encode × N encodes) fragments INTERNAL such
+     * that a later small alloc lands on a corrupted free-block header.
+     *
+     * What this scenario asserts: under the proposed architecture
+     * (TCM LUT, INTERNAL stack), running 30 photo_btn cycles + their
+     * encodes leaves internal_largest within 50% of the steady-state
+     * value. If the per-frame churn really fragments the pool, the
+     * mock should show internal_largest dropping monotonically.
+     *
+     * If this scenario PASSES (no monotonic decline), the fragmentation
+     * isn't the per-frame churn — it's something else (concurrent
+     * capture/save/encode race, or an actual buffer overflow we can't
+     * model in a sequential simulator). */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    album_decoder_init();
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+
+    size_t before = pimslo_sim_internal_largest();
+    P("before: internal_largest=%zu", before);
+
+    for (int i = 0; i < 30; i++) {
+        pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+        if (r.cams_usable < 2) continue;
+        pimslo_sim_wait_idle(120 * 1000);
+    }
+
+    size_t after = pimslo_sim_internal_largest();
+    P("after 30 cycles: internal_largest=%zu", after);
+
+    /* If the per-frame alloc/free pattern fragments the pool, after
+     * would be substantially smaller than before. A clean allocator
+     * should recover the same largest-block on each cycle. */
+    ASSERT(after >= before / 2,
+           "internal_largest must not shrink >50% after 30 encode cycles");
+    ASSERT(gallery_count() == 30, "all 30 captures made it through");
+}
+
 SCENARIO(album_decoder_released_during_encode)
 {
     /* When the encoder runs, it must drop the ~6 MB PPA buffer that
@@ -659,6 +701,7 @@ int main(void)
     RUN(p4ms_persists_after_encode_for_instant_replay);
     RUN(rapid_burst_captures_all_eventually_encode);
 
+    RUN(long_sequence_internal_largest_does_not_shrink);
     RUN(album_decoder_released_during_encode);
     RUN(album_reacquire_failure_is_non_fatal);
     RUN(album_dance_alloc_releases_psram_for_encoder);

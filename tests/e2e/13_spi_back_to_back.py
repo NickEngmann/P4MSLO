@@ -75,6 +75,23 @@ def main():
             # so short sleeps are fine here.
             time.sleep(1)
 
+        # Drain to encoder idle BEFORE measuring drift. The encoder's
+        # working set (7 MB scaled_buf + 23 KB err buffers + JPEG buf)
+        # consumes ~20 KB of internal RAM while running, which would
+        # otherwise show up as a false-positive "leak" of dma_int. Wait
+        # up to 300 s for pimslo_encoding=0 + gifs_encoding=0; the last
+        # encode in a 5-shot burst can take 80-120 s on top of any
+        # earlier ones still in the queue.
+        _lib.mark(fh, 'wait for encoder idle before sampling drift')
+        for _ in range(150):
+            _lib.do(s, 'status', 2, fh)
+            time.sleep(0)
+            with open(LOG) as lf:
+                tail = lf.read().splitlines()[-20:]
+            if any('pimslo_encoding=0' in ln and 'gifs_encoding=0' in ln
+                   for ln in tail):
+                break
+
         _lib.mark(fh, 'post-run heap_caps — drift check')
         _lib.do(s, 'heap_caps', 2, fh)
         _lib.do(s, 'status', 2, fh)
@@ -90,8 +107,15 @@ def main():
         r'setup_dma_priv_buffer\(1206\): Failed to allocate priv',
         txt))
 
-    spi_pimslo_responses = len(re.findall(
-        r'spi_pimslo capture_ms=\d+', txt))
+    # Two parallel signals — either the serial-cmd response OR the
+    # spi_cam log line counts as "this capture happened". CDC TX
+    # saturation during a concurrent encode can eat the response text
+    # without affecting the underlying capture, so use whichever number
+    # is higher.
+    spi_pimslo_responses = max(
+        len(re.findall(r'spi_pimslo capture_ms=\d+', txt)),
+        len(re.findall(r'spi_cam: Capture all: \d/4 cameras', txt))
+    )
 
     # DMA-internal drift across the 5 captures — both heap_caps lines
     # should be close. Big drop = we're leaking internal RAM per shot.

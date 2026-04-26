@@ -117,3 +117,8 @@ CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
 #   2. if poisoning was masking, switch to COMPREHENSIVE + periodic
 #      heap_caps_check_integrity_all to identify the writer
 CONFIG_HEAP_POISONING_LIGHT=y
+# Periodic heap_caps_check_integrity_all() polls cut the diagnostic
+# window from "panic on next free of the corrupted block" (could be
+# seconds or minutes later) to "panic within 1 s of the bad write."
+# Off by default; flip via `heap_check` serial command (see
+# app_serial_cmd.c) when chasing a corruption bug.

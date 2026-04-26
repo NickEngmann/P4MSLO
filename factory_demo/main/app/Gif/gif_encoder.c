@@ -440,8 +440,13 @@ esp_err_t gif_encoder_create(const gif_encoder_config_t *config, gif_encoder_t *
         return ret;
     }
 
-    /* Get cache alignment for PSRAM buffers */
+    /* Get cache alignment for PSRAM buffers. Clamp to a minimum so a
+     * 0 return (unlikely on this chip but possible on BSP changes)
+     * doesn't make ALIGN_UP zero out the allocation size and silently
+     * misdescribe the buffer. */
+    enc->cache_line_size = 0;
     esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &enc->cache_line_size);
+    if (enc->cache_line_size < 64) enc->cache_line_size = 64;
 
     /* Decode buffer is allocated lazily in load_and_decode_jpeg() based on
      * the actual JPEG dimensions, to avoid wasting memory on a full-res buffer

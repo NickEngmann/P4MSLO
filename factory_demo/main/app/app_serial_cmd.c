@@ -727,13 +727,18 @@ static void dispatch_command(char *line)
     } else if (strcmp(line, "cam_wifi_on") == 0 ||
                strcmp(line, "cam_wifi_off") == 0 ||
                strcmp(line, "cam_reboot") == 0 ||
-               strcmp(line, "cam_identify") == 0) {
+               strcmp(line, "cam_identify") == 0 ||
+               strcmp(line, "cam_sleep") == 0) {
         /* cam_wifi_on N | cam_wifi_off N | cam_reboot N | cam_identify N
-         * N = 1-4 (camera index 0-3 + 1), or "all" for broadcast */
+         * | cam_sleep N
+         * N = 1-4 (camera index 0-3 + 1), or "all" for broadcast.
+         * cam_sleep puts the cam into light sleep — wakes on the next
+         * trigger pulse (P4 GPIO34 → S3 GPIO1 falling edge). */
         uint8_t cmd_byte = 0;
         if      (strcmp(line, "cam_wifi_on")  == 0) cmd_byte = SPI_CAM_CMD_WIFI_ON;
         else if (strcmp(line, "cam_wifi_off") == 0) cmd_byte = SPI_CAM_CMD_WIFI_OFF;
         else if (strcmp(line, "cam_reboot")   == 0) cmd_byte = SPI_CAM_CMD_REBOOT;
+        else if (strcmp(line, "cam_sleep")    == 0) cmd_byte = SPI_CAM_CMD_SLEEP;
         else                                         cmd_byte = SPI_CAM_CMD_IDENTIFY;
 
         spi_camera_init();

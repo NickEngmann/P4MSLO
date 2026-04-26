@@ -29,6 +29,7 @@
 #include "app_pimslo.h"
 #include "bsp/esp-bsp.h"          /* bsp_display_lock/unlock for the format-progress task */
 #include "esp_lvgl_port.h"        /* lvgl_port_stop/resume for idle sleep */
+#include "spi_camera.h"           /* SPI_CAM_CMD_SLEEP broadcast on idle entry */
 #include "bsp/esp32_p4_eye.h"     /* bsp_get_sdcard_handle */
 #include "esp_vfs_fat.h"          /* esp_vfs_fat_sdcard_format */
 #include <sys/stat.h>             /* mkdir to recreate PIMSLO dirs post-format */
@@ -838,8 +839,29 @@ static void enter_sleeping(void)
     /* lvgl_port_stop pauses the LVGL task — no more refresh cycles
      * until lvgl_port_resume. CPU is freed for the encoder. */
     lvgl_port_stop();
+
+    /* Broadcast SPI_CMD_SLEEP to all 4 S3 cameras. They each enter
+     * light sleep with GPIO1 (the trigger pin) configured as wake
+     * source. They'll wake when the next trigger pulse arrives —
+     * which the firmware fires on entering UI_PAGE_CAMERA via the
+     * existing video_stream → spi_camera_send_trigger path. Power
+     * draw on each S3 drops from ~50 mA active to ~0.8 mA in light
+     * sleep; with 4 cams that's ~200 mA saved while the user is idle.
+     *
+     * Sent BEFORE lvgl_port_stop above? No — order doesn't matter
+     * because spi_camera_send_control runs synchronously here on
+     * Core 0 and doesn't depend on LVGL. We log the broadcast count
+     * so test logs can verify the integration fired. */
+    spi_camera_init();
+    int sent = 0;
+    for (int i = 0; i < 4; i++) {
+        if (spi_camera_send_control(i, SPI_CAM_CMD_SLEEP) == ESP_OK) sent++;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGI(TAG, "Sent SPI_CMD_SLEEP to %d/4 S3 cameras", sent);
+
     s_power_state = POWER_SLEEPING;
-    ESP_LOGI(TAG, "Sleeping — backlight off + LVGL paused");
+    ESP_LOGI(TAG, "Sleeping — backlight off + LVGL paused + S3 cams asleep");
 }
 
 /* Wake from MODAL or SLEEPING. Called at the very top of every
@@ -1769,6 +1791,23 @@ static void ui_extra_redirect_to_camera_page(void)
     if(!lv_popup_timer){
         lv_popup_timer = lv_timer_create(pop_up_timer_callback, 5000, ui_PanelCanvasPopupCamera);
     }
+
+    /* The user-facing "Camera mode" overlay is now on screen for ~5 s.
+     * Use this window to wake the 4 S3 cameras out of any prior
+     * light-sleep state. spi_camera_send_trigger pulses GPIO34 LOW
+     * for ~100 ms — every S3 has GPIO1 (the trigger pin) configured
+     * as a falling-edge wake source after receiving SPI_CMD_SLEEP, so
+     * the same pulse the master uses to start a capture also serves
+     * as the wake-from-sleep signal. Idempotent if cams are already
+     * awake (just an extra trigger ISR fire that captures nothing
+     * because no buffer is queued). After this pulse the cams have
+     * the entire 5 s overlay window to re-arm their SPI slave, OV5640
+     * sensor, and JPEG framebuffer before the user can press the
+     * shutter. */
+    spi_camera_init();
+    esp_err_t tret = spi_camera_send_trigger();
+    ESP_LOGI(TAG, "Camera page entry: wake trigger pulse → S3s "
+                  "(spi_camera_send_trigger ret=0x%x)", tret);
 }
 
 /**

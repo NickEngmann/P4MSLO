@@ -93,6 +93,9 @@ esp_err_t spi_camera_capture_all_after_trigger(uint8_t *jpeg_bufs[4],
 #define SPI_CAM_CMD_IDENTIFY        0x07
 #define SPI_CAM_CMD_AUTOFOCUS       0x08  /* Phase 4 — trigger OV5640 AF */
 #define SPI_CAM_CMD_SET_EXPOSURE    0x09  /* Phase 4 — apply gain + exposure */
+#define SPI_CAM_CMD_SLEEP           0x0A  /* Light-sleep until trigger pulse —
+                                           * sent when the P4 UI enters its
+                                           * 3-min idle power-saving state. */
 
 /** Status byte flag bits in the IDLE poll response */
 #define SPI_CAM_STATUS_JPEG_READY       0x01

@@ -49,6 +49,7 @@ static const char *TAG = "spi_slave";
 #define CMD_IDENTIFY       SPI_CMD_IDENTIFY
 #define CMD_AUTOFOCUS      SPI_CMD_AUTOFOCUS
 #define CMD_SET_EXPOSURE   SPI_CMD_SET_EXPOSURE
+#define CMD_SLEEP          SPI_CMD_SLEEP
 
 /**
  * CS-gated MISO tri-state ISR.
@@ -397,7 +398,7 @@ void SPISlave::spiTask(void *param)
             ESP_LOGD(TAG, "DATA transfer complete");
         } else if (cmd == CMD_WIFI_ON || cmd == CMD_WIFI_OFF ||
                    cmd == CMD_REBOOT  || cmd == CMD_IDENTIFY ||
-                   cmd == CMD_AUTOFOCUS) {
+                   cmd == CMD_AUTOFOCUS || cmd == CMD_SLEEP) {
             ESP_LOGI(TAG, "Control cmd 0x%02X", cmd);
             if (self->_controlCb) self->_controlCb(cmd, nullptr, 0);
         } else if (cmd == CMD_SET_EXPOSURE) {

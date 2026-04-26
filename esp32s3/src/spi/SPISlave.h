@@ -49,6 +49,11 @@ static constexpr uint8_t SPI_CMD_REBOOT        = 0x06;
 static constexpr uint8_t SPI_CMD_IDENTIFY      = 0x07;
 static constexpr uint8_t SPI_CMD_AUTOFOCUS     = 0x08;  /* Trigger OV5640 AF */
 static constexpr uint8_t SPI_CMD_SET_EXPOSURE  = 0x09;  /* Apply master-supplied AE values */
+static constexpr uint8_t SPI_CMD_SLEEP         = 0x0A;  /* Enter light sleep, wake on
+                                                          TRIGGER_PIN (GPIO1) falling edge.
+                                                          Issued by the P4 master when its
+                                                          own UI enters the 3-min idle
+                                                          power-saving state. */
 
 /** Status byte bit flags */
 static constexpr uint8_t SPI_STATUS_JPEG_READY      = 0x01;

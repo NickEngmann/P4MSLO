@@ -28,6 +28,7 @@
 #include "ota/OTAManager.h"
 #include "led/StatusLED.h"
 #include "spi/SPISlave.h"
+#include "esp_sleep.h"
 
 static const char *TAG = "moment";
 
@@ -174,6 +175,53 @@ static void do_set_exposure(const uint8_t *payload, size_t len) {
     spiSlave.setExposureHeader(gain, exposure);
 }
 
+/**
+ * Light-sleep on master command. Wakes when TRIGGER_PIN (GPIO1) goes
+ * LOW — the same edge that fires the existing capture-trigger ISR, so
+ * the master's normal `spi_camera_send_trigger()` pulse doubles as a
+ * wake signal. We use light sleep (not deep) so RAM, SPI-slave state,
+ * and the camera handle survive across the sleep — wake is essentially
+ * instant (~hundreds of µs) and the next status poll from the master
+ * sees the cam alive. Power draw drops from ~50 mA active to ~0.8 mA
+ * during sleep (modem off, CPU clock-gated).
+ *
+ * The pin is already configured as INPUT with pull-up + falling-edge
+ * ISR by `task_trigger_monitor()` at boot. `gpio_wakeup_enable` and
+ * `esp_sleep_enable_gpio_wakeup` arm GPIO1 as a wake source for the
+ * sleep mechanism specifically — these settings persist until cleared
+ * but only have effect during sleep. */
+static void do_sleep() {
+    ESP_LOGI(TAG, "[SPI control] SLEEP — entering light sleep, GPIO%d wake source",
+             TRIGGER_PIN);
+    /* LED off saves a few mA on top of the modem-off light-sleep
+     * baseline. The LED animator task is suspended along with the
+     * rest of FreeRTOS during sleep, so the hardware just holds
+     * whatever state we last commanded. */
+    statusLED.setState(LEDState::OFF);
+
+    esp_err_t ge = gpio_wakeup_enable((gpio_num_t)TRIGGER_PIN, GPIO_INTR_LOW_LEVEL);
+    esp_err_t se = esp_sleep_enable_gpio_wakeup();
+    if (ge != ESP_OK || se != ESP_OK) {
+        ESP_LOGW(TAG, "[SPI control] SLEEP setup failed (gpio=0x%x sleep=0x%x), "
+                       "skipping sleep", ge, se);
+        return;
+    }
+
+    /* Light sleep returns when the wake source fires. esp_light_sleep_start
+     * blocks the calling task; the rest of FreeRTOS is also suspended
+     * (single-task scheduler stops). Wake reason is GPIO. */
+    esp_err_t r = esp_light_sleep_start();
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    ESP_LOGI(TAG, "[SPI control] WAKE — light_sleep ret=0x%x cause=%d",
+             r, (int)cause);
+    statusLED.setState(LEDState::READY);
+
+    /* Disarm the GPIO wake setup so it doesn't accidentally re-fire on a
+     * subsequent capture trigger (the trigger fires in the normal ISR
+     * path now that we're awake). */
+    gpio_wakeup_disable((gpio_num_t)TRIGGER_PIN);
+}
+
 static void task_control(void *arg) {
     SpiControlMsg msg;
     while (xQueueReceive(s_controlQueue, &msg, portMAX_DELAY) == pdPASS) {
@@ -183,6 +231,7 @@ static void task_control(void *arg) {
             case SPI_CMD_IDENTIFY:     do_identify_blink();    break;
             case SPI_CMD_AUTOFOCUS:    do_autofocus();         break;
             case SPI_CMD_SET_EXPOSURE: do_set_exposure(msg.payload, msg.payload_len); break;
+            case SPI_CMD_SLEEP:        do_sleep();             break;
             case SPI_CMD_REBOOT:
                 ESP_LOGW(TAG, "[SPI control] REBOOT requested — restarting in 100ms");
                 vTaskDelay(pdMS_TO_TICKS(100));

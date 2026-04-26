@@ -747,7 +747,7 @@ void ui_ScreenCamera_screen_init(void)
     lv_obj_set_x(ui_LabelPanelPanelSettingsODItem, -28);
     lv_obj_set_y(ui_LabelPanelPanelSettingsODItem, 0);
     lv_obj_set_align(ui_LabelPanelPanelSettingsODItem, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_LabelPanelPanelSettingsODItem, "Obj Det(YOLO)");
+    lv_label_set_text(ui_LabelPanelPanelSettingsODItem, "Format SD");
     lv_obj_set_style_text_color(ui_LabelPanelPanelSettingsODItem, lv_color_hex(0x000000),
                                 LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_LabelPanelPanelSettingsODItem, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -760,7 +760,7 @@ void ui_ScreenCamera_screen_init(void)
     lv_obj_set_x(ui_LabelPanelPanelSettingsODBody, 55);
     lv_obj_set_y(ui_LabelPanelPanelSettingsODBody, 0);
     lv_obj_set_align(ui_LabelPanelPanelSettingsODBody, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_LabelPanelPanelSettingsODBody, "Off");
+    lv_label_set_text(ui_LabelPanelPanelSettingsODBody, "Ready");
     lv_obj_set_style_text_color(ui_LabelPanelPanelSettingsODBody, lv_color_hex(0x000000),
                                 LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_LabelPanelPanelSettingsODBody, 255, LV_PART_MAIN | LV_STATE_DEFAULT);

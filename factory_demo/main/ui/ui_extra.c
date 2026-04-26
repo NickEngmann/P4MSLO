@@ -27,6 +27,10 @@
 #include "app_isp.h"
 #include "app_gifs.h"
 #include "app_pimslo.h"
+#include "bsp/esp-bsp.h"          /* bsp_display_lock/unlock for the format-progress task */
+#include "bsp/esp32_p4_eye.h"     /* bsp_get_sdcard_handle */
+#include "esp_vfs_fat.h"          /* esp_vfs_fat_sdcard_format */
+#include <sys/stat.h>             /* mkdir to recreate PIMSLO dirs post-format */
 
 /* Constants */
 #define IMG_BASE_ZOOM       60
@@ -92,6 +96,17 @@ static lv_obj_t *ui_BtnGifsDeleteNo         = NULL;
 static lv_obj_t *ui_LblGifsDeleteYes        = NULL;
 static lv_obj_t *ui_LblGifsDeleteNo         = NULL;
 static bool       delete_yes_selected       = false;
+
+/* Settings → Format SD confirmation modal. Mirrors the gifs-page
+ * modal but parented to ui_ScreenCamera so it floats over the
+ * settings panel; created lazily on first show. Reuses
+ * delete_yes_selected (modals are mutually exclusive). */
+static lv_obj_t *ui_PanelSettingsFormat      = NULL;
+static lv_obj_t *ui_PanelSettingsFormatTitle = NULL;
+static lv_obj_t *ui_BtnSettingsFormatYes     = NULL;
+static lv_obj_t *ui_BtnSettingsFormatNo      = NULL;
+static lv_obj_t *ui_LblSettingsFormatYes     = NULL;
+static lv_obj_t *ui_LblSettingsFormatNo      = NULL;
 
 // UI settings
 static uint16_t magnification_factor = DEFAULT_MAGNIFICATION_FACTOR;
@@ -161,6 +176,7 @@ static const PageMapping page_map[] = {
 };
 
 /* Forward declarations */
+static void update_format_sd_display(void);
 static void ui_extra_redirect_to_main_page(void);
 static void ui_extra_redirect_to_camera_page(void);
 static void ui_extra_redirect_to_interval_camera_page(void);
@@ -277,22 +293,26 @@ static void update_setting_display(int setting_index) {
         ESP_LOGW(TAG, "Invalid setting index: %d", setting_index);
         return;
     }
-    
+
+    /* Slot 1 was the OD/Language toggle; repurposed to "DELETE ALL".
+     * It has no cycling options — body shows live SD state instead. */
+    if (setting_index == 1) {
+        update_format_sd_display();
+        return;
+    }
+
     setting_options_t* opt = &settings_options[setting_index];
     const char* current_text = opt->options[opt->current_option];
-    
+
     // Update the label text
     if (opt->label) {
         lv_label_set_text(opt->label, current_text);
     }
-    
+
     // Update the current settings info
     switch (setting_index) {
         case 0:
             current_settings.gyroscope = current_text;
-            break;
-        case 1:
-            current_settings.od = current_text;
             break;
         case 2:
             current_settings.resolution = current_text;
@@ -301,7 +321,7 @@ static void update_setting_display(int setting_index) {
             current_settings.flash = current_text;
             break;
     }
-    
+
     save_current_settings();
 
     ESP_LOGD(TAG, "Setting %d updated to: %s", setting_index, current_text);
@@ -317,10 +337,12 @@ static void init_settings_options(void) {
     settings_options[0].current_option = 0;    // Set to 0, corresponds to "Off"
     settings_options[0].label = ui_LabelPanelPanelSettingsGyroscopeBody;
     
-    // OD options
-    settings_options[1].options = od_options;
-    settings_options[1].option_count = sizeof(od_options) / sizeof(od_options[0]);
-    settings_options[1].current_option = 1;    // Set to 1, corresponds to "On"
+    /* Slot 1 was the OD/Language toggle (AI detection — long since
+     * stripped). Repurposed to DELETE ALL: no cycling options, body
+     * label is driven by update_format_sd_display() from SD state. */
+    settings_options[1].options = NULL;
+    settings_options[1].option_count = 0;
+    settings_options[1].current_option = 0;
     settings_options[1].label = ui_LabelPanelPanelSettingsODBody;
     
     // Resolution options
@@ -777,6 +799,335 @@ static bool gifs_delete_modal_yes_focused(void)
     return delete_yes_selected;
 }
 
+/* ===== Settings → Format SD confirmation modal =====
+ * Same Y/N pattern as the gifs delete modal. Shares delete_yes_selected
+ * (only one modal is ever visible at a time — they live on different
+ * pages). Parented to ui_ScreenCamera so it floats above ui_PanelSettings
+ * which is itself a child of ui_PanelCanvas under the same screen. */
+
+static void settings_format_apply_selection(void)
+{
+    if (!ui_BtnSettingsFormatYes || !ui_BtnSettingsFormatNo) return;
+    lv_obj_set_style_bg_color(ui_BtnSettingsFormatYes, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(ui_BtnSettingsFormatNo,  lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(ui_BtnSettingsFormatYes, delete_yes_selected ? 150 : 0, 0);
+    lv_obj_set_style_bg_opa(ui_BtnSettingsFormatNo,  delete_yes_selected ? 0   : 150, 0);
+}
+
+static void settings_format_modal_ensure_created(void)
+{
+    if (ui_PanelSettingsFormat != NULL) return;
+    if (ui_ScreenCamera == NULL) return;
+
+    ui_PanelSettingsFormat = lv_obj_create(ui_ScreenCamera);
+    lv_obj_set_width(ui_PanelSettingsFormat, 200);
+    lv_obj_set_height(ui_PanelSettingsFormat, 185);
+    lv_obj_align(ui_PanelSettingsFormat, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(ui_PanelSettingsFormat, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(ui_PanelSettingsFormat, 30, 0);
+    lv_obj_set_style_bg_color(ui_PanelSettingsFormat, lv_color_hex(0xC9C9C9), 0);
+    lv_obj_set_style_bg_opa(ui_PanelSettingsFormat, 220, 0);
+    lv_obj_set_style_border_opa(ui_PanelSettingsFormat, 0, 0);
+    lv_obj_add_flag(ui_PanelSettingsFormat, LV_OBJ_FLAG_HIDDEN);
+
+    ui_PanelSettingsFormatTitle = lv_label_create(ui_PanelSettingsFormat);
+    lv_obj_align(ui_PanelSettingsFormatTitle, LV_ALIGN_CENTER, 0, -55);
+    lv_label_set_text(ui_PanelSettingsFormatTitle, "Format?");
+    lv_obj_set_style_text_color(ui_PanelSettingsFormatTitle, lv_color_black(), 0);
+    lv_obj_set_style_text_font(ui_PanelSettingsFormatTitle, &lv_font_montserrat_20, 0);
+
+    ui_BtnSettingsFormatYes = lv_btn_create(ui_PanelSettingsFormat);
+    lv_obj_set_size(ui_BtnSettingsFormatYes, 140, 30);
+    lv_obj_align(ui_BtnSettingsFormatYes, LV_ALIGN_CENTER, 0, -5);
+    lv_obj_clear_flag(ui_BtnSettingsFormatYes, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ui_BtnSettingsFormatYes, LV_OBJ_FLAG_CLICKABLE);
+
+    ui_LblSettingsFormatYes = lv_label_create(ui_BtnSettingsFormatYes);
+    lv_obj_align(ui_LblSettingsFormatYes, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(ui_LblSettingsFormatYes, "YES");
+    lv_obj_set_style_text_color(ui_LblSettingsFormatYes, lv_color_hex(0xFF0202), 0);
+    lv_obj_set_style_text_font(ui_LblSettingsFormatYes, &lv_font_montserrat_16, 0);
+
+    ui_BtnSettingsFormatNo = lv_btn_create(ui_PanelSettingsFormat);
+    lv_obj_set_size(ui_BtnSettingsFormatNo, 140, 30);
+    lv_obj_align(ui_BtnSettingsFormatNo, LV_ALIGN_CENTER, 0, 38);
+    lv_obj_clear_flag(ui_BtnSettingsFormatNo, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ui_BtnSettingsFormatNo, LV_OBJ_FLAG_CLICKABLE);
+
+    ui_LblSettingsFormatNo = lv_label_create(ui_BtnSettingsFormatNo);
+    lv_obj_align(ui_LblSettingsFormatNo, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(ui_LblSettingsFormatNo, "NO");
+    lv_obj_set_style_text_color(ui_LblSettingsFormatNo, lv_color_black(), 0);
+    lv_obj_set_style_text_font(ui_LblSettingsFormatNo, &lv_font_montserrat_16, 0);
+}
+
+static bool settings_format_modal_open(void)
+{
+    return ui_PanelSettingsFormat != NULL &&
+           !lv_obj_has_flag(ui_PanelSettingsFormat, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void settings_format_modal_show(void)
+{
+    settings_format_modal_ensure_created();
+    if (!ui_PanelSettingsFormat) return;
+    delete_yes_selected = false;   /* default to NO — accidental press is safe */
+    settings_format_apply_selection();
+    lv_obj_clear_flag(ui_PanelSettingsFormat, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ui_PanelSettingsFormat);
+}
+
+static void settings_format_modal_hide(void)
+{
+    if (!ui_PanelSettingsFormat) return;
+    lv_obj_add_flag(ui_PanelSettingsFormat, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void settings_format_modal_toggle_focus(void)
+{
+    delete_yes_selected = !delete_yes_selected;
+    settings_format_apply_selection();
+}
+
+static bool settings_format_modal_yes_focused(void)
+{
+    return delete_yes_selected;
+}
+
+/* Repaint the Format SD settings slot. The other settings rows have a
+ * body label (Off/On/1080P/etc) but Format SD is an action, not a
+ * toggle — so we hide the body and re-center the lone "Format SD"
+ * item label inside the row. Black when SD is mounted (clickable),
+ * grey when SD is missing (visually disabled — SELECT is no-op'd in
+ * the btn_menu handler). Called on settings page entry, when SD mount
+ * changes, and after the confirm modal closes. */
+static void update_format_sd_display(void)
+{
+    bool sd = ui_extra_get_sd_card_mounted();
+    if (ui_LabelPanelPanelSettingsODBody) {
+        /* SquareLine layout had a right-side body label here for the
+         * old Off/On toggle. Format SD is an action — no body text.
+         * Hide flag is sticky so this is effectively idempotent. */
+        lv_obj_add_flag(ui_LabelPanelPanelSettingsODBody, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_LabelPanelPanelSettingsODItem) {
+        /* SquareLine put the item label at x=-28 to leave room for the
+         * body. With body hidden, re-center the lone "Format SD" so it
+         * sits in the middle of the row. */
+        lv_obj_set_x(ui_LabelPanelPanelSettingsODItem, 0);
+        lv_obj_set_style_text_color(ui_LabelPanelPanelSettingsODItem,
+                                    lv_color_hex(sd ? 0x000000 : 0x888888),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+}
+
+/* ===== Format SD progress (animated overlay + background task) =====
+ * Format takes ~8 s on a typical SD card. Running it inline on the
+ * LVGL task freezes the UI for the duration. Instead:
+ *   1. SELECT YES on the confirm modal swaps the modal content from
+ *      "Format?" + YES/NO to "Formatting" + animated dots.
+ *   2. A FreeRTOS task drives the actual format work, taking the LVGL
+ *      lock only around the pre/post bookkeeping (gallery rescan,
+ *      empty-overlay refresh) — NOT around the slow f_mkfs itself,
+ *      so the dot animation keeps ticking the whole time.
+ *   3. lv_async_call schedules the modal teardown back onto the LVGL
+ *      task once the task finishes.
+ * While s_format_in_progress is true the settings page ignores all
+ * button input — the user can't navigate away or interact mid-format. */
+static volatile bool s_format_in_progress = false;
+static lv_timer_t   *s_format_progress_timer = NULL;
+static int           s_format_dot_count = 0;
+
+static void format_progress_tick_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!ui_PanelSettingsFormatTitle) return;
+    s_format_dot_count = (s_format_dot_count + 1) % 4;
+    char buf[24];
+    /* "Formatting", "Formatting.", "Formatting..", "Formatting..." */
+    snprintf(buf, sizeof(buf), "Formatting%.*s", s_format_dot_count, "...");
+    lv_label_set_text(ui_PanelSettingsFormatTitle, buf);
+}
+
+/* Scheduled via lv_async_call from the BG task — runs on LVGL task
+ * context so widget mutation is safe. */
+static void format_done_async_cb(void *arg)
+{
+    esp_err_t err = (esp_err_t)(intptr_t)arg;
+    if (s_format_progress_timer) {
+        lv_timer_del(s_format_progress_timer);
+        s_format_progress_timer = NULL;
+    }
+    /* Restore the modal to its idle "Format?" + YES/NO layout so the
+     * next time the user opens it, it's not stuck mid-progress. */
+    if (ui_PanelSettingsFormatTitle) {
+        lv_label_set_text(ui_PanelSettingsFormatTitle, "Format?");
+    }
+    if (ui_BtnSettingsFormatYes) {
+        lv_obj_clear_flag(ui_BtnSettingsFormatYes, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_BtnSettingsFormatNo) {
+        lv_obj_clear_flag(ui_BtnSettingsFormatNo, LV_OBJ_FLAG_HIDDEN);
+    }
+    settings_format_modal_hide();
+    update_format_sd_display();
+    s_format_in_progress = false;
+    ESP_LOGI(TAG, "Settings: format done err=0x%x", err);
+}
+
+/* True iff any bg actor that touches SD is currently busy. Polled by
+ * the format BG task so we don't yank the filesystem out from under
+ * an open file handle.
+ *   - app_gifs_is_encoding: gif_bg's stale-encode pipeline + the
+ *     legacy album encoder (both grab open file handles for ~150 s)
+ *   - app_pimslo_is_encoding: pimslo_encode_queue_task running a job
+ *   - app_pimslo_get_queue_depth: pending GIF encode jobs queued up
+ *   - app_pimslo_is_capturing: SPI capture (no file handles, but it
+ *     hands off to pimslo_save_task which writes pos*.jpg next)
+ * Note: we don't poll pimslo_save_task directly (no public flag). It
+ * tolerates fwrite-after-unmount gracefully — it logs a write error
+ * and advances the queue. Worst case is a stale ENOSPC log line.
+ * Note: bg_worker pre-render path (.p4ms generation) is paused via
+ * s_last_nav_ms suppression once we call app_gifs_signal_bg_abort,
+ * so by the time we reach this poll loop it's already cooperating. */
+static bool format_workers_idle(void)
+{
+    return !app_gifs_is_encoding()
+        && !app_pimslo_is_encoding()
+        && !app_pimslo_is_capturing()
+        && app_pimslo_get_queue_depth() == 0;
+}
+
+/* FreeRTOS task body. Splits the lock acquisition so the slow
+ * esp_vfs_fat_sdcard_format runs without holding the LVGL lock —
+ * which is what lets the dot animation keep ticking. Mirrors the
+ * sequencing inside app_gifs_format_sd; we can't reuse that function
+ * directly because it does the whole sequence under one logical
+ * call, and we need the lock to be released across the slow part. */
+static void format_bg_task(void *arg)
+{
+    (void)arg;
+    esp_err_t err = ESP_FAIL;
+
+    /* Pre-format LVGL cleanup — stops the gallery player + drops the
+     * cross-GIF canvas cache so file paths we're about to invalidate
+     * aren't pinned anywhere. */
+    bsp_display_lock(0);
+    if (!ui_extra_get_sd_card_mounted()) {
+        bsp_display_unlock();
+        lv_async_call(format_done_async_cb,
+                      (void *)(intptr_t)ESP_ERR_INVALID_STATE);
+        vTaskDelete(NULL);
+        return;
+    }
+    app_gifs_stop();
+    app_gifs_flush_cache();
+    bsp_display_unlock();
+
+    /* Tell gif_bg to abort whatever it's doing and stay quiet for the
+     * next 15 s. Combined with the wait loop below this prevents the
+     * format from unmounting the FATFS volume out from under an open
+     * bg-worker file handle (which would not crash on this build but
+     * would spam error logs and leave the worker confused for a few
+     * iterations until it caught up with the wiped gallery). */
+    app_gifs_signal_bg_abort();
+
+    /* Wait up to 5 s for any in-flight encode / capture to drain.
+     * Modal-open already gated on these, but new work could have
+     * landed between modal-show and SELECT-YES (e.g. an SPI capture
+     * just kicked off, or gif_bg started a stale-encode). 5 s is
+     * enough for gif_bg to bail out at its next per-JPEG check
+     * (~1.7 s typical) but not enough for a long pimslo encode —
+     * for that we just refuse and let the user retry. */
+    const uint32_t WAIT_TIMEOUT_MS = 5000;
+    uint32_t t_start = esp_log_timestamp();
+    while (!format_workers_idle()) {
+        if (esp_log_timestamp() - t_start > WAIT_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "Settings: format_sd refused — bg workers busy after %lu ms (encoding=%d capturing=%d queue=%d)",
+                     (unsigned long)WAIT_TIMEOUT_MS,
+                     app_gifs_is_encoding() || app_pimslo_is_encoding(),
+                     app_pimslo_is_capturing(),
+                     app_pimslo_get_queue_depth());
+            lv_async_call(format_done_async_cb,
+                          (void *)(intptr_t)ESP_ERR_TIMEOUT);
+            vTaskDelete(NULL);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    /* Slow phase — no LVGL lock so the modal animation keeps running. */
+    sdmmc_card_t *card = NULL;
+    err = bsp_get_sdcard_handle(&card);
+    if (err == ESP_OK && card != NULL) {
+        ESP_LOGI(TAG, "Settings: format_sd starting (BG task)");
+        uint32_t t0 = esp_log_timestamp();
+        err = esp_vfs_fat_sdcard_format(BSP_SD_MOUNT_POINT, card);
+        ESP_LOGI(TAG, "Settings: format_sd done err=0x%x in %lu ms",
+                 err, (unsigned long)(esp_log_timestamp() - t0));
+        if (err == ESP_OK) {
+            mkdir("/sdcard/p4mslo", 0755);
+            mkdir("/sdcard/p4mslo_gifs", 0755);
+            mkdir("/sdcard/p4mslo_small", 0755);
+            mkdir("/sdcard/p4mslo_previews", 0755);
+        }
+    } else {
+        err = (err == ESP_OK) ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    /* Post-format LVGL cleanup — rescan rebuilds the (now-empty)
+     * gallery and refreshes the empty-album overlay. */
+    bsp_display_lock(0);
+    app_gifs_scan();
+    app_gifs_refresh_empty_overlay();
+    bsp_display_unlock();
+
+    /* Hand back to the LVGL task to tear down the progress modal. */
+    lv_async_call(format_done_async_cb, (void *)(intptr_t)err);
+    vTaskDelete(NULL);
+}
+
+/* Called from the SELECT-YES button handler on the LVGL task. Swaps
+ * the modal layout to "Formatting" + animated dots, starts the dot
+ * animation timer, and spawns the format BG task. */
+static void start_format_progress(void)
+{
+    if (s_format_in_progress) return;
+
+    /* Swap modal contents: hide YES/NO, change title to "Formatting". */
+    if (ui_BtnSettingsFormatYes) {
+        lv_obj_add_flag(ui_BtnSettingsFormatYes, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_BtnSettingsFormatNo) {
+        lv_obj_add_flag(ui_BtnSettingsFormatNo, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_PanelSettingsFormatTitle) {
+        lv_label_set_text(ui_PanelSettingsFormatTitle, "Formatting");
+    }
+
+    s_format_dot_count = 0;
+    if (s_format_progress_timer) {
+        lv_timer_del(s_format_progress_timer);
+    }
+    s_format_progress_timer = lv_timer_create(format_progress_tick_cb, 350, NULL);
+
+    s_format_in_progress = true;
+    /* Pinned to Core 1 to keep Core 0 free for LVGL rendering. Stack
+     * 8 KB — 4 KB blew up inside the post-format app_gifs_scan() call
+     * chain (opendir + entries[] alloc + tjpgd-adjacent paths put a
+     * surprising amount on stack). Same bracket as pimslo_cap and
+     * larger than pimslo_save (6 KB). */
+    BaseType_t ok = xTaskCreatePinnedToCore(format_bg_task, "fmt_sd",
+                                            8192, NULL, 4, NULL, 1);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "format_sd: failed to create BG task");
+        /* Unwind the UI changes so the user isn't stuck on a stalled
+         * progress modal. */
+        s_format_in_progress = false;
+        lv_async_call(format_done_async_cb, (void *)(intptr_t)ESP_ERR_NO_MEM);
+    }
+}
+
 /**
  * @brief Popup timer callback
  * @param timer Timer object
@@ -1092,6 +1443,9 @@ static void ui_extra_leaving_main(void)
     /* Hide the delete modal if the user was in the middle of confirming
      * when they navigated away, so it doesn't reappear on re-entry. */
     gifs_delete_modal_hide();
+    /* Same for the settings → delete-all modal. Lazy-created, so the
+     * hide is a no-op until the user has opened it at least once. */
+    settings_format_modal_hide();
     /* Hide the empty-album / SD-error overlay so other pages don't see
      * it leaked into their layout. Refreshed on next gallery entry. */
     app_gifs_refresh_empty_overlay();    /* no-op when count>0 */
@@ -1541,7 +1895,17 @@ uint16_t app_extra_get_interval_time(void)
 void ui_extra_set_sd_card_mounted(bool mounted)
 {
     is_sd_card_mounted = mounted;
-    
+
+    /* Settings page: keep the DELETE ALL slot in sync with SD state. If
+     * the user yanks the card while the confirm modal is up, hide the
+     * modal — the action would no-op. */
+    if (current_page == UI_PAGE_SETTINGS) {
+        if (!mounted && settings_format_modal_open()) {
+            settings_format_modal_hide();
+        }
+        update_format_sd_display();
+    }
+
     if(current_page != UI_PAGE_CAMERA && current_page != UI_PAGE_INTERVAL_CAM && current_page != UI_PAGE_VIDEO_MODE && current_page != UI_PAGE_ALBUM) {
         return;
     }
@@ -1744,6 +2108,13 @@ void ui_extra_btn_up(void)
             break;
             
         case UI_PAGE_SETTINGS:
+            /* Format in flight — block input until BG task completes. */
+            if (s_format_in_progress) break;
+            /* Modal up: up/down toggles YES/NO selection. */
+            if (settings_format_modal_open()) {
+                settings_format_modal_toggle_focus();
+                break;
+            }
             if (is_camera_settings_panel_active) {
                 // camera settings panel is active
                 if(current_camera_settings_item == 0) {
@@ -1761,7 +2132,7 @@ void ui_extra_btn_up(void)
                 }
             }
             break;
-            
+
         case UI_PAGE_CAMERA:
         case UI_PAGE_VIDEO_MODE:
             app_extra_set_magnification_factor(2);
@@ -1832,6 +2203,13 @@ void ui_extra_btn_down(void)
             break;
             
         case UI_PAGE_SETTINGS:
+            /* Format in flight — block input until BG task completes. */
+            if (s_format_in_progress) break;
+            /* Modal up: up/down toggles YES/NO selection. */
+            if (settings_format_modal_open()) {
+                settings_format_modal_toggle_focus();
+                break;
+            }
             if (is_camera_settings_panel_active) {
                 // camera settings panel is active
                 if(current_camera_settings_item < 4) {
@@ -1847,7 +2225,7 @@ void ui_extra_btn_down(void)
                 }
             }
             break;
-            
+
         case UI_PAGE_CAMERA:
         case UI_PAGE_VIDEO_MODE:
             app_extra_set_magnification_factor(3);
@@ -2046,6 +2424,23 @@ void ui_extra_btn_menu(void)
             break;
             
         case UI_PAGE_SETTINGS:
+            /* Format in flight — ignore all input until BG task finishes
+             * + format_done_async_cb runs. Prevents the user from
+             * navigating away or re-confirming mid-format. */
+            if (s_format_in_progress) break;
+            /* Modal up: SELECT confirms (YES → kick off the BG format
+             * task, modal swaps to the animated "Formatting" overlay;
+             * NO → just close the modal). */
+            if (settings_format_modal_open()) {
+                if (settings_format_modal_yes_focused()) {
+                    start_format_progress();
+                } else {
+                    settings_format_modal_hide();
+                    update_format_sd_display();
+                }
+                break;
+            }
+
             if(is_camera_settings_panel_active && current_camera_settings_item == 4 && camera_settings_items[current_camera_settings_item] == ui_PanelSettingsMenu) {
                 // If current setting item is menu item, return to main page
                 ui_extra_goto_page(UI_PAGE_MAIN);
@@ -2063,11 +2458,25 @@ void ui_extra_btn_menu(void)
                 lv_obj_add_flag(ui_PanelSettings, LV_OBJ_FLAG_HIDDEN);
 
                 app_video_stream_set_photo_resolution_by_string(current_settings.resolution);
+            } else if (!is_camera_settings_panel_active && current_settings_item == 1) {
+                /* Slot 1 is DELETE ALL. Greyed out when SD missing — do
+                 * nothing. Otherwise refuse if a capture / encode is in
+                 * flight, else open the confirm modal. */
+                if (!ui_extra_get_sd_card_mounted()) break;
+                if (app_pimslo_is_capturing() || app_pimslo_is_encoding() ||
+                    app_gifs_is_encoding() || app_pimslo_get_queue_depth() > 0) {
+                    ESP_LOGW(TAG, "Settings: delete_all refused (busy)");
+                    break;
+                }
+                settings_format_modal_show();
             } else {
-                // Otherwise, cycle through options
+                // Otherwise, cycle through options (slots 0/2/3 only —
+                // slot 1 is handled above; slot 4 is the menu item)
                 setting_options_t* opt = &settings_options[current_settings_item];
-                opt->current_option = (opt->current_option + 1) % opt->option_count;
-                update_setting_display(current_settings_item);
+                if (opt->options && opt->option_count > 0) {
+                    opt->current_option = (opt->current_option + 1) % opt->option_count;
+                    update_setting_display(current_settings_item);
+                }
             }
             break;
             
@@ -2280,6 +2689,24 @@ void ui_extra_btn_encoder(void)
                 is_video_recording = false;
                 if (lv_video_timer) {
                     lv_timer_pause(lv_video_timer);
+                }
+            }
+            break;
+
+        case UI_PAGE_SETTINGS:
+            /* Encoder on the settings page only matters when the format
+             * modal is open — same dual-button confirm pattern as the
+             * gallery (either button can answer YES/NO). When the modal
+             * is closed, encoder is a no-op; the menu button drives all
+             * settings navigation. Ignored entirely while a format is
+             * in flight. */
+            if (s_format_in_progress) break;
+            if (settings_format_modal_open()) {
+                if (settings_format_modal_yes_focused()) {
+                    start_format_progress();
+                } else {
+                    settings_format_modal_hide();
+                    update_format_sd_display();
                 }
             }
             break;

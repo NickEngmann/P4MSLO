@@ -112,6 +112,14 @@ static inline bool bsp_sdcard_is_present(void) { return mock_bsp_sd_present; }
 static inline esp_err_t bsp_sdcard_mount(void) { return ESP_OK; }
 static inline esp_err_t bsp_sdcard_unmount(void) { return ESP_OK; }
 
+/* SD card handle stub — the simulator never actually formats anything,
+ * but ui_extra.c's format BG task references the symbol and type. */
+typedef struct sdmmc_card { int dummy; } sdmmc_card_t;
+static inline esp_err_t bsp_get_sdcard_handle(sdmmc_card_t **card) {
+    if (card) *card = NULL;
+    return ESP_OK;
+}
+
 static inline esp_err_t bsp_knob_init(void) { return ESP_OK; }
 static inline esp_err_t bsp_knob_register_cb(knob_event_t event, knob_cb_t cb, void *data) {
     (void)event; (void)cb; (void)data; return ESP_OK;

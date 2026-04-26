@@ -27,6 +27,8 @@
 #include "esp_private/esp_cache_private.h"
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
+#include "bsp/esp32_p4_eye.h"     /* bsp_get_sdcard_handle for format_sd */
+#include "esp_vfs_fat.h"          /* esp_vfs_fat_sdcard_format */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"  /* xTaskCreatePinnedToCoreWithCaps */
@@ -1732,6 +1734,66 @@ esp_err_t app_gifs_delete_current(void)
         s_ctx.current_index = 0;
     }
 
+    return ESP_OK;
+}
+
+void app_gifs_signal_bg_abort(void)
+{
+    s_last_nav_ms = esp_log_timestamp();
+    s_bg_abort_current = true;
+}
+
+esp_err_t app_gifs_format_sd(void)
+{
+    if (!ui_extra_get_sd_card_mounted()) {
+        ESP_LOGW(TAG, "format_sd: SD not mounted, refusing");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    sdmmc_card_t *card = NULL;
+    esp_err_t err = bsp_get_sdcard_handle(&card);
+    if (err != ESP_OK || card == NULL) {
+        ESP_LOGE(TAG, "format_sd: bsp_get_sdcard_handle failed (err=0x%x)", err);
+        return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    /* Drop the foreground player + cross-GIF cache (cache key is the
+     * file path — those paths are about to vanish). Nudge bg_worker
+     * abort so it doesn't try to reopen a file mid-format. */
+    app_gifs_stop();
+    app_gifs_flush_cache();
+    s_last_nav_ms = esp_log_timestamp();
+    s_bg_abort_current = true;
+
+    ESP_LOGI(TAG, "format_sd: starting esp_vfs_fat_sdcard_format on %s",
+             BSP_SD_MOUNT_POINT);
+    uint32_t t0 = esp_log_timestamp();
+    err = esp_vfs_fat_sdcard_format(BSP_SD_MOUNT_POINT, card);
+    uint32_t dt = esp_log_timestamp() - t0;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "format_sd: format failed err=0x%x after %lu ms",
+                 err, (unsigned long)dt);
+        /* Try to refresh the gallery anyway — partial-format leaves
+         * an indeterminate FS, but the rescan won't make it worse. */
+        app_gifs_scan();
+        app_gifs_refresh_empty_overlay();
+        return err;
+    }
+    ESP_LOGI(TAG, "format_sd: done in %lu ms", (unsigned long)dt);
+
+    /* Recreate the PIMSLO output directories so the next capture /
+     * encode doesn't trip on ENOENT. Mirrors the lazy mkdirs scattered
+     * across pimslo_save_task / encode pipeline / ensure_small_dir(). */
+    char gif_dir[MAX_PATH_LEN];
+    snprintf(gif_dir, sizeof(gif_dir), "%s/%s",
+             BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME);
+    mkdir("/sdcard/p4mslo", 0755);
+    mkdir(gif_dir, 0755);
+    mkdir(P4MS_DIR, 0755);
+    mkdir(PIMSLO_PREVIEW_DIR, 0755);
+
+    app_gifs_scan();
+    app_gifs_refresh_empty_overlay();
     return ESP_OK;
 }
 

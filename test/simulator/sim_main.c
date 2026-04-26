@@ -374,6 +374,40 @@ static void run_screenshot_mode(void)
     PUMP_MS(300);
     SCREENSHOT("settings_encoder_press");
 
+    /* ===== 4b. Format SD slot — both SD states =====
+     * Slot 1 is the "Format SD" action item. With SD present the
+     * label is black + clickable (SELECT opens the confirm modal).
+     * With SD absent the label is grey + SELECT is a no-op. The
+     * row has no body text either way — it's an action, not a
+     * toggle. */
+    GOTO_PAGE(UI_PAGE_SETTINGS);
+    ui_extra_btn_down();          /* slot 0 → slot 1 (Format SD) */
+    PUMP_MS(300);
+    SCREENSHOT("settings_format_sd_ready");
+
+    ui_extra_btn_menu();          /* SELECT — opens the modal */
+    PUMP_MS(300);
+    SCREENSHOT("settings_format_modal_no");
+    ui_extra_btn_up();            /* toggle YES */
+    PUMP_MS(300);
+    SCREENSHOT("settings_format_modal_yes");
+    ui_extra_btn_down();          /* back to NO (cancel-default) */
+    PUMP_MS(300);
+    ui_extra_btn_menu();          /* confirm NO → modal closes */
+    PUMP_MS(300);
+
+    /* Now flip SD off and re-enter to capture the greyed-out state. */
+    ui_extra_set_sd_card_mounted(false);
+    PUMP_MS(300);
+    SCREENSHOT("settings_format_sd_nosd");
+    /* Try to open the modal — should NOT open (SD missing guard). */
+    ui_extra_btn_menu();
+    PUMP_MS(300);
+    SCREENSHOT("settings_format_sd_nosd_select_noop");
+    /* Restore SD for the rest of the screenshot run. */
+    ui_extra_set_sd_card_mounted(true);
+    PUMP_MS(300);
+
     /* ===== 5. VIDEO MODE PAGE ===== */
     printf("\n[SIM] === Video Mode Screenshots ===\n");
     GOTO_PAGE(UI_PAGE_VIDEO_MODE);
@@ -392,28 +426,10 @@ static void run_screenshot_mode(void)
     PUMP_MS(300);
     SCREENSHOT("video_mode_btn_up");
 
-    /* ===== 6. AI DETECT PAGE ===== */
-    printf("\n[SIM] === AI Detection Screenshots ===\n");
-    GOTO_PAGE(UI_PAGE_AI_DETECT);
-    SCREENSHOT("ai_detect_main");
-
-    /* Cycle through AI modes */
-    ui_extra_btn_encoder();
-    PUMP_MS(300);
-    SCREENSHOT("ai_detect_mode2");
-
-    ui_extra_btn_encoder();
-    PUMP_MS(300);
-    SCREENSHOT("ai_detect_mode3");
-
-    /* Zoom via knob */
-    ui_extra_btn_right();
-    PUMP_MS(300);
-    SCREENSHOT("ai_detect_zoom_in");
-
-    ui_extra_btn_left();
-    PUMP_MS(300);
-    SCREENSHOT("ai_detect_zoom_out");
+    /* ===== 6. AI DETECT PAGE — REMOVED =====
+     * UI_PAGE_AI_DETECT and the entire AI detection feature were
+     * stripped from the codebase. Page-skip kept here for screenshot
+     * numbering continuity with older runs. */
 
     /* ===== 7. INTERVAL CAMERA PAGE ===== */
     printf("\n[SIM] === Interval Camera Screenshots ===\n");

@@ -56,6 +56,25 @@ esp_err_t app_gifs_prev(void);
  */
 esp_err_t app_gifs_delete_current(void);
 
+/**
+ * @brief Quick-format the SD card.
+ *
+ * Calls esp_vfs_fat_sdcard_format on the mounted card — recreates
+ * the FAT structures in-place (no need to unmount/remount, no full
+ * block erase). Wipes EVERYTHING: PIMSLO captures + previews + GIFs
+ * AND the regular P4-photo album in /sdcard/esp32_p4_pic_save AND
+ * any user-placed files. After format, recreates the four PIMSLO
+ * directories so subsequent captures don't trip on ENOENT, then
+ * rescans the gallery so count drops to 0 and the empty-album
+ * overlay flips on.
+ *
+ * Returns ESP_ERR_INVALID_STATE if SD is unmounted, or whatever
+ * esp_vfs_fat_sdcard_format returns. Caller must verify no PIMSLO
+ * capture / save / encode is in flight — formatting under an active
+ * write will brick the FATFS state.
+ */
+esp_err_t app_gifs_format_sd(void);
+
 /** @brief Start playback of the current GIF */
 esp_err_t app_gifs_play_current(void);
 
@@ -96,6 +115,20 @@ esp_err_t app_gifs_create_from_album(int frame_delay_ms, int max_frames);
 
 /** @brief Check if GIF creation is in progress */
 bool app_gifs_is_encoding(void);
+
+/**
+ * @brief Ask the bg_worker to abort whatever it's doing right now.
+ *
+ * Sets the internal s_bg_abort_current flag and bumps s_last_nav_ms,
+ * which together cause bg_worker to (a) exit its current pre-render
+ * or stale-encode iteration at the next per-frame / per-JPEG check
+ * point, and (b) suppress new bg work for the next ~15 s. Used by
+ * the Settings → Format SD path so the format doesn't unmount the
+ * filesystem out from under an open bg-worker file handle. Caller
+ * should poll app_gifs_is_encoding() afterwards to confirm idle
+ * before proceeding with the destructive action.
+ */
+void app_gifs_signal_bg_abort(void);
 
 /**
  * @brief Create a PIMSLO stereoscopic 3D GIF from 4 camera JPEGs on SD card

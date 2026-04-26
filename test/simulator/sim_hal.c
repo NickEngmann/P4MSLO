@@ -421,3 +421,26 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *dir, int delay_ms, float p
     printf("[SIM] app_gifs_encode_pimslo_from_dir(%s, %d, %.2f)\n", dir, delay_ms, parallax);
     return ESP_OK;
 }
+
+/* PIMSLO + extended app_gifs / video_stream stubs for the simulator.
+ * These let ui_extra.c link without pulling in the real Pimslo / video
+ * / encoder pipelines (which need ESP-IDF). All safe no-ops. */
+esp_err_t app_gifs_delete_current(void) { return ESP_OK; }
+esp_err_t app_gifs_format_sd(void) {
+    printf("[SIM] app_gifs_format_sd\n");
+    return ESP_OK;
+}
+void app_gifs_signal_bg_abort(void) {}
+void app_gifs_flush_cache(void) {}
+void app_gifs_refresh_empty_overlay(void) {}
+void app_gifs_set_gallery_open(bool open) { (void)open; }
+bool app_gifs_gallery_ever_opened(void) { return false; }
+void app_gifs_start_background_worker(void) {}
+
+bool app_pimslo_is_capturing(void)  { return false; }
+bool app_pimslo_is_encoding(void)   { return false; }
+int  app_pimslo_get_queue_depth(void) { return 0; }
+uint16_t app_pimslo_encoding_capture_num(void) { return 0; }
+
+void app_video_stream_realloc_buffers(void) {}
+void app_video_stream_free_buffers(void) {}

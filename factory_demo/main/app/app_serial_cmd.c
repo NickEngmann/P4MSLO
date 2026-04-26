@@ -404,6 +404,43 @@ static void cmd_sd_rmrf(const char *path)
     cmd_respond("ok sd_rmrf %s: %d removed, %d failed", path, removed, failed);
 }
 
+/* Quick-format the SD card. Mirrors the Settings → Format SD UI button.
+ * Refuses if SD is unmounted or any capture / save / encode is in flight
+ * (formatting under an active write trashes the FATFS state). Wipes
+ * EVERYTHING — PIMSLO + the regular P4 album + any user files. */
+static void cmd_format_sd(void)
+{
+    if (!ui_extra_get_sd_card_mounted()) {
+        cmd_respond("error: format_sd SD not mounted");
+        return;
+    }
+    if (app_pimslo_is_capturing()) {
+        cmd_respond("error: format_sd busy (pimslo_capturing)");
+        return;
+    }
+    if (app_pimslo_is_encoding() || app_gifs_is_encoding()) {
+        cmd_respond("error: format_sd busy (encoding)");
+        return;
+    }
+    if (app_pimslo_get_queue_depth() > 0) {
+        cmd_respond("error: format_sd busy (pimslo_queue=%d)",
+                    app_pimslo_get_queue_depth());
+        return;
+    }
+
+    /* Take the LVGL lock — the scan + refresh-overlay tail touches LVGL
+     * widgets (gallery entry list, empty-overlay label). */
+    bsp_display_lock(0);
+    esp_err_t err = app_gifs_format_sd();
+    bsp_display_unlock();
+
+    if (err != ESP_OK) {
+        cmd_respond("error: format_sd failed (err=0x%x)", err);
+        return;
+    }
+    cmd_respond("ok format_sd");
+}
+
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static void cmd_sd_base64(const char *args)
@@ -851,6 +888,8 @@ static void dispatch_command(char *line)
         cmd_sd_rm(arg);
     } else if (strcmp(line, "sd_rmrf") == 0) {
         cmd_sd_rmrf(arg);
+    } else if (strcmp(line, "format_sd") == 0) {
+        cmd_format_sd();
     } else if (strcmp(line, "sd_base64") == 0) {
         cmd_sd_base64(arg ? arg : "");
     } else {

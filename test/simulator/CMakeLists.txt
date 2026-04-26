@@ -92,6 +92,7 @@ target_include_directories(p4eye_sim PRIVATE
     ${REPO_ROOT}/factory_demo/main/app
     ${REPO_ROOT}/factory_demo/main/app/Video
     ${REPO_ROOT}/factory_demo/main/app/Gif
+    ${REPO_ROOT}/factory_demo/main/app/Pimslo
 
     # SDL2
     ${SDL2_INCLUDE_DIRS}

@@ -455,6 +455,34 @@ static void pimslo_encode_queue_task(void *param)
         /* Block until a job is available */
         xQueueReceive(s_gif_queue, &job, portMAX_DELAY);
 
+        /* CLAIM THE JOB IMMEDIATELY — set s_encoding + capture_num
+         * BEFORE the defer loop. Why this matters:
+         *   - format_workers_idle() in ui_extra.c uses
+         *     app_pimslo_is_encoding() to gate format_sd. Pre-fix,
+         *     s_encoding was only set after exiting the defer loop,
+         *     so a job that was popped-but-deferred reported
+         *     pimslo_queue=0 AND pimslo_encoding=0 — invisible to
+         *     the format gate. Format would wipe the source dir
+         *     while the encoder waited; encoder later resumed and
+         *     panic'd on missing pos*.jpg files (user reports:
+         *     "first photo errors after format", "P4 crashes on
+         *     Queued→Processing", "entry stuck in Queued forever").
+         *   - The gallery's PROCESSING-vs-QUEUED badge also needs
+         *     this: the badge driver checks
+         *     app_pimslo_encoding_capture_num() to decide which
+         *     entry says "PROCESSING". Setting s_encoding_num up
+         *     front means the badge transitions QUEUED→PROCESSING
+         *     the moment the encoder commits, not when defer ends.
+         *
+         * Net cost: tests/code paths that observe is_encoding while
+         * the encoder is in defer get "true" instead of "false".
+         * The defer is invisible to the user anyway (encoder is
+         * waiting for the user to leave the camera page), so the
+         * earlier "true" is what consumers should have been seeing
+         * all along. */
+        s_encoding = true;
+        s_encoding_num = job.capture_num;
+
         /* Defer encoding until the user is off a camera page. Demoted
          * to DEBUG because e2e test 08 uses the presence of any
          * "Deferring" log line in Phase A as its proxy for "did the
@@ -474,9 +502,6 @@ static void pimslo_encode_queue_task(void *param)
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
 
-        s_encoding = true;
-        s_encoding_num = job.capture_num;
-
         /* If the user is on the gallery right now, pause playback and
          * flush the canvas cache — that's ~3.5 MB of PSRAM we need back
          * for the encoder's 7 MB scaled_buf. The gallery will re-open
@@ -489,6 +514,32 @@ static void pimslo_encode_queue_task(void *param)
         char dir_path[64];
         snprintf(dir_path, sizeof(dir_path), "%s/P4M%04d",
                  PIMSLO_BASE_DIR, job.capture_num);
+
+        /* Guard: if the source dir doesn't have at least 2 pos*.jpg
+         * files, skip the encode. Possible causes: format_sd ran
+         * while this job was deferred (rare now that the format
+         * gate sees s_encoding earlier — see job-claim above), the
+         * dir was manually deleted from a debug shell, or the SD
+         * filesystem is in some unexpected state. The encoder
+         * itself logs "Need at least 2 cameras, found 0" and
+         * returns ESP_FAIL on this case, but it gets there after
+         * allocating the 7 MB scaled_buf — wasting memory and SD
+         * I/O on a path we know will fail. Bail early here. */
+        int src_pos_files = 0;
+        for (int i = 1; i <= 4; i++) {
+            char p[80];
+            snprintf(p, sizeof(p), "%s/pos%d.jpg", dir_path, i);
+            struct stat st;
+            if (stat(p, &st) == 0 && st.st_size > 0) src_pos_files++;
+        }
+        if (src_pos_files < 2) {
+            ESP_LOGW(TAG, "Skip encode P4M%04d — only %d/4 pos files on disk "
+                          "(stale job after format / wipe?)",
+                     job.capture_num, src_pos_files);
+            s_encoding = false;
+            s_encoding_num = 0;
+            continue;
+        }
 
         ESP_LOGI(TAG, "Encoding GIF from %s (queue remaining: %d)",
                  dir_path, (int)uxQueueMessagesWaiting(s_gif_queue));

@@ -316,12 +316,13 @@ static void scan_async_cb(void *arg)
     (void)arg;
     app_gifs_scan();
     if (ui_extra_get_current_page() == UI_PAGE_GIFS) {
+        /* Always refresh — the count may have just transitioned from
+         * 0 (overlay visible) to >0 (overlay must hide). Without
+         * this, the "Album empty" label persists on top of the
+         * newly-encoded entry. */
+        app_gifs_refresh_empty_overlay();
         if (app_gifs_get_count() > 0) {
             app_gifs_play_current();
-        } else {
-            /* Nothing to play — make sure the empty-state overlay is
-             * up to date (e.g. after deleting the last entry). */
-            app_gifs_refresh_empty_overlay();
         }
     }
 }

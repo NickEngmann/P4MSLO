@@ -984,6 +984,162 @@ SCENARIO(concurrent_encodes_serialize_decoder_dance)
     ASSERT(album_ppa_held(), "PPA restored at the end");
 }
 
+/* ------------------------------------------------------------------ *
+ * Bug 1 + 2 + 3 — format-related races (2026-04-26 user reports):
+ *  1. After format, first photo errors but second works.
+ *  2. After format, photo → gallery nav crashes during Queued→Processing.
+ *  3. After format, photo → gallery shows "Album empty" overlay
+ *     OVER the entry's "Processing" badge + filename.
+ *
+ * The shared root cause was the encoder defer-loop window: a job is
+ * popped off the queue and `s_encoding` only gets set AFTER the defer
+ * loop exits. So during the window the firmware reports
+ * pimslo_queue=0 + pimslo_encoding=0, and format_workers_idle() wipes
+ * the source dir from under the encoder.
+ *
+ * After fix:
+ *   - Encoder claims s_encoding (or equivalent in-flight flag) the
+ *     moment it pops the job, BEFORE entering the defer loop.
+ *   - Format gates on that same flag → refuses with "busy".
+ *   - Empty-overlay refresh runs on EVERY gallery_enter, not just
+ *     when count==0, so empty→non-empty transitions clear the label.
+ * ------------------------------------------------------------------ */
+SCENARIO(format_with_no_jobs_in_flight_succeeds)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_SETTINGS);
+
+    /* Idle device — no jobs, no encodes. */
+    format_result_t r = pimslo_sim_format_sd();
+    ASSERT(r == FORMAT_OK, "idle format must succeed");
+    ASSERT(gallery_count() == 0, "post-format gallery is empty");
+}
+
+SCENARIO(format_refused_when_encoder_actively_running)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+
+    /* Job is in the encode queue. Format must refuse. */
+    format_result_t r = pimslo_sim_format_sd();
+    ASSERT(r == FORMAT_REFUSED_BUSY,
+           "format must refuse when encoder pipeline is in flight");
+    /* Drain so the test is hygienic. */
+    pimslo_sim_wait_idle(240 * 1000);
+}
+
+SCENARIO(format_refused_when_encoder_deferred_in_flight)
+{
+    /* THE BUG path: encoder has popped a job off the queue and is
+     * sitting in defer-loop because user is on UI_PAGE_CAMERA. Pre-
+     * fix, format_workers_idle() couldn't see this — pimslo_queue=0
+     * AND s_encoding=0 because s_encoding wasn't set until after
+     * defer exit. After fix, the in-flight flag is set on job-pop
+     * and the format check sees the encoder is busy. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    /* Move user to CAMERA so the next wait_idle iteration enters
+     * defer-loop (and sets s_deferred_in_flight=true). */
+    ui_extra_set_current_page(UI_PAGE_CAMERA);
+    /* One iteration of the defer loop: claims the job, ages 100ms. */
+    pimslo_sim_wait_idle(100);
+
+    ASSERT(app_pimslo_is_encoding_or_deferred(),
+           "encoder must report busy while in defer loop");
+
+    format_result_t r = pimslo_sim_format_sd();
+    ASSERT(r == FORMAT_REFUSED_BUSY,
+           "format must refuse while encoder has a deferred job");
+    ASSERT(pimslo_sim_deferred_jobs_lost_count() == 0,
+           "no deferred jobs should be lost (format refused)");
+
+    /* Move user off camera so encoder can finish. */
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(gallery_count() == 1, "encode finished cleanly after format refusal");
+}
+
+SCENARIO(format_then_first_photo_no_collision)
+{
+    /* Bug 1 user-reported: "If you format the SD card, the first
+     * picture you take always errors." Once format correctly waits
+     * for the encoder to drain BEFORE wiping, the first-photo path
+     * has a clean state — no in-flight jobs pointing at wiped dirs,
+     * no stale flags. We model the ideal sequence: format succeeds,
+     * then user goes to camera, then a 4-cam capture lands without
+     * tripping the error overlay. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_SETTINGS);
+    format_result_t r = pimslo_sim_format_sd();
+    ASSERT(r == FORMAT_OK, "format succeeds when idle");
+
+    ui_extra_set_current_page(UI_PAGE_CAMERA);
+    pimslo_sim_capture_result_t cap = pimslo_sim_photo_btn(4);
+    ASSERT(cap.cams_usable == 4, "first capture lands 4/4");
+    ASSERT(!capture_error_pending(), "no ERROR overlay on a 4/4 capture");
+
+    /* Drain encoder (off camera). */
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(gallery_count() == 1, "encode landed");
+}
+
+SCENARIO(empty_overlay_hides_after_count_zero_to_one_transition)
+{
+    /* Bug 3 user-reported: after format, gallery shows "Album empty"
+     * AND the just-taken photo's "Processing" badge + filename
+     * overlapping. Root cause: ui_extra_redirect_to_gifs_page only
+     * called refresh_empty_overlay() in the count==0 branch.
+     *
+     * Repro: format → gallery shows empty overlay (count=0 + visible).
+     * Take a photo (off camera, encode runs). Re-enter gallery.
+     * Pre-fix: visibility stays true (because count>0 branch never
+     * called refresh). Post-fix: visibility false. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_SETTINGS);
+    pimslo_sim_format_sd();
+
+    /* User enters empty gallery — overlay should be visible. */
+    gallery_enter();
+    ASSERT(gallery_overlay_visible(), "empty gallery shows the overlay");
+    ASSERT(gallery_count() == 0, "count is 0 after format");
+
+    /* User goes to MAIN, takes a photo, encode runs. */
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(gallery_count() == 1, "encode finished, gallery has 1 entry");
+
+    /* Re-enter gallery — overlay must be hidden now (count > 0). */
+    gallery_enter();
+    ASSERT(!gallery_overlay_visible(),
+           "non-empty gallery must HIDE the empty overlay (bug 3 fix)");
+}
+
+SCENARIO(empty_overlay_visible_when_format_leaves_zero_entries)
+{
+    /* The other half of bug 3: after format, the overlay should be
+     * showing. (Post-fix this still works because format calls scan
+     * + refresh_empty_overlay regardless of whether count was 0
+     * before format.) */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    /* Build up some entries first. */
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(gallery_count() == 1, "have one entry pre-format");
+
+    /* Format wipes everything. */
+    ui_extra_set_current_page(UI_PAGE_SETTINGS);
+    format_result_t r = pimslo_sim_format_sd();
+    ASSERT(r == FORMAT_OK, "format succeeds after drain");
+    ASSERT(gallery_count() == 0, "post-format gallery is empty");
+    ASSERT(gallery_overlay_visible(),
+           "post-format empty gallery shows overlay immediately");
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -1039,6 +1195,13 @@ int main(void)
     RUN(album_reacquire_failure_is_non_fatal);
     RUN(album_dance_alloc_releases_psram_for_encoder);
     RUN(concurrent_encodes_serialize_decoder_dance);
+
+    RUN(format_with_no_jobs_in_flight_succeeds);
+    RUN(format_refused_when_encoder_actively_running);
+    RUN(format_refused_when_encoder_deferred_in_flight);
+    RUN(format_then_first_photo_no_collision);
+    RUN(empty_overlay_hides_after_count_zero_to_one_transition);
+    RUN(empty_overlay_visible_when_format_leaves_zero_entries);
 
     printf("\n=== Results ===\n  PASS: %d\n  FAIL: %d\n", passed, fails);
     return (fails > 0) ? 1 : 0;

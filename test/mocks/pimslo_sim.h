@@ -291,3 +291,73 @@ typedef enum {
 
 void pimslo_sim_set_architecture(pimslo_sim_arch_t arch);
 pimslo_sim_arch_t pimslo_sim_architecture(void);
+
+/* ========================================================================
+ * SD format model (mirrors ui_extra.c::format_bg_task + format_workers_idle)
+ *
+ * The on-device flow:
+ *   1. format_workers_idle() — refuses if pimslo_is_capturing /
+ *      pimslo_is_encoding / pimslo_get_queue_depth > 0.
+ *   2. f_mkfs() runs (~8 s on this board).
+ *   3. mkdir the four PIMSLO dirs.
+ *   4. gallery_scan() + refresh_empty_overlay() to rebuild UI state.
+ *
+ * THE BUG bug 1 + 2 model: when an encode job is in the queue and the
+ * encoder task is in its defer loop (user on UI_PAGE_CAMERA), s_encoding
+ * is NOT yet true and the queue depth is 0 (job already taken). So
+ * format_workers_idle() returns true even though there's a job in
+ * flight. format wipes the source dir; encoder later resumes and
+ * tries to encode a missing dir → fails / panics / leaves the entry
+ * stuck in QUEUED forever.
+ *
+ * Mock APIs:
+ *   pimslo_sim_format_sd()      attempts the format. Returns 0 on
+ *                                success, non-zero if refused (busy)
+ *                                or if a deferred-job-vs-format race
+ *                                was detected.
+ *   pimslo_sim_force_deferred_encode_in_flight(true)
+ *                                pretends an encoder job has been
+ *                                taken from the queue but is sitting
+ *                                in defer. Used to test that
+ *                                format_workers_idle now detects this
+ *                                state.
+ * ======================================================================== */
+typedef enum {
+    FORMAT_OK = 0,
+    FORMAT_REFUSED_BUSY,           /* something in pimslo pipeline */
+    FORMAT_DEFERRED_JOB_LOST,      /* legacy: format wiped a dir an
+                                    * in-defer encoder still expects.
+                                    * After fix, this should never
+                                    * happen. */
+} format_result_t;
+
+format_result_t pimslo_sim_format_sd(void);
+void pimslo_sim_force_deferred_encode_in_flight(bool yes);
+int  pimslo_sim_deferred_jobs_lost_count(void);
+
+/* ========================================================================
+ * Empty-overlay state (mirrors app_gifs.c::empty_label visibility)
+ *
+ * The "Album empty / Take a photo" label is shown when count==0 AND
+ * sd_ok. Once shown, it's only hidden by an explicit
+ * refresh_empty_overlay() call; the label widget has no auto-hide
+ * trigger. So if the gallery transitions empty→non-empty between two
+ * page-entries and refresh_empty_overlay isn't called, the overlay
+ * STAYS visible on top of the new entry's "QUEUED" badge — exactly
+ * the symptom the user reported as bug 3.
+ *
+ * Mock tracks: is the overlay currently visible?
+ * Test entry points:
+ *   gallery_overlay_visible()        — current visibility flag
+ *   gallery_enter()                  — simulates redirect_to_gifs_page
+ *                                       (calls scan + auto-refresh
+ *                                       overlay AFTER the fix)
+ * ======================================================================== */
+bool gallery_overlay_visible(void);
+void gallery_enter(void);    /* mirrors ui_extra_redirect_to_gifs_page */
+void gallery_refresh_empty_overlay(void);
+
+/* Public hook so tests can assert format's "busy when encoder
+ * deferred" detection works. Returns true while either s_is_encoding
+ * or s_deferred_in_flight is set. */
+bool app_pimslo_is_encoding_or_deferred(void);

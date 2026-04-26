@@ -1155,6 +1155,11 @@ static void format_bg_task(void *arg)
             mkdir("/sdcard/p4mslo_gifs", 0755);
             mkdir("/sdcard/p4mslo_small", 0755);
             mkdir("/sdcard/p4mslo_previews", 0755);
+            /* P4 photo path — the lazy mkdir in app_storage.c handles
+             * the missing case, but creating it up front avoids one
+             * "Directory doesn't exist, creating it" warning on the
+             * first photo after format. */
+            mkdir("/sdcard/esp32_p4_pic_save", 0755);
         }
     } else {
         err = (err == ESP_OK) ? ESP_ERR_INVALID_STATE : err;
@@ -1692,16 +1697,20 @@ static void ui_extra_redirect_to_gifs_page(void)
          * thumbnail instead of a silently-failed-to-start state — they
          * can navigate and the system will retry on the next redirect. */
         app_gifs_scan();
+        /* Refresh overlay UNCONDITIONALLY after every scan. Without
+         * this, an empty→non-empty transition (e.g. format SD then
+         * take a photo then re-enter gallery) leaves the previously-
+         * shown "Album empty" label visible on top of the new
+         * entry's PROCESSING badge — exactly the user-visible bug 3
+         * regression from 2026-04-26. The refresh hides the label
+         * when count > 0. */
+        app_gifs_refresh_empty_overlay();
         if (app_gifs_get_count() > 0) {
             if (app_gifs_is_encoding() || app_pimslo_is_encoding()) {
                 ESP_LOGI(TAG, "Gallery entry: encoder busy — skipping auto-play");
             } else {
                 app_gifs_play_current();
             }
-        } else {
-            /* Empty gallery — surface the "Album empty" overlay instead
-             * of leaving the user staring at a blank canvas. */
-            app_gifs_refresh_empty_overlay();
         }
     } else {
         lv_obj_clear_flag(ui_PanelGifsPopupSDWarning, LV_OBJ_FLAG_HIDDEN);

@@ -75,6 +75,35 @@ void gallery_inject_orphan_capture_dir(const char *stem, int pos_files)
 
 int gallery_orphan_cleanup_count(void) { return s_orphan_cleanup_count; }
 
+/* Empty-overlay visibility — sticky bool that mirrors the LVGL label
+ * widget. Set by refresh_empty_overlay (count==0 → visible, count>0
+ * → hidden). The bug 3 path was: after format the gallery was empty
+ * → overlay shown. User took a photo → gallery has 1 entry, but the
+ * gallery-entry path only refreshed the overlay when count==0. So
+ * the visible flag stayed true even though count>0 — that's the
+ * "Album empty" + "Processing" + filename overlap the user saw. */
+static bool s_overlay_visible = false;
+
+bool gallery_overlay_visible(void) { return s_overlay_visible; }
+
+void gallery_refresh_empty_overlay(void)
+{
+    /* Mirrors app_gifs.c::app_gifs_refresh_empty_overlay — visible
+     * when count==0, hidden otherwise. */
+    s_overlay_visible = (s_n_entries == 0);
+}
+
+/* Mirrors ui_extra.c::ui_extra_redirect_to_gifs_page after the
+ * fix: ALWAYS call refresh_empty_overlay after scan, regardless of
+ * count. */
+void gallery_enter(void)
+{
+    s_gallery_ever_opened = true;
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_scan();
+    gallery_refresh_empty_overlay();   /* THE FIX */
+}
+
 void gallery_init(void)
 {
     memset(s_entries, 0, sizeof(s_entries));
@@ -83,6 +112,10 @@ void gallery_init(void)
     s_is_encoding = false;
     s_is_playing  = false;
     s_gallery_ever_opened = false;
+    /* Don't reset s_overlay_visible here — tests want to assert
+     * "after format, overlay is visible because gallery is empty AND
+     * the scan ran". gallery_refresh_empty_overlay handles that
+     * explicitly. */
 }
 void gallery_scan(void)
 {
@@ -572,21 +605,84 @@ pimslo_sim_capture_result_t pimslo_sim_photo_btn(int cams_to_simulate)
     return r;
 }
 
+/* "Deferred encode in flight" state — a job has been popped off the
+ * queue and the encoder task is sitting in its 2 s defer-poll loop.
+ * Critical: BEFORE the firmware fix, s_is_encoding was only set after
+ * exiting the defer loop, and queue_depth was 0 (job already taken).
+ * format_workers_idle() couldn't see the job at all → format wiped
+ * the source dir → encoder later resumed → encode failed on missing
+ * dir. After the fix, we set this flag the moment the encoder
+ * commits to a job, and format_workers_idle treats it as "busy". */
+static bool s_deferred_in_flight = false;
+
+void pimslo_sim_force_deferred_encode_in_flight(bool yes)
+{
+    s_deferred_in_flight = yes;
+}
+
+bool app_pimslo_is_encoding_or_deferred(void)
+{
+    return s_is_encoding || s_deferred_in_flight;
+}
+
 int pimslo_sim_wait_idle(int max_wait_ms)
 {
     int waited = 0;
     while (s_encode_queue_depth > 0 && waited < max_wait_ms) {
         if (encode_should_defer()) {
-            /* Idle — encoder is waiting for safe page. */
+            /* Encoder has committed to the head-of-queue job and is
+             * polling for a safe page. The fix: claim the job now so
+             * format_workers_idle can see it. */
+            s_deferred_in_flight = true;
             s_sim_clock_ms += 100; waited += 100;
             continue;
         }
+        s_deferred_in_flight = false;
         encode_job_t job = s_encode_queue[s_encode_queue_head];
         s_encode_queue_head = (s_encode_queue_head + 1) % ENCODE_QUEUE_DEPTH_MAX;
         int t = run_encode_pipeline(job.n_cams, job.stem);
         waited += t;
     }
+    /* Only drop the in-flight flag when the queue actually drained.
+     * Hitting max_wait_ms while still deferred must leave the flag
+     * up — that's exactly the state format_workers_idle needs to
+     * detect. */
+    if (s_encode_queue_depth == 0) s_deferred_in_flight = false;
     return waited;
+}
+
+/* ========================================================================
+ * SD format model (mirrors ui_extra.c::format_bg_task)
+ * ======================================================================== */
+static int s_deferred_jobs_lost = 0;
+
+int pimslo_sim_deferred_jobs_lost_count(void)
+{
+    return s_deferred_jobs_lost;
+}
+
+format_result_t pimslo_sim_format_sd(void)
+{
+    /* Pre-format gate — mirrors format_workers_idle. Refuse if any
+     * pipeline stage is mid-flight, OR if a deferred encoder has
+     * already claimed a job (the bug path). */
+    if (s_is_encoding || s_deferred_in_flight ||
+        s_encode_queue_depth > 0) {
+        return FORMAT_REFUSED_BUSY;
+    }
+
+    /* Wipe the simulated SD layout. Mirrors esp_vfs_fat_sdcard_format
+     * + the four post-format mkdirs. */
+    gallery_init();
+    s_p4ms_count = s_gif_count = 0;
+    s_bg_pre_render_count = s_bg_re_encode_count = 0;
+
+    /* Post-format LVGL cleanup: scan rebuilds (now-empty) gallery and
+     * refreshes the empty-overlay. Mirrors ui_extra.c:1166-1168. */
+    gallery_scan();
+    gallery_refresh_empty_overlay();
+
+    return FORMAT_OK;
 }
 
 /* ========================================================================

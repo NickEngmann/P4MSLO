@@ -936,6 +936,7 @@ static void update_format_sd_display(void)
  * button input — the user can't navigate away or interact mid-format. */
 static volatile bool s_format_in_progress = false;
 static lv_timer_t   *s_format_progress_timer = NULL;
+static lv_timer_t   *s_format_dismiss_timer  = NULL;   /* one-shot 1.5s after success/fail */
 static int           s_format_dot_count = 0;
 
 static void format_progress_tick_cb(lv_timer_t *t)
@@ -949,17 +950,18 @@ static void format_progress_tick_cb(lv_timer_t *t)
     lv_label_set_text(ui_PanelSettingsFormatTitle, buf);
 }
 
-/* Scheduled via lv_async_call from the BG task — runs on LVGL task
- * context so widget mutation is safe. */
-static void format_done_async_cb(void *arg)
+/* Fires 1.5 s after format completes — actually closes the success/fail
+ * popup and returns the modal to its idle "Format?" layout. While this
+ * is pending s_format_in_progress stays true so input remains gated. */
+static void format_dismiss_cb(lv_timer_t *t)
 {
-    esp_err_t err = (esp_err_t)(intptr_t)arg;
-    if (s_format_progress_timer) {
-        lv_timer_del(s_format_progress_timer);
-        s_format_progress_timer = NULL;
+    (void)t;
+    if (s_format_dismiss_timer) {
+        lv_timer_del(s_format_dismiss_timer);
+        s_format_dismiss_timer = NULL;
     }
     /* Restore the modal to its idle "Format?" + YES/NO layout so the
-     * next time the user opens it, it's not stuck mid-progress. */
+     * next time the user opens it, it's not stuck on the success text. */
     if (ui_PanelSettingsFormatTitle) {
         lv_label_set_text(ui_PanelSettingsFormatTitle, "Format?");
     }
@@ -972,7 +974,42 @@ static void format_done_async_cb(void *arg)
     settings_format_modal_hide();
     update_format_sd_display();
     s_format_in_progress = false;
-    ESP_LOGI(TAG, "Settings: format done err=0x%x", err);
+}
+
+/* Scheduled via lv_async_call from the BG task — runs on LVGL task
+ * context so widget mutation is safe. Stops the dot animation, swaps
+ * the modal title to a brief success/fail message, and starts a
+ * one-shot 1.5 s timer that actually closes the modal. */
+static void format_done_async_cb(void *arg)
+{
+    esp_err_t err = (esp_err_t)(intptr_t)arg;
+    if (s_format_progress_timer) {
+        lv_timer_del(s_format_progress_timer);
+        s_format_progress_timer = NULL;
+    }
+
+    /* Pick a status string the user can read at a glance. ESP_ERR_TIMEOUT
+     * is the busy-bg-workers refusal (encoder didn't finish in 5 s);
+     * ESP_ERR_INVALID_STATE is SD-not-mounted (shouldn't happen given
+     * the modal-open gate, but handle it anyway). */
+    const char *status =
+        err == ESP_OK              ? "Done!"  :
+        err == ESP_ERR_TIMEOUT     ? "Busy"   :
+        err == ESP_ERR_INVALID_STATE ? "No SD" :
+                                       "Failed";
+    if (ui_PanelSettingsFormatTitle) {
+        lv_label_set_text(ui_PanelSettingsFormatTitle, status);
+    }
+
+    /* Schedule auto-dismiss in 1.5 s. s_format_in_progress stays true
+     * until dismiss fires so input remains gated through the popup. */
+    if (s_format_dismiss_timer) {
+        lv_timer_del(s_format_dismiss_timer);
+    }
+    s_format_dismiss_timer = lv_timer_create(format_dismiss_cb, 1500, NULL);
+    lv_timer_set_repeat_count(s_format_dismiss_timer, 1);
+
+    ESP_LOGI(TAG, "Settings: format done err=0x%x — popup '%s'", err, status);
 }
 
 /* True iff any bg actor that touches SD is currently busy. Polled by

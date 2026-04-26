@@ -361,3 +361,63 @@ void gallery_refresh_empty_overlay(void);
  * deferred" detection works. Returns true while either s_is_encoding
  * or s_deferred_in_flight is set. */
 bool app_pimslo_is_encoding_or_deferred(void);
+
+/* ========================================================================
+ * Power-saving idle/sleep model (mirrors ui_extra.c idle timer)
+ *
+ * Goal on hardware: after 3 minutes of no user input, briefly show a
+ * "Going to sleep" modal, then turn off the LCD backlight AND stop
+ * the LVGL refresh task. The next button press wakes the display +
+ * resumes LVGL + is swallowed (not propagated as an action). Encoder
+ * + capture pipeline keeps running through sleep — power saving is
+ * just for display + LVGL CPU.
+ *
+ * Mock state machine:
+ *   POWER_ACTIVE        — display on, LVGL running
+ *     tick (>= timeout) → POWER_SLEEP_MODAL
+ *     button_press      → kick timer, stay
+ *
+ *   POWER_SLEEP_MODAL   — modal shown, ~1.5 s grace before backlight
+ *                         off. Encoder still running.
+ *     tick (>= modal_ms)  → POWER_SLEEPING
+ *     button_press        → wake (back to ACTIVE), button swallowed
+ *
+ *   POWER_SLEEPING      — backlight off, LVGL stopped. Encoder still
+ *                         running (this is the whole point).
+ *     button_press        → wake (back to ACTIVE), button swallowed
+ *
+ * Side-effect counters let tests assert the right calls fired:
+ *   power_backlight_off_count  — bsp_display_backlight_off()
+ *   power_backlight_on_count   — bsp_display_backlight_on()
+ *   power_lvgl_stop_count      — lvgl_port_stop()
+ *   power_lvgl_resume_count    — lvgl_port_resume()
+ * ======================================================================== */
+typedef enum {
+    POWER_ACTIVE = 0,
+    POWER_SLEEP_MODAL,
+    POWER_SLEEPING,
+} power_state_t;
+
+#define POWER_IDLE_TIMEOUT_MS    (3 * 60 * 1000)
+#define POWER_SLEEP_MODAL_MS     1500
+
+void          power_idle_init(void);
+void          power_idle_kick(void);             /* reset activity timer */
+power_state_t power_idle_state(void);
+bool          power_idle_is_sleeping(void);      /* true in MODAL or SLEEPING */
+bool          power_idle_modal_visible(void);    /* true only in MODAL */
+
+/* Advance the simulation clock by `ms` and run state-machine ticks.
+ * Returns the new state. */
+power_state_t power_idle_advance_ms(int ms);
+
+/* Simulate a button press. Returns true if this press was a wake
+ * (i.e. caller should swallow the action), false if normal. Always
+ * resets the activity timer. */
+bool          power_idle_press_button(void);
+
+/* Side-effect counters. */
+int power_backlight_off_count(void);
+int power_backlight_on_count(void);
+int power_lvgl_stop_count(void);
+int power_lvgl_resume_count(void);

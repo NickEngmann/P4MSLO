@@ -75,6 +75,28 @@ void ui_extra_btn_left(void);
  */
 void ui_extra_btn_encoder(void);
 
+/* Power-saving idle / display-sleep management.
+ *
+ * After 3 minutes with no user input, the firmware:
+ *   1. Briefly shows a "Going to sleep" modal (~1.5 s)
+ *   2. Turns the LCD backlight off (bsp_display_backlight_off)
+ *   3. Stops LVGL refresh (lvgl_port_stop)
+ * Background encoding (PIMSLO save + GIF / .p4ms encode) keeps
+ * running through sleep — the whole point is to free up CPU and
+ * battery for that work, not interrupt it.
+ *
+ * Wake on any button press: backlight on, lvgl_port_resume, idle
+ * timer reset, button SWALLOWED (the wake press doesn't propagate
+ * as an action).
+ *
+ * Tests + serial commands count as activity via
+ * `ui_extra_kick_idle_timer()`.
+ *
+ * Mock model: see test/mocks/pimslo_sim.h power_idle_*.
+ */
+void ui_extra_kick_idle_timer(void);
+bool ui_extra_is_display_sleeping(void);
+
 /* Page management */
 /**
  * @brief Get current page

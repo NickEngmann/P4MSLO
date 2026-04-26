@@ -1140,6 +1140,145 @@ SCENARIO(empty_overlay_visible_when_format_leaves_zero_entries)
            "post-format empty gallery shows overlay immediately");
 }
 
+/* ------------------------------------------------------------------ *
+ * Power-saving idle/sleep scenarios (2026-04-26 user request).
+ *
+ * After 3 minutes of no user input the firmware should:
+ *   1. Briefly show a "Going to sleep" modal
+ *   2. Turn off LCD backlight
+ *   3. Stop LVGL refresh task
+ *   4. NOT interrupt the encoder pipeline
+ * Any button press wakes the display + resumes LVGL + is swallowed.
+ * ------------------------------------------------------------------ */
+SCENARIO(idle_state_starts_active)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ASSERT(power_idle_state() == POWER_ACTIVE, "boot state is ACTIVE");
+    ASSERT(!power_idle_is_sleeping(), "not sleeping at boot");
+    ASSERT(!power_idle_modal_visible(), "no modal at boot");
+    ASSERT(power_backlight_off_count() == 0, "no backlight changes yet");
+}
+
+SCENARIO(idle_after_3min_enters_sleep_modal_then_sleeping)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    /* Fast-forward to just before 3 minutes — should still be ACTIVE. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS - 1000);
+    ASSERT(power_idle_state() == POWER_ACTIVE,
+           "still active under timeout");
+
+    /* Cross the 3-minute threshold. Lands in modal. */
+    power_idle_advance_ms(2000);
+    ASSERT(power_idle_state() == POWER_SLEEP_MODAL,
+           "modal shown right at timeout");
+    ASSERT(power_idle_modal_visible(), "modal flag visible");
+    ASSERT(power_backlight_off_count() == 0,
+           "backlight not off yet — modal grace period");
+
+    /* Wait out the modal grace window. Lands in sleeping. */
+    power_idle_advance_ms(POWER_SLEEP_MODAL_MS);
+    ASSERT(power_idle_state() == POWER_SLEEPING, "now sleeping");
+    ASSERT(!power_idle_modal_visible(), "modal hidden once sleeping");
+    ASSERT(power_backlight_off_count() == 1, "backlight turned off once");
+    ASSERT(power_lvgl_stop_count() == 1, "lvgl stopped once");
+}
+
+SCENARIO(button_press_resets_idle_timer)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    /* 2 minutes idle. */
+    power_idle_advance_ms(2 * 60 * 1000);
+    ASSERT(power_idle_state() == POWER_ACTIVE, "still active");
+
+    /* User presses a button — kicks the timer. Active state, not a wake. */
+    bool was_wake = power_idle_press_button();
+    ASSERT(!was_wake, "active-state press is not a wake");
+
+    /* Another 2 minutes — total 4 minutes, but timer reset 2 min ago. */
+    power_idle_advance_ms(2 * 60 * 1000);
+    ASSERT(power_idle_state() == POWER_ACTIVE,
+           "kick reset the 3-min countdown");
+
+    /* One more minute pushes us past 3 since the last kick. */
+    power_idle_advance_ms(60 * 1000 + 1);
+    ASSERT(power_idle_state() == POWER_SLEEP_MODAL,
+           "now over the 3-min threshold from kick");
+}
+
+SCENARIO(button_during_modal_wakes_and_swallows)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    /* Get into modal state. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS);
+    ASSERT(power_idle_state() == POWER_SLEEP_MODAL, "in modal");
+
+    /* User notices the modal and presses a button before backlight off. */
+    bool was_wake = power_idle_press_button();
+    ASSERT(was_wake, "modal press counts as a wake — caller must swallow");
+    ASSERT(power_idle_state() == POWER_ACTIVE, "back to active");
+    /* Backlight was never turned off — user caught it before sleeping. */
+    ASSERT(power_backlight_off_count() == 0,
+           "no backlight cycle — woken before SLEEPING");
+    ASSERT(power_backlight_on_count() == 0,
+           "no backlight on either — was never off");
+    ASSERT(power_lvgl_stop_count() == 0, "lvgl never stopped");
+}
+
+SCENARIO(button_during_sleeping_wakes_and_resumes_lvgl)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    /* Cross both thresholds — fully sleeping. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS + POWER_SLEEP_MODAL_MS);
+    ASSERT(power_idle_state() == POWER_SLEEPING, "fully sleeping");
+    ASSERT(power_backlight_off_count() == 1, "backlight was off'd");
+    ASSERT(power_lvgl_stop_count() == 1, "lvgl was stopped");
+
+    /* Wake. */
+    bool was_wake = power_idle_press_button();
+    ASSERT(was_wake, "sleeping press is a wake");
+    ASSERT(power_idle_state() == POWER_ACTIVE, "back to active");
+    ASSERT(power_backlight_on_count() == 1, "backlight turned back on");
+    ASSERT(power_lvgl_resume_count() == 1, "lvgl resumed");
+}
+
+SCENARIO(encoder_runs_uninterrupted_during_sleep)
+{
+    /* The KEY user requirement: sleep must not interfere with
+     * background encoding. Queue an encode, force the device to
+     * sleep mid-encode, then drain the queue and verify the encode
+     * still completed and the gallery has the entry. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+
+    /* Take a photo — encoder will pick up the job. */
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    ASSERT(r.cams_usable == 4, "4-cam capture queued");
+
+    /* Now go idle for 3 minutes WHILE the encode is queued. The
+     * device should sleep regardless. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS + POWER_SLEEP_MODAL_MS);
+    ASSERT(power_idle_state() == POWER_SLEEPING,
+           "device sleeps even with encode queued");
+
+    /* Drain the encoder. */
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(gallery_count() == 1, "encode finished while sleeping");
+    ASSERT(power_idle_state() == POWER_SLEEPING,
+           "still sleeping — encoder finishing doesn't wake");
+}
+
+SCENARIO(reset_clears_power_state)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    /* Sleep, then reset, then verify clean active state. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS + POWER_SLEEP_MODAL_MS);
+    ASSERT(power_idle_state() == POWER_SLEEPING, "asleep");
+    pimslo_sim_reset();
+    ASSERT(power_idle_state() == POWER_ACTIVE, "reset → active");
+    ASSERT(power_backlight_off_count() == 0, "counters cleared");
+    ASSERT(power_backlight_on_count() == 0, "counters cleared");
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -1202,6 +1341,14 @@ int main(void)
     RUN(format_then_first_photo_no_collision);
     RUN(empty_overlay_hides_after_count_zero_to_one_transition);
     RUN(empty_overlay_visible_when_format_leaves_zero_entries);
+
+    RUN(idle_state_starts_active);
+    RUN(idle_after_3min_enters_sleep_modal_then_sleeping);
+    RUN(button_press_resets_idle_timer);
+    RUN(button_during_modal_wakes_and_swallows);
+    RUN(button_during_sleeping_wakes_and_resumes_lvgl);
+    RUN(encoder_runs_uninterrupted_during_sleep);
+    RUN(reset_clears_power_state);
 
     printf("\n=== Results ===\n  PASS: %d\n  FAIL: %d\n", passed, fails);
     return (fails > 0) ? 1 : 0;

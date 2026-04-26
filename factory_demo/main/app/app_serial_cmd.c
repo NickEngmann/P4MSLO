@@ -504,6 +504,14 @@ static void dispatch_command(char *line)
 
     if (*line == '\0') return;
 
+    /* Every serial command counts as user/test activity for the
+     * idle-to-sleep timer. Without this, e2e tests that have a
+     * slow phase (e.g. test 03's 360 s drain wait between status
+     * polls) would let the 3-min idle window expire and the device
+     * would sleep mid-test, blacking out the display + pausing
+     * LVGL during regression. */
+    ui_extra_kick_idle_timer();
+
     ESP_LOGI(TAG, "Command: '%s'", line);
 
     /* Parse command and argument */

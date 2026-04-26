@@ -28,6 +28,7 @@
 #include "app_gifs.h"
 #include "app_pimslo.h"
 #include "bsp/esp-bsp.h"          /* bsp_display_lock/unlock for the format-progress task */
+#include "esp_lvgl_port.h"        /* lvgl_port_stop/resume for idle sleep */
 #include "bsp/esp32_p4_eye.h"     /* bsp_get_sdcard_handle */
 #include "esp_vfs_fat.h"          /* esp_vfs_fat_sdcard_format */
 #include <sys/stat.h>             /* mkdir to recreate PIMSLO dirs post-format */
@@ -78,6 +79,42 @@ static lv_obj_t *ui_PanelHomeBackground = NULL;
 static lv_obj_t  *saving_label  = NULL;
 static lv_timer_t *saving_timer = NULL;
 static int       saving_dot_step = 0;
+
+/* ---- Power-saving idle / display-sleep state ---------------------
+ *
+ * State machine mirrors the host-side model in test/mocks/pimslo_sim.c:
+ *   POWER_ACTIVE       — display on, LVGL running. Timer reset on
+ *                        every button press / serial command.
+ *   POWER_SLEEP_MODAL  — modal shown for IDLE_MODAL_VISIBLE_MS, then
+ *                        transitions to POWER_SLEEPING.
+ *   POWER_SLEEPING     — backlight off + lvgl_port_stop.
+ *
+ * Wake (from MODAL or SLEEPING) on any button press: backlight on +
+ * lvgl_port_resume, button is swallowed.
+ *
+ * Encoder pipeline is INDEPENDENT of this state — pimslo_save_task
+ * and pimslo_encode_queue_task run on Core 1 and don't touch LVGL,
+ * so sleep doesn't block them. That's the power-saving goal: stop
+ * the display + LVGL CPU churn, let the encoder grind. */
+typedef enum {
+    POWER_ACTIVE = 0,
+    POWER_SLEEP_MODAL,
+    POWER_SLEEPING,
+} power_state_t;
+
+#define IDLE_TIMEOUT_MS         (3 * 60 * 1000)
+#define IDLE_MODAL_VISIBLE_MS   1500
+#define IDLE_CHECK_INTERVAL_MS  5000
+
+static volatile power_state_t s_power_state = POWER_ACTIVE;
+static volatile uint32_t s_last_activity_ms = 0;
+static volatile uint32_t s_modal_entered_ms = 0;
+static lv_timer_t *s_idle_check_timer = NULL;
+static lv_obj_t   *s_idle_modal = NULL;
+/* Forward-declared so enter_sleep_modal() can defer when the format
+ * BG task is mid-run. Real definition is later in the file with the
+ * rest of the format-modal state. */
+static volatile bool s_format_in_progress;
 
 /* Delete-confirmation modal for the GIFs gallery. Mirrors the album's
  * ui_PanelImageScreenAlbumDelete in layout but opens / confirms via the
@@ -713,6 +750,137 @@ static void saving_timer_cb(lv_timer_t *timer)
         lv_obj_add_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
         saving_dot_step = 0;
     }
+}
+
+/* ---- Power-saving idle/sleep helpers ----------------------------- */
+
+bool ui_extra_is_display_sleeping(void)
+{
+    return s_power_state != POWER_ACTIVE;
+}
+
+void ui_extra_kick_idle_timer(void)
+{
+    s_last_activity_ms = esp_log_timestamp();
+}
+
+/* Lazy-create the "Going to sleep" modal on lv_layer_top so it floats
+ * above whatever page is current. Layer-top isn't subject to the
+ * page-clear path so we don't have to recreate it per page. */
+static void idle_modal_ensure_created(void)
+{
+    if (s_idle_modal) return;
+    s_idle_modal = lv_label_create(lv_layer_top());
+    lv_obj_set_style_bg_color(s_idle_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_idle_modal, LV_OPA_90, 0);
+    lv_obj_set_style_text_color(s_idle_modal, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_idle_modal, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_align(s_idle_modal, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_all(s_idle_modal, 14, 0);
+    lv_obj_set_style_radius(s_idle_modal, 8, 0);
+    lv_obj_align(s_idle_modal, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(s_idle_modal, "Idle\nGoing to sleep...");
+    lv_obj_add_flag(s_idle_modal, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void idle_modal_show(void)
+{
+    idle_modal_ensure_created();
+    if (!s_idle_modal) return;
+    bsp_display_lock(0);
+    lv_obj_clear_flag(s_idle_modal, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_idle_modal);
+    bsp_display_unlock();
+}
+
+static void idle_modal_hide(void)
+{
+    if (!s_idle_modal) return;
+    bsp_display_lock(0);
+    lv_obj_add_flag(s_idle_modal, LV_OBJ_FLAG_HIDDEN);
+    bsp_display_unlock();
+}
+
+/* ACTIVE → SLEEP_MODAL transition. Called from idle_check_timer_cb
+ * once IDLE_TIMEOUT_MS has elapsed without activity. The modal is
+ * shown; the timer will continue to run and transition us to
+ * SLEEPING after IDLE_MODAL_VISIBLE_MS. */
+static void enter_sleep_modal(void)
+{
+    if (s_power_state != POWER_ACTIVE) return;
+    /* Don't sleep mid-SPI-capture (user is watching the saving
+     * overlay, ~3 s window). The actual encode (~150 s) is allowed
+     * to overlap with sleep — that's the user-requested win. */
+    if (app_pimslo_is_capturing()) {
+        s_last_activity_ms = esp_log_timestamp();
+        return;
+    }
+    /* Don't sleep mid-format. f_mkfs takes ~8 s and the user is
+     * actively waiting on the formatting modal animation. */
+    if (s_format_in_progress) {
+        s_last_activity_ms = esp_log_timestamp();
+        return;
+    }
+    ESP_LOGI(TAG, "Idle %d s — entering sleep modal", IDLE_TIMEOUT_MS / 1000);
+    s_modal_entered_ms = esp_log_timestamp();
+    s_power_state = POWER_SLEEP_MODAL;
+    idle_modal_show();
+}
+
+/* SLEEP_MODAL → SLEEPING transition. Called from idle_check_timer_cb
+ * after IDLE_MODAL_VISIBLE_MS in modal state. Drops backlight + stops
+ * LVGL refresh. Encoder + capture pipeline keep running. */
+static void enter_sleeping(void)
+{
+    if (s_power_state != POWER_SLEEP_MODAL) return;
+    idle_modal_hide();
+    bsp_display_backlight_off();
+    /* lvgl_port_stop pauses the LVGL task — no more refresh cycles
+     * until lvgl_port_resume. CPU is freed for the encoder. */
+    lvgl_port_stop();
+    s_power_state = POWER_SLEEPING;
+    ESP_LOGI(TAG, "Sleeping — backlight off + LVGL paused");
+}
+
+/* Wake from MODAL or SLEEPING. Called at the very top of every
+ * button handler. Returns true if this press was a wake (caller
+ * should swallow it). Always resets the activity timestamp. */
+static bool wake_from_idle_if_sleeping(void)
+{
+    s_last_activity_ms = esp_log_timestamp();
+    if (s_power_state == POWER_ACTIVE) return false;
+    bool was_sleeping = (s_power_state == POWER_SLEEPING);
+    if (was_sleeping) {
+        /* Bring LVGL back FIRST so the modal-hide and any subsequent
+         * UI changes get rendered. */
+        lvgl_port_resume();
+        bsp_display_backlight_on();
+    }
+    idle_modal_hide();
+    s_power_state = POWER_ACTIVE;
+    ESP_LOGI(TAG, "Wake on button — display + LVGL resumed");
+    return true;
+}
+
+static void idle_check_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    uint32_t now = esp_log_timestamp();
+    if (s_power_state == POWER_ACTIVE) {
+        uint32_t idle = now - s_last_activity_ms;
+        if (idle >= IDLE_TIMEOUT_MS) {
+            enter_sleep_modal();
+        }
+    } else if (s_power_state == POWER_SLEEP_MODAL) {
+        uint32_t in_modal = now - s_modal_entered_ms;
+        if (in_modal >= IDLE_MODAL_VISIBLE_MS) {
+            enter_sleeping();
+        }
+    }
+    /* POWER_SLEEPING: nothing to do here — only a button press
+     * brings us back. Note that lvgl_port_stop pauses the LVGL
+     * task itself, so this very timer callback only fires while
+     * we're NOT sleeping. */
 }
 
 /* ---- GIFs delete-modal helpers ---------------------------------- */
@@ -2196,6 +2364,11 @@ void ui_extra_popup_picture_delete_success(void)
  */
 void ui_extra_btn_up(void)
 {
+    /* Idle wake: if sleeping or modal-shown, this press wakes the
+     * display + resumes LVGL and is then SWALLOWED (no scroll, no
+     * select). Same pattern in every btn handler below. */
+    if (wake_from_idle_if_sleeping()) return;
+
     // Check if there are any popup windows that need to be cleared
     if(!lv_obj_has_flag(ui_PanelCanvasPopupCamera, LV_OBJ_FLAG_HIDDEN) || 
        !lv_obj_has_flag(ui_PanelCanvasPopupCameraInterval, LV_OBJ_FLAG_HIDDEN) ||
@@ -2291,8 +2464,10 @@ void ui_extra_btn_up(void)
  */
 void ui_extra_btn_down(void)
 {
+    if (wake_from_idle_if_sleeping()) return;
+
     // Check if there are any popup windows that need to be cleared
-    if(!lv_obj_has_flag(ui_PanelCanvasPopupCamera, LV_OBJ_FLAG_HIDDEN) || 
+    if(!lv_obj_has_flag(ui_PanelCanvasPopupCamera, LV_OBJ_FLAG_HIDDEN) ||
        !lv_obj_has_flag(ui_PanelCanvasPopupCameraInterval, LV_OBJ_FLAG_HIDDEN) ||
        !lv_obj_has_flag(ui_PanelCanvasPopupVideoMode, LV_OBJ_FLAG_HIDDEN) ||
        !lv_obj_has_flag(ui_PanelCanvasPopupSDWarning, LV_OBJ_FLAG_HIDDEN) ||
@@ -2380,6 +2555,7 @@ void ui_extra_btn_down(void)
  */
 void ui_extra_btn_right(void)
 {
+    if (wake_from_idle_if_sleeping()) return;
     switch(current_page) {
         case UI_PAGE_SETTINGS:
             if (is_camera_settings_panel_active && current_camera_settings_item < 4) {
@@ -2441,6 +2617,7 @@ void ui_extra_btn_right(void)
  */
 void ui_extra_btn_left(void)
 {
+    if (wake_from_idle_if_sleeping()) return;
     switch(current_page) {
         case UI_PAGE_SETTINGS:
             if (is_camera_settings_panel_active && current_camera_settings_item < 4) {
@@ -2502,6 +2679,8 @@ void ui_extra_btn_left(void)
  */
 void ui_extra_btn_menu(void)
 {
+    if (wake_from_idle_if_sleeping()) return;
+
     if(!lv_obj_has_flag(ui_PanelCanvasPopupSDWarning, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
@@ -2661,7 +2840,9 @@ void ui_extra_btn_menu(void)
  */
 void ui_extra_btn_encoder(void)
 {
-    if(!lv_obj_has_flag(ui_PanelCanvasPopupCamera, LV_OBJ_FLAG_HIDDEN) || 
+    if (wake_from_idle_if_sleeping()) return;
+
+    if(!lv_obj_has_flag(ui_PanelCanvasPopupCamera, LV_OBJ_FLAG_HIDDEN) ||
        !lv_obj_has_flag(ui_PanelCanvasPopupCameraInterval, LV_OBJ_FLAG_HIDDEN) ||
        !lv_obj_has_flag(ui_PanelCanvasPopupVideoMode, LV_OBJ_FLAG_HIDDEN) ||
        !lv_obj_has_flag(ui_PanelCanvasPopupIntervalTimerWarning, LV_OBJ_FLAG_HIDDEN) ||
@@ -2900,6 +3081,17 @@ void ui_extra_init(void)
      * cheap; the real work comes from what the capture task is doing
      * on Core 0. */
     saving_timer = lv_timer_create(saving_timer_cb, 100, NULL);
+
+    /* Idle-to-sleep timer. Polls every IDLE_CHECK_INTERVAL_MS and
+     * fires the state-machine transitions defined in
+     * idle_check_timer_cb. The wall-clock checks use
+     * esp_log_timestamp() which keeps ticking through any
+     * lvgl_port_stop pause, so we don't lose time accounting while
+     * sleeping (not that it matters — we don't sleep again until a
+     * wake button press starts the next idle window). */
+    s_last_activity_ms = esp_log_timestamp();
+    s_idle_check_timer =
+        lv_timer_create(idle_check_timer_cb, IDLE_CHECK_INTERVAL_MS, NULL);
 
     /* The GIFs "Delete?" modal is created lazily in
      * ui_extra_redirect_to_gifs_page() the first time the gallery page is

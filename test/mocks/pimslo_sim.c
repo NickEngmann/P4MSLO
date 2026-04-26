@@ -686,6 +686,123 @@ format_result_t pimslo_sim_format_sd(void)
 }
 
 /* ========================================================================
+ * Power-saving idle/sleep model
+ *
+ * Pure state machine — no side effects on real hardware, just counters
+ * for tests + tracks last-activity timestamp against the sim clock.
+ * The "encoder runs uninterrupted" property is enforced by NOT pausing
+ * any encode-queue work in this state machine — the existing
+ * pimslo_sim_wait_idle / run_encode_pipeline run independently of
+ * power state.
+ * ======================================================================== */
+static power_state_t s_power_state = POWER_ACTIVE;
+static int64_t       s_last_activity_clock_ms = 0;
+static int64_t       s_modal_entered_clock_ms = 0;
+static int           s_backlight_off_count = 0;
+static int           s_backlight_on_count = 0;
+static int           s_lvgl_stop_count = 0;
+static int           s_lvgl_resume_count = 0;
+
+static void power_enter_sleep_modal(void)
+{
+    s_power_state = POWER_SLEEP_MODAL;
+    /* Anchor to the MOMENT the idle threshold was crossed, not the
+     * current sim clock — otherwise a single advance_ms() that
+     * overshoots both thresholds (e.g. 180000+1500 in one call)
+     * would land in MODAL with in_modal=0 and never transition to
+     * SLEEPING in the same call. The threshold-crossing time is
+     * `last_activity + POWER_IDLE_TIMEOUT_MS`. */
+    s_modal_entered_clock_ms =
+        s_last_activity_clock_ms + POWER_IDLE_TIMEOUT_MS;
+}
+
+static void power_enter_sleeping(void)
+{
+    s_power_state = POWER_SLEEPING;
+    /* These are the side effects the firmware will perform. The mock
+     * just tallies them so tests can assert. */
+    s_backlight_off_count++;
+    s_lvgl_stop_count++;
+}
+
+static void power_wake(void)
+{
+    if (s_power_state == POWER_SLEEPING) {
+        s_backlight_on_count++;
+        s_lvgl_resume_count++;
+    }
+    s_power_state = POWER_ACTIVE;
+    s_last_activity_clock_ms = s_sim_clock_ms;
+}
+
+void power_idle_init(void)
+{
+    s_power_state = POWER_ACTIVE;
+    s_last_activity_clock_ms = s_sim_clock_ms;
+    s_modal_entered_clock_ms = 0;
+    s_backlight_off_count = s_backlight_on_count = 0;
+    s_lvgl_stop_count = s_lvgl_resume_count = 0;
+}
+
+void power_idle_kick(void)
+{
+    s_last_activity_clock_ms = s_sim_clock_ms;
+}
+
+power_state_t power_idle_state(void)        { return s_power_state; }
+bool power_idle_is_sleeping(void) {
+    return s_power_state != POWER_ACTIVE;
+}
+bool power_idle_modal_visible(void) {
+    return s_power_state == POWER_SLEEP_MODAL;
+}
+
+power_state_t power_idle_advance_ms(int ms)
+{
+    s_sim_clock_ms += ms;
+    /* Re-evaluate transitions. The model uses absolute clock
+     * comparisons so a single advance that crosses both thresholds
+     * ends up in POWER_SLEEPING in the same call. */
+    while (1) {
+        if (s_power_state == POWER_ACTIVE) {
+            int64_t idle = s_sim_clock_ms - s_last_activity_clock_ms;
+            if (idle >= POWER_IDLE_TIMEOUT_MS) {
+                power_enter_sleep_modal();
+                continue;     /* re-evaluate; modal might also expire */
+            }
+            break;
+        } else if (s_power_state == POWER_SLEEP_MODAL) {
+            int64_t in_modal = s_sim_clock_ms - s_modal_entered_clock_ms;
+            if (in_modal >= POWER_SLEEP_MODAL_MS) {
+                power_enter_sleeping();
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    return s_power_state;
+}
+
+bool power_idle_press_button(void)
+{
+    bool was_sleeping = (s_power_state != POWER_ACTIVE);
+    if (was_sleeping) {
+        power_wake();
+        /* Caller must swallow the press — wake-only, no action. */
+        return true;
+    }
+    /* Active state — just kick the timer, press propagates normally. */
+    s_last_activity_clock_ms = s_sim_clock_ms;
+    return false;
+}
+
+int power_backlight_off_count(void) { return s_backlight_off_count; }
+int power_backlight_on_count(void)  { return s_backlight_on_count; }
+int power_lvgl_stop_count(void)     { return s_lvgl_stop_count; }
+int power_lvgl_resume_count(void)   { return s_lvgl_resume_count; }
+
+/* ========================================================================
  * Init / shutdown
  * ======================================================================== */
 void pimslo_sim_init(void)
@@ -710,6 +827,9 @@ void pimslo_sim_init(void)
     memset(s_orphans, 0, sizeof(s_orphans));
     s_n_orphans = 0;
     s_orphan_cleanup_count = 0;
+    /* Reset power-saving state — must happen AFTER s_sim_clock_ms is
+     * zeroed so power_idle_init() seeds last_activity from clock=0. */
+    power_idle_init();
 }
 
 void pimslo_sim_shutdown(void)

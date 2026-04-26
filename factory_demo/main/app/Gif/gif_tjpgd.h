@@ -15,7 +15,15 @@ extern "C" {
 /* Configuration */
 #define JD_SZBUF      512
 #define JD_FORMAT      0       /* 0=RGB888 output */
-#define JD_USE_SCALE   0
+/* Enables tjpgd's built-in 1:1 / 1:2 / 1:4 / 1:8 scaling. show_jpeg()
+ * (gallery JPEG preview) computes a scale based on canvas size (240×240)
+ * vs source (typically 1920×1080) and lands at scale 2 or 3. With
+ * JD_USE_SCALE=0 the decomp call returns JDR_PAR for any non-zero
+ * scale, leaving JPEG-only gallery entries painted as a solid 0x10
+ * canvas (the "blue square + PROCESSING badge" bug). The other
+ * gif_jd_decomp callers (gif_encoder.c hot loop, jpeg_crop_out_cb in
+ * .p4ms generation) all pass scale=0 and are unaffected. */
+#define JD_USE_SCALE   1
 #define JD_TBLCLIP     1
 #define JD_FASTDECODE  2
 

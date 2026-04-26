@@ -2009,19 +2009,24 @@ static esp_err_t show_jpeg(const char *path)
 
     /* Shared tjpgd work buffer — see s_tjpgd_work comment at file top.
      *
-     * 30 s timeout (was 5 s). Why 30 s: with err_cur/err_nxt now in
-     * PSRAM (commit 1ac42a1), encoder Pass 2 frames take ~22 s each
-     * including the encoder's ~1.7 s tjpgd-mutex hold. If show_jpeg
-     * runs concurrently with an active encoder frame, 5 s wasn't
-     * enough — show_jpeg returned TIMEOUT and the canvas's blue 0x10
-     * memset background stayed visible. User-visible symptom: gallery
-     * preview is solid blue when entered while another encode is mid-
-     * frame. 30 s covers the worst case (encoder frame + p4ms decode
-     * + small slack). The encoder releases the mutex AROUND each frame
-     * (decode → release → dither+LZW → next-frame decode → reacquire)
-     * so the longest single hold is the decode phase, ~1.7 s. */
-    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
-        ESP_LOGW(TAG, "show_jpeg: tjpgd mutex timeout (>30 s — encoder stuck?)");
+     * 2 s timeout — must be SHORT because show_jpeg runs on the LVGL
+     * task during gallery entry (called from
+     * `ui_extra_redirect_to_gifs_page` via `play_current`). Holding
+     * the LVGL task hostage for 30 s while the encoder cycles through
+     * frame decodes blocks every other UI input (button presses,
+     * menu_goto responses, screen redraws) for the duration. The
+     * encoder's per-frame mutex hold is ~1.7 s, so 2 s covers the
+     * common case where the encoder releases between frames; the
+     * tighter window also bounds the worst-case UI freeze on a
+     * heavy-encode build.
+     *
+     * On timeout the canvas keeps its pre-show-jpeg state (whatever
+     * play_current set up — for JPEG-only entries, the 0x10 memset
+     * background; for GIF entries, the previous frame). The user
+     * still gets the PROCESSING/QUEUED badge + filename overlay, and
+     * a subsequent gallery re-entry retries the decode. */
+    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGW(TAG, "show_jpeg: tjpgd mutex timeout (>2 s — encoder busy)");
         heap_caps_free(jpeg_buf);
         return ESP_ERR_TIMEOUT;
     }

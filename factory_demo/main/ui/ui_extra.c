@@ -1012,6 +1012,37 @@ static void format_done_async_cb(void *arg)
     ESP_LOGI(TAG, "Settings: format done err=0x%x — popup '%s'", err, status);
 }
 
+/* Brief informational popup that reuses the format modal chrome. Used
+ * when SELECT on the Format SD slot is refused at modal-open time
+ * (e.g. bg encode in flight) so the user gets visible feedback
+ * instead of a silent no-op. Hides YES/NO, sets the title, marks
+ * the format flow in-progress so input is gated, then schedules the
+ * same format_dismiss_cb that handles success/fail tear-down. */
+static void show_format_status_popup(const char *title, uint32_t hold_ms)
+{
+    settings_format_modal_ensure_created();
+    if (!ui_PanelSettingsFormat) return;
+
+    if (ui_BtnSettingsFormatYes) {
+        lv_obj_add_flag(ui_BtnSettingsFormatYes, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_BtnSettingsFormatNo) {
+        lv_obj_add_flag(ui_BtnSettingsFormatNo, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_PanelSettingsFormatTitle) {
+        lv_label_set_text(ui_PanelSettingsFormatTitle, title);
+    }
+    lv_obj_clear_flag(ui_PanelSettingsFormat, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ui_PanelSettingsFormat);
+
+    s_format_in_progress = true;
+    if (s_format_dismiss_timer) {
+        lv_timer_del(s_format_dismiss_timer);
+    }
+    s_format_dismiss_timer = lv_timer_create(format_dismiss_cb, hold_ms, NULL);
+    lv_timer_set_repeat_count(s_format_dismiss_timer, 1);
+}
+
 /* True iff any bg actor that touches SD is currently busy. Polled by
  * the format BG task so we don't yank the filesystem out from under
  * an open file handle.
@@ -2496,13 +2527,17 @@ void ui_extra_btn_menu(void)
 
                 app_video_stream_set_photo_resolution_by_string(current_settings.resolution);
             } else if (!is_camera_settings_panel_active && current_settings_item == 1) {
-                /* Slot 1 is DELETE ALL. Greyed out when SD missing — do
-                 * nothing. Otherwise refuse if a capture / encode is in
-                 * flight, else open the confirm modal. */
+                /* Slot 1 is FORMAT SD. Greyed out when SD missing — do
+                 * nothing (the slot itself reads as disabled). Otherwise
+                 * if a capture / encode is in flight show a brief "SD
+                 * Busy" popup so the user gets visible feedback (silent
+                 * no-op was confusing — looked like the button broke).
+                 * Idle → open the confirm modal normally. */
                 if (!ui_extra_get_sd_card_mounted()) break;
                 if (app_pimslo_is_capturing() || app_pimslo_is_encoding() ||
                     app_gifs_is_encoding() || app_pimslo_get_queue_depth() > 0) {
-                    ESP_LOGW(TAG, "Settings: delete_all refused (busy)");
+                    ESP_LOGW(TAG, "Settings: format_sd refused at open (busy) — popup 'SD Busy'");
+                    show_format_status_popup("SD Busy", 1500);
                     break;
                 }
                 settings_format_modal_show();

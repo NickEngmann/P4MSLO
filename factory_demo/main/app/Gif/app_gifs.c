@@ -2233,6 +2233,22 @@ esp_err_t app_gifs_play_current(void)
      * loop decode. A complete slot (memory-resident OR just loaded from
      * .p4ms) plays entirely from the cached canvas table. */
     if (!s_ctx.first_loop_complete) {
+        /* Encoder-busy guard. The GIF decoder needs ~7 MB of PSRAM
+         * (decode_buffer + working state) and the encoder is sitting
+         * on its own 7 MB scaled_buf — opening both at once OOMs.
+         * Pre-2026-04-26 this guard lived in
+         * `ui_extra_redirect_to_gifs_page` and skipped play_current
+         * entirely, but that also skipped the safe .p4ms path. Now
+         * the gate is here, narrowly targeting the decoder open:
+         * if the entry doesn't have a .p4ms cached and an encode is
+         * in flight, leave the static JPEG preview on screen and
+         * bail. The user can re-enter the gallery (or wait for the
+         * encode to finish) to trigger the full decoder path. */
+        if (app_gifs_is_encoding() || app_pimslo_is_encoding()) {
+            ESP_LOGI(TAG, "play_current: encoder busy — skipping GIF decoder "
+                          "open; static JPEG preview remains on canvas");
+            return ESP_OK;
+        }
         /* Tell the bg worker to release its own decoder NOW — foreground
          * is about to claim the ~7 MB PSRAM that a decoder needs. */
         s_bg_abort_current = true;

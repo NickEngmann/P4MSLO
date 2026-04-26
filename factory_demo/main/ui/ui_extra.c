@@ -1706,11 +1706,19 @@ static void ui_extra_redirect_to_gifs_page(void)
          * when count > 0. */
         app_gifs_refresh_empty_overlay();
         if (app_gifs_get_count() > 0) {
-            if (app_gifs_is_encoding() || app_pimslo_is_encoding()) {
-                ESP_LOGI(TAG, "Gallery entry: encoder busy — skipping auto-play");
-            } else {
-                app_gifs_play_current();
-            }
+            /* Always try to play. play_current() loads the .p4ms
+             * preview via load_small_gif() before falling back to
+             * the GIF decoder, and the .p4ms path uses a 240×240
+             * canvas (~115 KB × 6 frames ≈ 700 KB) that does not
+             * collide with the encoder's 7 MB scaled_buf. The 7 MB
+             * GIF decoder open is gated INSIDE play_current itself
+             * (see encoder-busy guard there). Net effect: when the
+             * user lands on a gallery entry that has a .p4ms, it
+             * starts playing immediately even if a different
+             * capture's GIF is mid-encode in the background — fixes
+             * 2026-04-26 user report "p4m doesn't play on first
+             * entry, plays after I navigate away and back". */
+            app_gifs_play_current();
         }
     } else {
         lv_obj_clear_flag(ui_PanelGifsPopupSDWarning, LV_OBJ_FLAG_HIDDEN);

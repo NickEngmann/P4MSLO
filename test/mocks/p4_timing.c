@@ -51,22 +51,40 @@ p4_pipeline_timing_t p4_timing_estimate(p4_pipeline_params_t p)
     if (n > 4) n = 4;
 
     /* .p4ms save: tjpgd decode 4 cams (one per camera). Stack-bound,
-     * LUT-independent (tjpgd doesn't use the pixel_lut). */
+     * LUT-independent (tjpgd doesn't use the pixel_lut). With
+     * boost_dual_core, the n cams split 2/2 across cores — small
+     * 240×240 canvas (115 KB) fits twice in any heap, so true
+     * parallelism is realizable. */
     if (p.save_p4ms) {
-        t.p4ms_save_ms = apply_penalty(P4_TIMING_P4MS_PER_FRAME_MS * n, p.stack);
+        int p4ms = apply_penalty(P4_TIMING_P4MS_PER_FRAME_MS * n, p.stack);
+        if (p.boost_dual_core) {
+            p4ms = (p4ms * P4_BOOST_P4MS_SAVE_PCT) / 100;
+        }
+        t.p4ms_save_ms = p4ms;
     }
 
     /* Pass 1: palette accumulation, n decodes. Stack-bound. Doesn't
-     * touch the per-encode pixel_lut. */
-    t.pass1_ms = apply_penalty(P4_TIMING_PALETTE_PER_FRAME_MS * n, p.stack);
-    t.pass1_ms += P4_TIMING_PALETTE_LUT_BUILD_MS;
+     * touch the per-encode pixel_lut. With boost_dual_core, Core 0
+     * helps decode + accumulate in parallel — apply
+     * P4_BOOST_PASS1_PCT to the n-frame portion. The LUT-build at
+     * the end is single-threaded (median-cut) and unchanged. */
+    int pass1_decodes = apply_penalty(P4_TIMING_PALETTE_PER_FRAME_MS * n, p.stack);
+    if (p.boost_dual_core) {
+        pass1_decodes = (pass1_decodes * P4_BOOST_PASS1_PCT) / 100;
+    }
+    t.pass1_ms = pass1_decodes + P4_TIMING_PALETTE_LUT_BUILD_MS;
 
     /* Pass 2: forward — n frames. Decode is stack-only; encode (dither
-     * + LZW) is stack × LUT. */
+     * + LZW) is stack × LUT. With boost_dual_core, Core 0 prefetches
+     * the next frame's JPEG from SD while Core 1 dithers the current
+     * — apply P4_BOOST_PASS2_FWD_PCT. */
     int decode_part = apply_penalty(P4_TIMING_DECODE_PER_FRAME_MS * n, p.stack);
     int encode_part = apply_pass2_penalty(P4_TIMING_ENCODE_PER_FRAME_MS * n,
                                            p.stack, p.lut);
     t.pass2_forward_ms = decode_part + encode_part;
+    if (p.boost_dual_core) {
+        t.pass2_forward_ms = (t.pass2_forward_ms * P4_BOOST_PASS2_FWD_PCT) / 100;
+    }
 
     /* Pass 2: reverse — (n-2) middle frames replayed from cache, no
      * LZW re-encode but the file write still costs SD throughput. */

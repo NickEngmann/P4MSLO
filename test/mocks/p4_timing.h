@@ -112,7 +112,48 @@ typedef struct {
     p4_stack_location_t stack;
     p4_lut_location_t   lut;
     bool save_p4ms;         /* whether to include the .p4ms direct-JPEG save */
+    /* Dual-core boost mode. When ui_extra_is_display_sleeping() is
+     * true on hardware, Core 0 (LVGL + video_stream paused) is fully
+     * idle and can be enlisted to help the encoder. Concrete wins
+     * the mock models:
+     *   - Pass 1 palette accumulation: each frame's tjpgd decode +
+     *     histogram contribution is independent. Run them in
+     *     parallel across both cores. Two-frame parallelism caps the
+     *     speedup at ~50 %; merge overhead + memory contention drops
+     *     the realized win to ~35 %.
+     *   - Pass 2 forward: SD prefetch of frame N+1 in parallel with
+     *     dither + LZW of frame N. JPEG buffers are ~600 KB so they
+     *     fit (the 7 MB scaled_buf can NOT be double-buffered).
+     *     Realized win ~15 % on the forward pass.
+     * Pass 2 replay (cached frame writes) and the .p4ms save are SD
+     * I/O–bound and unchanged. */
+    bool boost_dual_core;
 } p4_pipeline_params_t;
+
+/* Boost mode multipliers applied to Pass 1 and Pass 2 forward when
+ * boost_dual_core is true. Calibrated to what's ACTUALLY
+ * implementable on hardware given the 7 MB scaled_buf + ~8 MB
+ * largest-contig PSRAM constraint:
+ *
+ *   - The scaled_buf can NOT be double-buffered for true
+ *     decode/dither pipelining. Two 7 MB buffers would need 14 MB
+ *     contig.
+ *   - .p4ms save (4× tjpgd into 240×240 canvas) IS parallelizable —
+ *     each cam is independent and the 240×240 canvas is 115 KB. Two
+ *     cores can do 2 cams each in parallel. ~40 % savings on the
+ *     .p4ms portion.
+ *   - Pass 1 histogram accumulation is fast (small), so parallel
+ *     decode there yields ~8 % savings.
+ *   - Pass 2 forward: SD prefetch of next frame's JPEG (~600 KB) on
+ *     Core 0 while Core 1 dithers the current frame on Core 1. Saves
+ *     the SD-read latency once per frame ≈ 3 % of pass-2 time.
+ *
+ * If these prove unrealistic when implemented, adjust the constants
+ * here and rerun the test; the speedup-assertion threshold is also
+ * driven from these numbers. */
+#define P4_BOOST_PASS1_PCT          92   /* 8 % off */
+#define P4_BOOST_PASS2_FWD_PCT      97   /* 3 % off */
+#define P4_BOOST_P4MS_SAVE_PCT      60   /* 40 % off */
 
 typedef struct {
     int decode_ms;

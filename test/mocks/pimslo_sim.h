@@ -180,6 +180,7 @@ void   album_force_next_reacquire_fail(int n);
  * ======================================================================== */
 bool   capture_error_pending(void);
 void   simulate_advance_time_ms(int ms);   /* age the mock clock */
+int64_t simulate_clock_ms(void);            /* read the mock clock */
 
 /* ========================================================================
  * Gallery rendering model
@@ -421,3 +422,9 @@ int power_backlight_off_count(void);
 int power_backlight_on_count(void);
 int power_lvgl_stop_count(void);
 int power_lvgl_resume_count(void);
+
+/* Encoder dual-core boost telemetry (set by run_encode_pipeline
+ * each time it starts a frame; tests assert that boost ran when
+ * sleeping). */
+int encoder_boost_encode_count(void);
+int encoder_normal_encode_count(void);

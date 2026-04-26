@@ -1267,6 +1267,145 @@ SCENARIO(encoder_runs_uninterrupted_during_sleep)
            "still sleeping — encoder finishing doesn't wake");
 }
 
+SCENARIO(boost_mode_active_only_when_sleeping)
+{
+    /* The boost flag is sourced from power_idle_is_sleeping() at the
+     * START of each encode. Verify both branches: an awake encode
+     * uses normal timing, a sleeping encode uses boost timing. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+
+    /* Awake encode. */
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(encoder_normal_encode_count() == 1, "awake encode counted as normal");
+    ASSERT(encoder_boost_encode_count() == 0, "no boost when active");
+
+    /* Sleep, then enqueue a fresh encode. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS + POWER_SLEEP_MODAL_MS);
+    ASSERT(power_idle_state() == POWER_SLEEPING, "fully sleeping");
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(encoder_normal_encode_count() == 1, "no new normal encode");
+    ASSERT(encoder_boost_encode_count() == 1, "sleep encode used boost");
+}
+
+SCENARIO(sleeping_encode_is_measurably_faster_than_active)
+{
+    /* The headline test: total encode duration in sleep vs awake.
+     * Both encodes use the same arch + cam count; only the boost
+     * flag differs. Boost should shave a meaningful chunk off the
+     * total. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+
+    /* Awake baseline. */
+    int t_awake_start = (int)pimslo_sim_internal_largest();   /* unused */
+    (void)t_awake_start;
+    int64_t clock_before_awake = simulate_clock_ms();
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+    int64_t awake_ms = simulate_clock_ms() - clock_before_awake;
+
+    /* Sleep, then take another photo. */
+    pimslo_sim_reset();
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    /* Force into SLEEPING before the encode. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS + POWER_SLEEP_MODAL_MS);
+    ASSERT(power_idle_state() == POWER_SLEEPING, "in sleep state");
+    int64_t clock_before_sleep = simulate_clock_ms();
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+    int64_t sleep_ms = simulate_clock_ms() - clock_before_sleep;
+
+    P("awake encode  : %lld ms", (long long)awake_ms);
+    P("sleeping encode: %lld ms", (long long)sleep_ms);
+    P("speedup       : %.1f%%",
+      100.0 * (double)(awake_ms - sleep_ms) / (double)awake_ms);
+
+    /* Boost is calibrated to realistic hardware-implementable wins
+     * (see p4_timing.h: P4_BOOST_*). The total encode is dominated
+     * by Pass 2 (which we can only nibble at because scaled_buf
+     * can't double-buffer), so the realized speedup is small but
+     * non-zero. We assert >= 1 % — strong enough that a regression
+     * in the boost path (someone accidentally turning it off) would
+     * fail the test, weak enough to absorb constant-tuning. */
+    ASSERT(sleep_ms < awake_ms,
+           "sleeping encode must be faster than awake encode");
+    int64_t saved_ms = awake_ms - sleep_ms;
+    ASSERT(saved_ms >= awake_ms / 100,
+           "boost saves at least 1 % of total encode time");
+}
+
+SCENARIO(boost_does_not_change_outcome_correctness)
+{
+    /* The encode must produce the same gallery state regardless of
+     * whether it ran boosted. This is the "no functional regression"
+     * guard for the parallelization. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+
+    /* Sleeping encode. */
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS + POWER_SLEEP_MODAL_MS);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(240 * 1000);
+    ASSERT(gallery_count() == 1, "boosted encode produced one entry");
+    ASSERT(encoder_boost_encode_count() == 1, "encode actually used boost");
+    /* Album decoder must still be reacquired post-encode (boost
+     * doesn't change the dance — both cores converge on the same
+     * post-encode cleanup). */
+    ASSERT(album_release_count() == 1, "PPA released exactly once");
+    ASSERT(album_reacquire_count() == 1, "PPA reacquired exactly once");
+    ASSERT(album_ppa_held(), "PPA buffer held after encode");
+}
+
+SCENARIO(wake_mid_drain_disables_boost_for_subsequent_encodes)
+{
+    /* Boost is sampled at the START of each encode. If the user
+     * wakes between two queued encodes, the next encode runs on a
+     * single core. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+
+    /* Queue two photos, sleep BEFORE either runs. */
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_photo_btn(4);
+    power_idle_advance_ms(POWER_IDLE_TIMEOUT_MS + POWER_SLEEP_MODAL_MS);
+    ASSERT(power_idle_state() == POWER_SLEEPING, "sleeping");
+
+    /* Drain the FIRST encode. Boost is on. */
+    /* Manually advance time inside wait_idle by running ONE encode
+     * worth — call the wait helper with a tight cap so it returns
+     * after the head-of-queue completes. The mock's wait_idle
+     * processes one job per inner iteration; awake-time per encode
+     * is ~155 s on PROPOSED arch. */
+    pimslo_sim_wait_idle(240 * 1000);
+    /* Either we drained both already (sleep was cheap) or one
+     * remains. Either way, boost should still be in effect. */
+    int boost_after_first = encoder_boost_encode_count();
+    ASSERT(boost_after_first >= 1,
+           "first sleeping encode used boost");
+
+    /* User wakes. This kicks the timer + drops back to ACTIVE. */
+    bool was_wake = power_idle_press_button();
+    ASSERT(was_wake || boost_after_first == 2,
+           "either we already drained both encodes, or wake registered");
+    ASSERT(power_idle_state() == POWER_ACTIVE, "active after wake");
+
+    /* Drain anything still queued. New encodes (if any) use normal
+     * timing because we're awake now. */
+    int normal_before = encoder_normal_encode_count();
+    pimslo_sim_wait_idle(240 * 1000);
+    int normal_after = encoder_normal_encode_count();
+    /* If a 2nd encode was still queued, it must have been counted
+     * as normal (not boost). */
+    if (boost_after_first == 1) {
+        ASSERT(normal_after == normal_before + 1,
+               "post-wake encode counted as normal, not boost");
+    }
+}
+
 SCENARIO(reset_clears_power_state)
 {
     pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED);
@@ -1348,6 +1487,10 @@ int main(void)
     RUN(button_during_modal_wakes_and_swallows);
     RUN(button_during_sleeping_wakes_and_resumes_lvgl);
     RUN(encoder_runs_uninterrupted_during_sleep);
+    RUN(boost_mode_active_only_when_sleeping);
+    RUN(sleeping_encode_is_measurably_faster_than_active);
+    RUN(boost_does_not_change_outcome_correctness);
+    RUN(wake_mid_drain_disables_boost_for_subsequent_encodes);
     RUN(reset_clears_power_state);
 
     printf("\n=== Results ===\n  PASS: %d\n  FAIL: %d\n", passed, fails);

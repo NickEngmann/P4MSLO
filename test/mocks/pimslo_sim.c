@@ -285,6 +285,7 @@ bool capture_error_pending(void)
 }
 
 void simulate_advance_time_ms(int ms) { s_sim_clock_ms += ms; }
+int64_t simulate_clock_ms(void) { return s_sim_clock_ms; }
 
 /* ========================================================================
  * Camera viewfinder buffer model — catches stale-pointer use-after-free
@@ -484,6 +485,13 @@ static bool encode_should_defer(void)
     return false;
 }
 
+/* Forward declarations for power_idle / encoder-boost telemetry —
+ * the real definitions live in the power-saving section further
+ * down; run_encode_pipeline references them. */
+bool power_idle_is_sleeping(void);
+static int s_encoder_boost_count;
+static int s_encoder_normal_count;
+
 static int run_encode_pipeline(int n_cams, const char *stem)
 {
     s_is_encoding = true;
@@ -493,9 +501,20 @@ static int run_encode_pipeline(int n_cams, const char *stem)
      * decoder handle stays alive (release does NOT destroy it). */
     album_decoder_release_ppa();
 
+    /* Dual-core boost is only available while the device is sleeping
+     * — that's the whole premise: Core 0 (LVGL + video_stream paused)
+     * is genuinely free to help. If the user wakes mid-encode the
+     * boost goes off; the model snapshots the state at the start of
+     * each encode so each frame's modeled time is consistent for the
+     * scenario duration. Tests can flip the device into sleep
+     * BEFORE pimslo_sim_wait_idle to exercise the boost path. */
+    bool boost = power_idle_is_sleeping();
+    if (boost) s_encoder_boost_count++;
+    else       s_encoder_normal_count++;
     p4_pipeline_timing_t t = p4_timing_estimate((p4_pipeline_params_t){
         .n_cams = n_cams, .stack = encoder_stack_location(),
         .lut = encoder_lut_location(), .save_p4ms = true,
+        .boost_dual_core = boost,
     });
 
     /* Allocate encoder buffers (PSRAM). The 7 MB scaled_buf is what
@@ -702,6 +721,10 @@ static int           s_backlight_off_count = 0;
 static int           s_backlight_on_count = 0;
 static int           s_lvgl_stop_count = 0;
 static int           s_lvgl_resume_count = 0;
+/* s_encoder_boost_count / s_encoder_normal_count are forward-declared
+ * earlier in the file (above run_encode_pipeline). They're tentative
+ * definitions; this is just where they get their initialization
+ * intent — actual zero-init happens in BSS. */
 
 static void power_enter_sleep_modal(void)
 {
@@ -742,6 +765,7 @@ void power_idle_init(void)
     s_modal_entered_clock_ms = 0;
     s_backlight_off_count = s_backlight_on_count = 0;
     s_lvgl_stop_count = s_lvgl_resume_count = 0;
+    s_encoder_boost_count = s_encoder_normal_count = 0;
 }
 
 void power_idle_kick(void)
@@ -801,6 +825,8 @@ int power_backlight_off_count(void) { return s_backlight_off_count; }
 int power_backlight_on_count(void)  { return s_backlight_on_count; }
 int power_lvgl_stop_count(void)     { return s_lvgl_stop_count; }
 int power_lvgl_resume_count(void)   { return s_lvgl_resume_count; }
+int encoder_boost_encode_count(void)  { return s_encoder_boost_count; }
+int encoder_normal_encode_count(void) { return s_encoder_normal_count; }
 
 /* ========================================================================
  * Init / shutdown

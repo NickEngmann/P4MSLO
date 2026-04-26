@@ -55,3 +55,10 @@ add_executable(test_e2e
     ${MOCK_DIR}/pimslo_sim.c
 )
 target_include_directories(test_e2e PRIVATE ${MOCK_DIR})
+
+# Pure bound-math test for the tjpgd output callbacks. No memory
+# model, no budget catalog — just iterates the inverse-floor mapping
+# at realistic source/canvas dimensions and asserts complete coverage.
+add_executable(test_jpeg_bounds
+    test_jpeg_bounds.c
+)

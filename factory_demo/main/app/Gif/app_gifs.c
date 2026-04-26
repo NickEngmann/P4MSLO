@@ -1861,16 +1861,30 @@ static int jpeg_out_cb(JDEC *jd, void *bitmap, JRECT *rect)
     const int cw = c->canvas_w;
     const int ch = c->canvas_h;
 
-    /* Output rows whose nearest source falls inside this MCU:
-     *   out_y s.t.  src_y_start <= out_y * sh / ch <= src_y_end
-     * i.e. out_y in [ceil(src_y_start*ch/sh), floor(src_y_end*ch/sh)]. */
+    /* Output rows whose nearest source falls inside this MCU.
+     *
+     * The forward map is `src_y = (out_y * sh) / ch` (integer floor).
+     * The inverse must be the consistent inverse OF FLOOR, NOT the
+     * floor of the inverse:
+     *   out_y_lo = smallest out_y where floor(out_y * sh / ch) >= src_y_start
+     *            = ceil(src_y_start * ch / sh)
+     *   out_y_hi = largest  out_y where floor(out_y * sh / ch) <= src_y_end
+     *            = ((src_y_end + 1) * ch - 1) / sh    [integer div]
+     *
+     * The earlier `(src_y_end * ch) / sh` form was the floor of the
+     * inverse, which loses one canvas cell at every MCU boundary
+     * where the source pixel that should serve it falls exactly on
+     * the boundary. Same bug fixed in jpeg_crop_out_cb (.p4ms path)
+     * earlier — they share the inverse-floor pattern. Symptom on
+     * the show_jpeg path: faint visible gaps / blue pixels every
+     * 8 columns/rows on the JPEG preview at 1920→240 ratios. */
     int out_y_lo = (src_y_start * ch + sh - 1) / sh;
-    int out_y_hi = (src_y_end   * ch) / sh;
+    int out_y_hi = ((src_y_end + 1) * ch - 1) / sh;
     if (out_y_lo < 0) out_y_lo = 0;
     if (out_y_hi >= ch) out_y_hi = ch - 1;
 
     int out_x_lo = (src_x_start * cw + sw - 1) / sw;
-    int out_x_hi = (src_x_end   * cw) / sw;
+    int out_x_hi = ((src_x_end + 1) * cw - 1) / sw;
     if (out_x_lo < 0) out_x_lo = 0;
     if (out_x_hi >= cw) out_x_hi = cw - 1;
 
@@ -1919,9 +1933,21 @@ static esp_err_t show_jpeg(const char *path)
         return ESP_FAIL;
     }
 
-    /* Shared tjpgd work buffer — see s_tjpgd_work comment at file top. */
-    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        ESP_LOGW(TAG, "show_jpeg: tjpgd mutex timeout");
+    /* Shared tjpgd work buffer — see s_tjpgd_work comment at file top.
+     *
+     * 30 s timeout (was 5 s). Why 30 s: with err_cur/err_nxt now in
+     * PSRAM (commit 1ac42a1), encoder Pass 2 frames take ~22 s each
+     * including the encoder's ~1.7 s tjpgd-mutex hold. If show_jpeg
+     * runs concurrently with an active encoder frame, 5 s wasn't
+     * enough — show_jpeg returned TIMEOUT and the canvas's blue 0x10
+     * memset background stayed visible. User-visible symptom: gallery
+     * preview is solid blue when entered while another encode is mid-
+     * frame. 30 s covers the worst case (encoder frame + p4ms decode
+     * + small slack). The encoder releases the mutex AROUND each frame
+     * (decode → release → dither+LZW → next-frame decode → reacquire)
+     * so the longest single hold is the decode phase, ~1.7 s. */
+    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        ESP_LOGW(TAG, "show_jpeg: tjpgd mutex timeout (>30 s — encoder stuck?)");
         heap_caps_free(jpeg_buf);
         return ESP_ERR_TIMEOUT;
     }

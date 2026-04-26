@@ -116,6 +116,24 @@ static int tjpgd_output(JDEC *jd, void *bitmap, JRECT *rect)
     int bw = rect->right - rect->left + 1;
     int bh = rect->bottom - rect->top + 1;
 
+    /* Bound the writable element range for explicit overflow protection.
+     * Diagnostic: the encoder used to occasionally corrupt a heap tail
+     * canary in PSRAM with RGB565 pixel data — a sign that some MCU
+     * rectangle was being written past the end of out_buf. With the
+     * canary enabled (HEAP_POISONING_LIGHT) the panic appeared on a
+     * subsequent free, NOT at the offending write, so the offender was
+     * hard to localize. Explicit clamp here AND a one-shot ESP_LOGE
+     * pinpoint the exact MCU that misbehaves. The clamp `< 0` paths are
+     * defensive — tjpgd's RECT shouldn't go negative but corrupted JPEG
+     * headers have been observed. */
+    const int out_w = ctx->out_width;
+    /* In the crop path, valid dst_y is [0, crop_h - 1] and dst_x is
+     * [0, crop_w - 1]. In the no-crop path the buffer height is
+     * effectively the JPEG height (set in decode_and_scale_jpeg from
+     * src_h on first frame), but we don't know it here, so we conservatively
+     * clamp via the alloc bound: (out_buf_size_bytes / 2 / out_width). */
+    const int out_h_max_crop = ctx->crop_h;
+
     for (int y = 0; y < bh; y++) {
         int src_y = rect->top + y;
 
@@ -123,19 +141,37 @@ static int tjpgd_output(JDEC *jd, void *bitmap, JRECT *rect)
         if (ctx->crop_w > 0) {
             if (src_y < ctx->crop_y || src_y >= ctx->crop_y + ctx->crop_h) continue;
             int dst_y = src_y - ctx->crop_y;
+            if (dst_y < 0 || dst_y >= out_h_max_crop) {
+                ESP_LOGE(TAG, "tjpgd_output: dst_y %d out of [0,%d) "
+                              "(rect=[%d,%d,%d,%d] crop=[%d,%d,%d,%d])",
+                         dst_y, out_h_max_crop,
+                         rect->left, rect->top, rect->right, rect->bottom,
+                         ctx->crop_x, ctx->crop_y, ctx->crop_w, ctx->crop_h);
+                continue;
+            }
 
             const uint8_t *src_row = &src[y * bw * 3];
             for (int x = 0; x < bw; x++) {
                 int src_x = rect->left + x;
                 if (src_x < ctx->crop_x || src_x >= ctx->crop_x + ctx->crop_w) continue;
                 int dst_x = src_x - ctx->crop_x;
+                if (dst_x < 0 || dst_x >= ctx->crop_w) {
+                    ESP_LOGE(TAG, "tjpgd_output: dst_x %d out of [0,%d)",
+                             dst_x, ctx->crop_w);
+                    continue;
+                }
                 uint8_t r = src_row[x * 3], g = src_row[x * 3 + 1], b = src_row[x * 3 + 2];
-                ctx->out_buf[dst_y * ctx->out_width + dst_x] =
+                ctx->out_buf[dst_y * out_w + dst_x] =
                     ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
             }
         } else {
-            /* No crop — write directly */
-            uint16_t *dst_row = &ctx->out_buf[src_y * ctx->out_width + rect->left];
+            /* No crop — write directly. Without an out_h on ctx we
+             * trust tjpgd's RECT to stay within the JPEG bounds that
+             * decode_and_scale_jpeg used to size out_buf. If the
+             * caller ever feeds a JPEG larger than the prior JPEG that
+             * sized scaled_buf, this path WILL overrun. Logged once
+             * per decode for diagnosis. */
+            uint16_t *dst_row = &ctx->out_buf[src_y * out_w + rect->left];
             const uint8_t *src_row = &src[y * bw * 3];
             for (int x = 0; x < bw; x++) {
                 uint8_t r = src_row[x * 3], g = src_row[x * 3 + 1], b = src_row[x * 3 + 2];

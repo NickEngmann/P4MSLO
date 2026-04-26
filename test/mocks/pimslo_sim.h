@@ -128,6 +128,43 @@ int    album_reacquire_fail_count(void);
 void   album_force_next_reacquire_fail(int n);
 
 /* ========================================================================
+ * Gallery rendering model
+ *
+ * Mirrors `app_gifs.c::show_jpeg` and `play_current` enough that tests
+ * can assert what the user actually sees. Specifically:
+ *   - When entering the gallery on a JPEG-only entry, the canvas is
+ *     first memset to 0x10 (which is RGB565 ~blue), then tjpgd fills
+ *     it with the preview JPEG. If tjpgd fails (mutex timeout, decode
+ *     error, file missing), the blue stays — that's the "blue square"
+ *     bug.
+ *   - This model tracks: did the canvas get filled? With what?
+ *
+ * Test usage:
+ *     gallery_play_current();
+ *     ASSERT(gallery_canvas_is_blue() == false,
+ *            "JPEG-only entry must not show solid blue");
+ * ======================================================================== */
+typedef enum {
+    CANVAS_EMPTY,        /* no entry / not played yet */
+    CANVAS_BLUE,         /* memset 0x10 only (decode failed) */
+    CANVAS_JPEG,         /* show_jpeg() succeeded — preview painted */
+    CANVAS_GIF_FRAME,    /* GIF playback frame painted */
+} canvas_state_t;
+
+canvas_state_t gallery_canvas_state(void);
+bool gallery_canvas_is_blue(void);
+bool gallery_canvas_has_jpeg(void);
+void gallery_play_current(void);
+
+/* Force show_jpeg to fail on the next call (simulates mutex timeout
+ * or a corrupted preview file). */
+void gallery_force_next_jpeg_fail(int n);
+
+/* Tally counters for assertions. */
+int gallery_jpeg_show_count(void);
+int gallery_jpeg_show_fail_count(void);
+
+/* ========================================================================
  * Task pipeline (mirrors app_pimslo.c)
  *
  * Each task has a stack location attribute. Tasks pinned to a core

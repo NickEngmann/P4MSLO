@@ -581,6 +581,119 @@ SCENARIO(long_sequence_internal_largest_does_not_shrink)
     ASSERT(gallery_count() == 30, "all 30 captures made it through");
 }
 
+/* Gallery rendering scenarios — model the `blue square` bug.
+ *
+ * `app_gifs.c::show_jpeg` memsets the canvas to byte 0x10 (which is
+ * RGB565 0x1010 ≈ dim blue) BEFORE tjpgd decodes the JPEG into it.
+ * If tjpgd fails (mutex timeout, decode error, file missing), the
+ * blue background stays visible. User-visible symptom is "JPEG-only
+ * gallery entry shows solid blue instead of the captured photo." */
+
+SCENARIO(jpeg_only_entry_paints_jpeg_not_blue)
+{
+    /* Happy path: a JPEG-only entry's preview JPEG decodes
+     * successfully and the canvas shows the photo, not the blue
+     * memset background. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_CAMERA);
+
+    /* Take a photo; it goes into the queue. The encoder doesn't run
+     * yet because we're on a camera page (deferred). */
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    ASSERT(r.cams_usable == 4, "captured 4/4");
+
+    /* User navigates to gallery. With encode deferred, this entry is
+     * JPEG-only (PROCESSING/QUEUED state). */
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_scan();
+    ASSERT(gallery_count() == 1, "one entry in gallery");
+
+    /* play_current → show_jpeg → canvas painted with JPEG. */
+    gallery_play_current();
+    ASSERT(!gallery_canvas_is_blue(),
+           "JPEG-only entry MUST NOT show solid blue (the memset background)");
+    ASSERT(gallery_canvas_has_jpeg(),
+           "canvas should be in JPEG state after play_current");
+    ASSERT(gallery_jpeg_show_count() == 1, "show_jpeg called exactly once");
+    ASSERT(gallery_jpeg_show_fail_count() == 0, "show_jpeg succeeded");
+}
+
+SCENARIO(jpeg_show_failure_leaves_blue_canvas)
+{
+    /* Regression: when show_jpeg fails (mutex timeout, decode error),
+     * the canvas stays blue. The mock catches this so e2e can assert
+     * the failure mode is at least DETECTABLE (logged) instead of
+     * showing the user blue silently. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_CAMERA);
+    pimslo_sim_photo_btn(4);
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_scan();
+
+    gallery_force_next_jpeg_fail(1);
+    gallery_play_current();
+    ASSERT(gallery_canvas_is_blue(),
+           "forced show_jpeg failure → canvas stays blue (this IS the user-visible bug)");
+    ASSERT(gallery_jpeg_show_fail_count() == 1, "fail count tracks");
+
+    /* Next play_current should succeed (force-fail consumed). */
+    gallery_play_current();
+    ASSERT(gallery_canvas_has_jpeg(),
+           "subsequent play_current succeeds when force-fail is consumed");
+}
+
+SCENARIO(gif_entry_with_preview_flashes_jpeg_first)
+{
+    /* When a GIF entry has an attached preview JPEG (the typical case
+     * after PIMSLO encode finishes), play_current flashes the JPEG
+     * first, then starts the GIF. Both paint the canvas in sequence. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(180 * 1000);
+    /* After encode, entry has both .gif and .jpg. */
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_scan();
+    const gallery_entry_t *e = gallery_current();
+    ASSERT(e && e->has_gif && e->has_jpeg,
+           "GIF entry should have both .gif and .jpg");
+
+    gallery_play_current();
+    /* After full play_current the canvas has cycled JPEG → GIF frame. */
+    ASSERT(gallery_canvas_state() == CANVAS_GIF_FRAME,
+           "GIF entry ends in GIF frame state");
+    ASSERT(gallery_jpeg_show_count() == 1,
+           "JPEG flash happens once before the GIF takes over");
+}
+
+SCENARIO(gallery_nav_replays_preview)
+{
+    /* After navigating between entries, each play_current re-flashes
+     * the JPEG. Catches the case where a stale "blue" state from a
+     * prior failed decode bleeds into the next entry. */
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_MAIN);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_photo_btn(4);
+    pimslo_sim_wait_idle(360 * 1000);
+
+    ui_extra_set_current_page(UI_PAGE_GIFS);
+    gallery_scan();
+    ASSERT(gallery_count() == 2, "two GIF entries");
+
+    /* Force first show_jpeg to fail. */
+    gallery_force_next_jpeg_fail(1);
+    gallery_play_current();
+    ASSERT(gallery_canvas_is_blue() || gallery_canvas_state() == CANVAS_GIF_FRAME,
+           "first entry: failed JPEG flash, falls through to GIF");
+
+    /* Nav to next entry. The fresh play_current should show JPEG. */
+    gallery_next();
+    gallery_play_current();
+    ASSERT(!gallery_canvas_is_blue(), "second entry recovers — no stale blue");
+    ASSERT(gallery_jpeg_show_fail_count() == 1, "exactly one forced failure");
+}
+
 SCENARIO(album_decoder_released_during_encode)
 {
     /* When the encoder runs, it must drop the ~6 MB PPA buffer that
@@ -702,6 +815,11 @@ int main(void)
     RUN(rapid_burst_captures_all_eventually_encode);
 
     RUN(long_sequence_internal_largest_does_not_shrink);
+    RUN(jpeg_only_entry_paints_jpeg_not_blue);
+    RUN(jpeg_show_failure_leaves_blue_canvas);
+    RUN(gif_entry_with_preview_flashes_jpeg_first);
+    RUN(gallery_nav_replays_preview);
+
     RUN(album_decoder_released_during_encode);
     RUN(album_reacquire_failure_is_non_fatal);
     RUN(album_dance_alloc_releases_psram_for_encoder);

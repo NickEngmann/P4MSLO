@@ -187,6 +187,65 @@ int    album_reacquire_fail_count(void)  { return s_album.reacquire_fail_count; 
 void   album_force_next_reacquire_fail(int n) { s_album.force_fail_remaining = n; }
 
 /* ========================================================================
+ * Gallery canvas rendering model (mirrors app_gifs.c::play_current)
+ * ======================================================================== */
+static struct {
+    canvas_state_t state;
+    int show_count;
+    int show_fail_count;
+    int force_fail_remaining;
+} s_canvas;
+
+canvas_state_t gallery_canvas_state(void) { return s_canvas.state; }
+bool gallery_canvas_is_blue(void)         { return s_canvas.state == CANVAS_BLUE; }
+bool gallery_canvas_has_jpeg(void)        { return s_canvas.state == CANVAS_JPEG; }
+int  gallery_jpeg_show_count(void)        { return s_canvas.show_count; }
+int  gallery_jpeg_show_fail_count(void)   { return s_canvas.show_fail_count; }
+void gallery_force_next_jpeg_fail(int n)  { s_canvas.force_fail_remaining = n; }
+
+/* Mirrors app_gifs.c::show_jpeg flow: memset to 0x10 (blue) FIRST,
+ * then tjpgd-decode into the canvas. If decode fails, blue stays.
+ * Returns 0 on success, -1 on failure (host int — no esp_err_t in
+ * pimslo_sim.c's scope without pulling in the firmware esp_err.h). */
+static int sim_show_jpeg(const char *path)
+{
+    s_canvas.show_count++;
+    s_canvas.state = CANVAS_BLUE;   /* memset(canvas, 0x10, ...) */
+
+    if (!path || path[0] == '\0') {
+        s_canvas.show_fail_count++;
+        return -1;
+    }
+    if (s_canvas.force_fail_remaining > 0) {
+        s_canvas.force_fail_remaining--;
+        s_canvas.show_fail_count++;
+        return -1;
+    }
+    /* tjpgd decode succeeded — canvas now has JPEG content. */
+    s_canvas.state = CANVAS_JPEG;
+    return 0;
+}
+
+void gallery_play_current(void)
+{
+    const gallery_entry_t *e = gallery_current();
+    if (!e) {
+        s_canvas.state = CANVAS_EMPTY;
+        return;
+    }
+    if (e->type == GALLERY_ENTRY_JPEG) {
+        sim_show_jpeg(e->jpeg_path);
+        return;
+    }
+    /* GIF entry: show JPEG flash first if we have one, then "play"
+     * the GIF (here just mark canvas as a GIF frame). */
+    if (e->jpeg_path[0]) {
+        sim_show_jpeg(e->jpeg_path);
+    }
+    s_canvas.state = CANVAS_GIF_FRAME;
+}
+
+/* ========================================================================
  * Architecture switch
  * ======================================================================== */
 static pimslo_sim_arch_t s_arch = PIMSLO_ARCH_BASELINE;
@@ -421,6 +480,7 @@ void pimslo_sim_init(void)
     s_encode_queue_head = s_encode_queue_tail = 0;
     s_sim_clock_ms = 0;
     memset(&s_album, 0, sizeof(s_album));
+    memset(&s_canvas, 0, sizeof(s_canvas));
 }
 
 void pimslo_sim_shutdown(void)

@@ -62,3 +62,9 @@ target_include_directories(test_e2e PRIVATE ${MOCK_DIR})
 add_executable(test_jpeg_bounds
     test_jpeg_bounds.c
 )
+
+# Bin-uniqueness check for gif_quantize CUBE_IDX. Asserts every
+# (r,g,b) triple in [0,63]³ maps to a unique histogram index.
+add_executable(test_quantize_bins
+    test_quantize_bins.c
+)

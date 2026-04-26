@@ -45,14 +45,20 @@ def main():
         _lib.do(s, 'status', 2, fh)
 
         _lib.mark(fh, 'PHASE 3 — park 90 s so encode can run + complete')
+        # Capture baseline `PIMSLO GIF saved to` count BEFORE PHASE 3
+        # and break only when a NEW save fires. In suite-mode the prior
+        # tests have already left at least one such line in the log,
+        # which made the break-on-first-match exit immediately and
+        # dropped ping_pong below the >= 3 floor.
+        with open(LOG) as lf:
+            baseline = lf.read().count('PIMSLO GIF saved to')
         t_end = time.time() + 90
         while time.time() < t_end:
             _lib.drain(s, 15, fh)
             _lib.do(s, 'ping', 1, fh)
             with open(LOG) as lf:
-                t = lf.read()
-            if 'PIMSLO GIF saved to' in t:
-                break
+                if lf.read().count('PIMSLO GIF saved to') > baseline:
+                    break
 
         _lib.mark(fh, 'PHASE 4 — after encode, verify scan rebuilt entries')
         _lib.do(s, 'status', 2, fh)

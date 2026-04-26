@@ -15,12 +15,21 @@
 
 static const char *TAG = "gif_quant";
 
-/* 6-bit color cube: 64x64x64 = 262144 bins (1MB in PSRAM) */
+/* 6-bit color cube: 64x64x64 = 262144 bins (1 MB in PSRAM as uint32).
+ *
+ * Index spacing must be 6 bits per channel. The earlier 5-bit-spaced
+ * formula `(r << 10) | (g << 5) | b` had bit-10 overlap between r's
+ * LSB and g's MSB, so many (r,g,b) triples collided onto the same
+ * histogram bin (e.g. (0,32,0) and (1,32,0) both → index 1024). That
+ * silently degraded palette quality on dim/dark scenes where r ≤ 1.
+ *
+ * 6-bit spacing: r in bits 12-17, g in bits 6-11, b in bits 0-5.
+ * No overlap. Max index = (63<<12)|(63<<6)|63 = 262143 = CUBE_TOTAL-1. */
 #define CUBE_BITS  6
 #define CUBE_SIZE  (1 << CUBE_BITS)  /* 64 */
-#define CUBE_TOTAL (CUBE_SIZE * CUBE_SIZE * CUBE_SIZE)  /* 32768 */
+#define CUBE_TOTAL (CUBE_SIZE * CUBE_SIZE * CUBE_SIZE)  /* 262144 */
 
-#define CUBE_IDX(r5, g5, b5) (((r5) << 10) | ((g5) << 5) | (b5))
+#define CUBE_IDX(r6, g6, b6) (((r6) << 12) | ((g6) << 6) | (b6))
 
 struct gif_quantize_ctx {
     uint32_t *histogram;  /* CUBE_TOTAL entries, allocated in PSRAM */

@@ -84,6 +84,14 @@ void gallery_mark_opened(void);   /* called when user enters UI_PAGE_GIFS */
 /* Inserts entry by writing to the simulated SD layout. */
 void gallery_record_capture(const char *stem, bool has_gif, bool has_jpeg, bool has_p4ms);
 
+/* Simulate a leftover orphan from a prior interrupted encode: a
+ * 0-byte .gif AND/OR a capture dir with 0-1 pos*.jpg files. The
+ * gallery-scan cleanup logic should drop these without showing them
+ * as gallery entries. */
+void gallery_inject_orphan_gif(const char *stem);
+void gallery_inject_orphan_capture_dir(const char *stem, int pos_files);
+int  gallery_orphan_cleanup_count(void);
+
 /* Mirrors app_gifs_delete_current: removes the current entry from the
  * list (drops the simulated .gif/.p4ms/.jpeg files), clamps current
  * index to remain valid. Called by tests that exercise the delete-
@@ -123,9 +131,55 @@ int    album_release_count(void);           /* tally for assertions */
 int    album_reacquire_count(void);
 int    album_reacquire_fail_count(void);
 
+/* ========================================================================
+ * Camera viewfinder buffer model (mirrors app_video_stream.c)
+ *
+ * `scaled_camera_buf` (~4 MB), `jpg_buf` (~835 KB), and
+ * `shared_photo_buf` (~1.8 MB) are allocated at boot, freed by
+ * `app_video_stream_free_buffers()` on every PIMSLO photo cycle and
+ * every background encode, and re-allocated at NEW addresses by
+ * `app_video_stream_realloc_buffers()`. Any consumer caching these
+ * pointers (app_video_photo, app_video_record) reads STALE pointers
+ * after the first free+realloc — writes to freed PSRAM blocks → heap
+ * corruption.
+ *
+ * The mock tracks: each buffer's "current address" (just an integer
+ * generation counter), plus consumer-side cached pointers. After
+ * `viewfinder_free_buffers` + `viewfinder_realloc_buffers`, the
+ * generation increments. Tests assert that consumers refresh on
+ * use, NOT cache at init.
+ * ======================================================================== */
+void   viewfinder_init_buffers(void);          /* allocates at "gen 1" */
+void   viewfinder_free_buffers(void);          /* frees current */
+void   viewfinder_realloc_buffers(void);       /* frees + allocates "gen N+1" */
+int    viewfinder_buf_generation(void);        /* current gen counter */
+bool   viewfinder_buffers_alive(void);         /* are they currently allocated? */
+
+/* Consumer-side simulated cache. Set by `consumer_cache_buffers()`
+ * (mirrors app_video_photo_init's caching pattern). When the consumer
+ * reads its cached pointer via `consumer_use_buffers()`, the model
+ * returns whether the read was valid (gen still matches). */
+void   consumer_cache_buffers(void);           /* simulates caching at boot */
+bool   consumer_use_buffers(void);             /* returns false if stale */
+void   consumer_refresh_buffers(void);         /* the FIX — refresh before use */
+
 /* Force the next N album reacquire calls to fail (simulates PSRAM
  * fragmentation). */
 void   album_force_next_reacquire_fail(int n);
+
+/* ========================================================================
+ * Capture-error-overlay state
+ *
+ * When SPI capture returns 0 usable cameras, the firmware sets a
+ * 3-second window during which the saving overlay is replaced with a
+ * red "ERROR" pill so the user gets explicit feedback that the photo
+ * failed (instead of silent disappearance). Tests can assert:
+ *   - 0-cam capture → error_pending() = true for ~3 s
+ *   - subsequent successful capture clears the flag immediately
+ *   - error window auto-expires after timeout
+ * ======================================================================== */
+bool   capture_error_pending(void);
+void   simulate_advance_time_ms(int ms);   /* age the mock clock */
 
 /* ========================================================================
  * Gallery rendering model

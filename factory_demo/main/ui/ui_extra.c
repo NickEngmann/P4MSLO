@@ -677,17 +677,34 @@ static void saving_timer_cb(lv_timer_t *timer)
      * confusing. If the user wants to see warm-up feedback we should
      * add a distinct "starting camera..." overlay rather than reusing
      * the saving one. */
-    bool should_show = on_camera && app_pimslo_is_capturing();
+    bool error_pending = app_pimslo_capture_error_pending();
+    bool should_show = on_camera && (app_pimslo_is_capturing() || error_pending);
 
     bool currently_hidden = lv_obj_has_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
 
     if (should_show) {
-        static const char *patterns[6] = {
-            "saving", "saving.", "saving..", "saving...",
-            "saving..", "saving.",
-        };
-        lv_label_set_text(saving_label, patterns[saving_dot_step % 6]);
-        saving_dot_step++;
+        if (error_pending) {
+            /* 0-cam capture or save-queue-full failure. User needs to
+             * know the photo didn't land — silent failure trains them
+             * to assume "if I see saving, my photo got saved", which
+             * is wrong here. Switch to a red ERROR pill that stays for
+             * ~3 s (see PIMSLO_ERROR_OVERLAY_MS in app_pimslo.c). */
+            lv_label_set_text(saving_label, "ERROR");
+            lv_obj_set_style_bg_color(saving_label,
+                                       lv_color_make(0xc0, 0x20, 0x20), 0);
+            lv_obj_set_style_text_color(saving_label, lv_color_white(), 0);
+        } else {
+            /* Normal saving animation. Reset color in case the previous
+             * capture left us in the red ERROR styling. */
+            static const char *patterns[6] = {
+                "saving", "saving.", "saving..", "saving...",
+                "saving..", "saving.",
+            };
+            lv_label_set_text(saving_label, patterns[saving_dot_step % 6]);
+            saving_dot_step++;
+            lv_obj_set_style_bg_color(saving_label, lv_color_black(), 0);
+            lv_obj_set_style_text_color(saving_label, lv_color_white(), 0);
+        }
         if (currently_hidden) {
             lv_obj_clear_flag(saving_label, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(saving_label);
@@ -1370,16 +1387,22 @@ static void lv_scroll_create(void)
 
     /* Menu entries in display order. "ALBUM" is the PIMSLO gallery
      * (GIFs + p4ms) — the legacy P4-photo album was removed. ALBUM sits
-     * right after CAMERA so users can quickly review recent captures. */
+     * right after CAMERA so users can quickly review recent captures.
+     *
+     * INTERVAL CAM and VIDEO MODE are out of scope for the PIMSLO
+     * product — the underlying code paths (UI_PAGE_INTERVAL_CAM,
+     * UI_PAGE_VIDEO_MODE, take_and_save_video, interval_photo_*) are
+     * still compiled but unreachable from the menu. Drop them from
+     * the menu so users don't trip into pages we don't test or
+     * maintain. The page-mapping table above keeps the entries so a
+     * `menu_goto interval_cam` serial command still works for
+     * diagnostics. */
     const char* btn_texts[] = {
-        "CAMERA", "ALBUM", "INTERVAL CAM", "VIDEO MODE",
-        "USB DISK", "SETTINGS"
+        "CAMERA", "ALBUM", "USB DISK", "SETTINGS"
     };
     const void* img_srcs[] = {
         &ui_img_camera_big_png,
         &ui_img_album_big_png,     /* ALBUM (PIMSLO gallery) */
-        &ui_img_interval_big_png,
-        &ui_img_video_big_png,
         &ui_img_usb_big_png,
         &ui_img_settings_big_png,
     };

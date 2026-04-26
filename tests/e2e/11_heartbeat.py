@@ -59,9 +59,14 @@ def main():
         # from a liveness smoke. Heartbeat now is pure UI + heap
         # verification; test 14 covers the capture path.
 
-        # --- 3. Page nav over all 6 pages + buttons ---
+        # --- 3. Page nav over the 4 visible menu pages + main + buttons ---
+        # 'video' and 'interval_cam' pages still exist in the firmware
+        # (UI_PAGE_VIDEO_MODE, UI_PAGE_INTERVAL_CAM enums + redirect
+        # logic) but the menu entries were removed (see ui_extra.c
+        # btn_texts). Don't exercise them here — those pages aren't
+        # part of the PIMSLO product surface anymore.
         _lib.mark(fh, '2/9 page nav')
-        for page in ['camera', 'gifs', 'video', 'usb', 'settings', 'main']:
+        for page in ['camera', 'gifs', 'usb', 'settings', 'main']:
             _lib.do(s, f'menu_goto {page}', 3, fh)
             _lib.do(s, 'ping', 1, fh)
 
@@ -104,14 +109,15 @@ def main():
     psram_largest = int(m.group(2)) if m else 0
 
     # Page-nav coverage (did we actually see each page in a status line?)
-    # Accept ≥5/6 pages — the CAMERA page transition occasionally gets
-    # eaten by stale spi_pimslo log output on the ttyACM stream when
-    # the spi_pimslo step in step 2 is still draining responses. The
-    # transition itself works; the status-response is what we miss.
+    # The PIMSLO menu has 4 entries: CAMERA, ALBUM (= UI_PAGE_GIFS),
+    # USB_DISK, SETTINGS. INTERVAL_CAM and VIDEO_MODE are still
+    # reachable via `menu_goto` for diagnostics but are not in the UI.
+    # Accept ≥3/4 menu pages — the CAMERA page transition occasionally
+    # gets eaten by stale serial output when an encoder is mid-frame.
     pages_seen = set(re.findall(r'page=(\w+)', txt))
-    want_pages = {'MAIN', 'CAMERA', 'GIFS', 'VIDEO_MODE', 'USB_DISK', 'SETTINGS'}
+    want_pages = {'MAIN', 'CAMERA', 'GIFS', 'USB_DISK', 'SETTINGS'}
     pages_missing = want_pages - pages_seen
-    enough_pages = (len(pages_seen & want_pages) >= 5)
+    enough_pages = (len(pages_seen & want_pages) >= 4)
 
     # (SPI capture smoke moved to test 14 — heartbeat no longer
     # exercises the camera path.)

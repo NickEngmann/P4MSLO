@@ -198,10 +198,28 @@ static esp_err_t decode_and_scale_jpeg(gif_encoder_t *enc,
      * Workspace is shared with show_jpeg / decode_jpeg_crop_to_canvas
      * via app_gifs's mutex. Saves 32 KB internal BSS — see CLAUDE.md
      * "Pipeline Timing" for why that matters. */
+    /* 60 s mutex acquire timeout. Multiple callers compete for the
+     * single shared `s_tjpgd_work[32768]` workspace:
+     *   - this encoder's per-frame decode (one acquire per Pass 1
+     *     and Pass 2 frame, 4-8× per encode)
+     *   - .p4ms generation in save_small_gif_from_jpegs (4× per
+     *     capture, on the same task)
+     *   - show_jpeg from the LVGL task when the user enters a
+     *     gallery entry (~650 ms hold)
+     *
+     * The .p4ms + encoder paths run serially on the same task so
+     * there's no internal contention, but show_jpeg from the LVGL
+     * task can fire concurrently. Worst-case contention: a full
+     * encode pipeline + multiple show_jpeg cycles = ~30-50 s. The
+     * earlier 5 s timeout was eating frame after frame as
+     * "Pass 2 encode failed" → 0-frame .gif written → user sees a
+     * frozen processing entry. Long timeout means the encoder
+     * waits, but eventually completes and produces a valid .gif. */
     size_t tjwork_size = 0;
-    uint8_t *tjwork = app_gifs_acquire_tjpgd_work(5000, &tjwork_size);
+    uint8_t *tjwork = app_gifs_acquire_tjpgd_work(60000, &tjwork_size);
     if (!tjwork) {
-        ESP_LOGE(TAG, "tjpgd workspace acquire timeout");
+        ESP_LOGE(TAG, "tjpgd workspace acquire timeout (>60 s — "
+                      "show_jpeg or another caller stuck?)");
         return ESP_ERR_TIMEOUT;
     }
 

@@ -17,6 +17,8 @@ test/simulator/lv_drivers/
 *.swo
 *~
 debug_gifs/
+# Local working notes (per-session debug logs; not for upstream)
+.local-debug-log.md
 # OS files
 .DS_Store
 Thumbs.db

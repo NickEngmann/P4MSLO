@@ -68,6 +68,29 @@ uint16_t app_pimslo_encoding_capture_num(void);
 bool app_pimslo_is_capturing(void);
 
 /**
+ * @brief Check if the most recent capture failed with 0 usable cameras
+ * AND the user-visible error window hasn't elapsed yet. The saving
+ * overlay swaps to a red "ERROR" pill while this is true so the user
+ * gets immediate feedback that the photo didn't land. Auto-clears
+ * after PIMSLO_ERROR_OVERLAY_MS (~3 s) of wall-clock time, OR sooner
+ * if a fresh capture starts and succeeds.
+ */
+bool app_pimslo_capture_error_pending(void);
+
+/**
+ * @brief Reserve the next P4M capture number, persist to NVS, and return it.
+ *
+ * Used by serial-cmd paths (`spi_pimslo`, `pimslo`) that don't go through
+ * the regular pimslo_capture_task. Without this, those paths would write
+ * `pimslo.gif` (basename of the literal `/sdcard/pimslo` working dir) and
+ * the user would see a non-conformant filename in the gallery instead of
+ * the standard `P4M%04d.gif` pattern. The returned number bumps the same
+ * counter the photo_btn flow uses, so subsequent regular captures stay
+ * unique.
+ */
+uint16_t app_pimslo_reserve_capture_num(void);
+
+/**
  * @brief Copy the most recent P4 photo into the preview directory, renaming
  * it to P4M<num>.jpg so the gallery can use it as a placeholder while the
  * matching GIF is still encoding.

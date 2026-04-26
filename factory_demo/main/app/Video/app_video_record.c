@@ -157,6 +157,19 @@ esp_err_t take_and_save_video(uint8_t *camera_buf, uint32_t width, uint32_t heig
     esp_err_t ret = ESP_OK;
     uint8_t *pic_buf = NULL;
 
+    /* Refresh cached buffer pointers — same use-after-free trap as
+     * app_video_photo.c. PIMSLO photo cycles + bg-encoder runs free
+     * and re-allocate scaled_camera_buf and jpg_buf with different
+     * addresses; cached statics from app_video_record_init are stale
+     * after the first such cycle. */
+    app_video_stream_get_scaled_camera_buf(&scaled_camera_buf, &scaled_camera_buf_size);
+    app_video_stream_get_jpg_buf(&jpg_buf, &rx_buffer_size);
+    if (!scaled_camera_buf || !jpg_buf) {
+        ESP_LOGE(TAG, "take_and_save_video: buffers NULL (scaled=%p jpg=%p)",
+                 scaled_camera_buf, jpg_buf);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // Maintain consistent frame rate by regulating timing
     int64_t current_time = esp_timer_get_time();
     int64_t time_since_last_frame = (current_time - recorder_ctx.last_frame_time) / 1000; // Convert to ms

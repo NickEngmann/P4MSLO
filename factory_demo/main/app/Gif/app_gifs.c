@@ -843,10 +843,13 @@ static esp_err_t decode_jpeg_crop_to_canvas(const char *jpeg_path,
      * app_video_stream_init OOM at boot (video utils 0x101), dead
      * viewfinder, user can't take a photo. Use a transient INTERNAL
      * alloc per call — fast (not PSRAM), no permanent BSS. */
-    /* Shared with show_jpeg() — see s_tjpgd_work comment at file top.
-     * Worst-case mutex hold: show_jpeg's decode (~650 ms). */
-    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        ESP_LOGW(TAG, "decode_jpeg_crop: tjpgd mutex timeout — show_jpeg holding too long?");
+    /* Shared with show_jpeg() and the encoder's decode_and_scale_jpeg.
+     * 60 s mutex acquire timeout — see the long rationale in
+     * gif_encoder.c::decode_and_scale_jpeg. Same architecture: better
+     * to wait and produce a valid .p4ms than to fail and leave the
+     * gallery showing a "PROCESSING" stub forever. */
+    if (s_tjpgd_mutex && xSemaphoreTake(s_tjpgd_mutex, pdMS_TO_TICKS(60000)) != pdTRUE) {
+        ESP_LOGW(TAG, "decode_jpeg_crop: tjpgd mutex timeout (>60 s — encoder stuck?)");
         heap_caps_free(jpeg_buf);
         return ESP_ERR_TIMEOUT;
     }
@@ -1491,19 +1494,89 @@ esp_err_t app_gifs_scan(void)
     s_ctx.entries = calloc(MAX_GIF_FILES, sizeof(gallery_entry_t));
     if (!s_ctx.entries) return ESP_ERR_NO_MEM;
 
-    /* Pass 1: every finished .gif. */
+    /* Pass 1: every finished .gif. Also clean up 0-byte / truncated
+     * .gif files that an earlier interrupted encode left behind —
+     * those would otherwise show up as empty gallery entries that
+     * play_current can't decode (the user sees a frozen blank canvas
+     * with a "PROCESSING" badge that never goes away). */
     DIR *dir = opendir(gif_dir);
     if (dir) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL && s_ctx.count < MAX_GIF_FILES) {
             if (!is_gif_file(entry->d_name) || entry->d_name[0] == '.') continue;
+            char full[MAX_PATH_LEN];
+            snprintf(full, sizeof(full), "%.200s/%.255s",
+                     gif_dir, entry->d_name);
+            /* GIF89a header is 13 bytes minimum (signature + LSD). A
+             * file smaller than that is definitely an interrupted-
+             * encode orphan. Use 32 B as the practical floor since
+             * even a single-frame valid GIF needs more than the bare
+             * header. */
+            struct stat st;
+            if (stat(full, &st) == 0 && st.st_size < 32) {
+                ESP_LOGW(TAG, "Cleaning truncated .gif (%lld B): %s",
+                         (long long)st.st_size, full);
+                unlink(full);
+                continue;
+            }
             gallery_entry_t *e = &s_ctx.entries[s_ctx.count++];
             e->type = GALLERY_ENTRY_GIF;
             e->gif_path = malloc(MAX_PATH_LEN);
-            snprintf(e->gif_path, MAX_PATH_LEN, "%.200s/%.255s",
-                     gif_dir, entry->d_name);
+            snprintf(e->gif_path, MAX_PATH_LEN, "%s", full);
         }
         closedir(dir);
+    }
+
+    /* Pass 1b: walk /sdcard/p4mslo for capture dirs that have <2
+     * pos*.jpg files AND no matching .gif AND no matching preview.
+     * These are orphans from a failed/interrupted capture. Without
+     * cleanup they accumulate forever, eating SD space and leaving
+     * users wondering why their card fills up faster than the GIF
+     * counter implies. */
+    char p4mslo_root[MAX_PATH_LEN];
+    snprintf(p4mslo_root, sizeof(p4mslo_root), "%s/p4mslo", BSP_SD_MOUNT_POINT);
+    DIR *capdir = opendir(p4mslo_root);
+    if (capdir) {
+        struct dirent *centry;
+        while ((centry = readdir(capdir)) != NULL) {
+            if (centry->d_name[0] != 'P') continue;
+            if (strncmp(centry->d_name, "P4M", 3) != 0) continue;
+            char capture_dir[MAX_PATH_LEN];
+            /* Bound %s to appease -Werror=format-truncation. d_name
+             * can be up to NAME_MAX bytes (POSIX 255) which exceeds
+             * the remaining slack in MAX_PATH_LEN once p4mslo_root
+             * is in there. PIMSLO stems are 7 chars (P4M0001) so
+             * 32 is plenty. */
+            snprintf(capture_dir, sizeof(capture_dir),
+                     "%.200s/%.32s", p4mslo_root, centry->d_name);
+            int pos_count = 0;
+            for (int k = 1; k <= 4; k++) {
+                char p[MAX_PATH_LEN + 16];
+                snprintf(p, sizeof(p), "%s/pos%d.jpg", capture_dir, k);
+                struct stat ps;
+                if (stat(p, &ps) == 0 && ps.st_size > 4) pos_count++;
+            }
+            if (pos_count >= 2) continue;   /* still encodable, leave alone */
+
+            /* Check if there's a matching .gif or .p4ms — if so, this
+             * dir is the encoder's working copy that's about to be
+             * cleaned up by the encode finalize. Don't fight it. */
+            char gif_path[MAX_PATH_LEN];
+            snprintf(gif_path, sizeof(gif_path), "%.200s/%.32s.gif",
+                     gif_dir, centry->d_name);
+            struct stat gst;
+            if (stat(gif_path, &gst) == 0) continue;
+
+            ESP_LOGW(TAG, "Cleaning orphan capture dir (%d/4 pos files): %s",
+                     pos_count, capture_dir);
+            for (int k = 1; k <= 4; k++) {
+                char p[MAX_PATH_LEN + 16];
+                snprintf(p, sizeof(p), "%s/pos%d.jpg", capture_dir, k);
+                unlink(p);
+            }
+            rmdir(capture_dir);
+        }
+        closedir(capdir);
     }
 
     /* Pass 2: JPEG previews. If a preview's PIMSLO stem matches an
@@ -2395,6 +2468,25 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
         jpeg_data[i] = NULL;
     }
 
+    /* Compute the output stem once. Normally the capture dir basename
+     * (e.g. "P4M0007") is the stem. The legacy `pimslo` / `spi_pimslo`
+     * serial commands write to `/sdcard/pimslo` (literal, no P4M number)
+     * so the basename is "pimslo" — that would land a `pimslo.gif` in
+     * the gallery, breaking the P4M%04d naming convention every other
+     * code path uses. When the input is that legacy path, reserve the
+     * next P4M slot from the same NVS-backed counter as photo_btn so
+     * the gallery sees a normal P4Mxxxx entry. */
+    const char *dir_name_raw = strrchr(capture_dir, '/');
+    dir_name_raw = dir_name_raw ? dir_name_raw + 1 : capture_dir;
+    char output_stem[16];
+    if (strcmp(dir_name_raw, "pimslo") == 0) {
+        uint16_t reserved = app_pimslo_reserve_capture_num();
+        snprintf(output_stem, sizeof(output_stem), "P4M%04u", reserved);
+        ESP_LOGI(TAG, "Legacy capture dir — assigning stem %s", output_stem);
+    } else {
+        snprintf(output_stem, sizeof(output_stem), "%.15s", dir_name_raw);
+    }
+
     /* Produce the 240×240 .p4ms now — BEFORE gif_encoder_create()
      * allocates its ~7 MB scaled_buf. Uses tjpgd on the source JPEGs
      * with the already-computed parallax crops; no GIF decoder involved,
@@ -2402,15 +2494,13 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
      * this capture from disk on future visits without ever touching
      * the GIF decoder. */
     {
-        const char *dir_name_p = strrchr(capture_dir, '/');
-        dir_name_p = dir_name_p ? dir_name_p + 1 : capture_dir;
         char p4ms_gif_path[MAX_PATH_LEN];
         snprintf(p4ms_gif_path, sizeof(p4ms_gif_path), "%s/%s/%s.gif",
-                 BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, dir_name_p);
+                 BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, output_stem);
         esp_err_t psave = save_small_gif_from_jpegs(capture_dir, p4ms_gif_path,
                                                      crops, src_pos, num_cams, delay_cs);
         if (psave == ESP_OK) {
-            ESP_LOGI(TAG, "Direct-JPEG .p4ms saved for %s", dir_name_p);
+            ESP_LOGI(TAG, "Direct-JPEG .p4ms saved for %s", output_stem);
         } else {
             ESP_LOGW(TAG, "Direct-JPEG .p4ms save failed (0x%x) — bg worker "
                           "will retry from .gif later", psave);
@@ -2461,11 +2551,10 @@ esp_err_t app_gifs_encode_pimslo_from_dir(const char *capture_dir,
      * Saves ~5s per replayed frame = ~15s for 4 cameras */
     ensure_gif_dir();
     char output_path[MAX_PATH_LEN];
-    /* Extract capture name from directory (e.g. "/sdcard/p4mslo/P4M0001" → "P4M0001") */
-    const char *dir_name = strrchr(capture_dir, '/');
-    dir_name = dir_name ? dir_name + 1 : capture_dir;
+    /* Stem already computed above (handles both regular P4Mxxxx dirs
+     * and the legacy `/sdcard/pimslo` literal-dir path). */
     snprintf(output_path, sizeof(output_path), "%s/%s/%s.gif",
-             BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, dir_name);
+             BSP_SD_MOUNT_POINT, GIF_FOLDER_NAME, output_stem);
 
     ret = gif_encoder_pass2_begin(enc, output_path);
     if (ret != ESP_OK) goto cleanup_enc;

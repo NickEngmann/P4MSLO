@@ -73,6 +73,16 @@ static volatile bool     s_capturing = false;
  * to is_capturing without a strong reason — the user-visible photo
  * cadence is now SPI-bound (~3 s/shot) and that's a major UX win. */
 static volatile bool     s_saving = false;
+
+/* Wall-clock (esp_log_timestamp() ms) until which the saving overlay
+ * should display the "ERROR" state instead of the "saving..." dots.
+ * Set by the capture task when SPI returns 0 usable cameras; the UI
+ * timer in ui_extra.c::saving_timer_cb checks
+ * app_pimslo_capture_error_pending() and swaps the label color/text
+ * while this is true. Cleared when a subsequent capture cycle either
+ * succeeds or starts (both reset the user expectation). */
+#define PIMSLO_ERROR_OVERLAY_MS 3000
+static volatile uint32_t s_error_until_ms = 0;
 static bool              s_initialized = false;
 
 /* ---- NVS persistence for capture counter ---- */
@@ -114,6 +124,13 @@ static void save_capture_counter(void)
         nvs_commit(h);
         nvs_close(h);
     }
+}
+
+uint16_t app_pimslo_reserve_capture_num(void)
+{
+    uint16_t num = s_next_capture_num++;
+    save_capture_counter();
+    return num;
 }
 
 /* ---- Fast-capture mode (Phase 4) ---- */
@@ -166,6 +183,10 @@ static void pimslo_capture_task(void *param)
         /* Block until capture requested */
         xSemaphoreTake(s_capture_sem, portMAX_DELAY);
         s_capturing = true;
+        /* Clear any leftover error window from a prior failed capture —
+         * if the user just pressed photo_btn again, they're past the
+         * point of caring about the prior failure. */
+        s_error_until_ms = 0;
 
         uint16_t num = s_next_capture_num++;
         save_capture_counter();
@@ -278,6 +299,15 @@ static void pimslo_capture_task(void *param)
             snprintf(prev, sizeof(prev), "%s/P4M%04u.jpg", PIMSLO_PREVIEW_DIR, num);
             unlink(prev);
             rmdir(dir_path);
+
+            /* User-visible error feedback. The "saving..." overlay was
+             * showing while we were polling cameras that all timed
+             * out; on its way out it'll swap to "ERROR" for a few
+             * seconds before hiding. Without this the user sees the
+             * overlay disappear and the gallery sit empty — silent
+             * failure that looks identical to "still saving" in the
+             * background. */
+            s_error_until_ms = esp_log_timestamp() + PIMSLO_ERROR_OVERLAY_MS;
         }
 
         /* Viewfinder buffers come back NOW, before the SD writes run.
@@ -622,6 +652,16 @@ uint16_t app_pimslo_encoding_capture_num(void)
     return s_encoding ? s_encoding_num : 0;
 }
 
+bool app_pimslo_capture_error_pending(void)
+{
+    if (s_error_until_ms == 0) return false;
+    if (esp_log_timestamp() >= s_error_until_ms) {
+        s_error_until_ms = 0;     /* expired — clear so next call is cheap */
+        return false;
+    }
+    return true;
+}
+
 bool app_pimslo_is_capturing(void)
 {
     /* Tracks ONLY the SPI-capture phase (s_capturing), not the
@@ -640,8 +680,13 @@ bool app_pimslo_is_capturing(void)
      * gallery shows a "PROCESSING" badge on the JPEG-only entry until
      * the .gif finalizes, which is the existing behavior the user
      * already understands (see CLAUDE.md "Gallery 'QUEUED' vs
-     * 'PROCESSING' badge"). */
-    return s_capturing;
+     * 'PROCESSING' badge").
+     *
+     * Also returns true while the post-capture error window is active.
+     * That keeps the overlay on screen showing "ERROR" for ~3 s
+     * after a 0-cam capture instead of vanishing silently — see
+     * app_pimslo_capture_error_pending() for the semantics. */
+    return s_capturing || app_pimslo_capture_error_pending();
 }
 
 #define P4_PHOTO_DIR "/sdcard/esp32_p4_pic_save"

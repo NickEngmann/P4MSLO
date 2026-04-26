@@ -112,8 +112,36 @@ esp_err_t take_and_save_photo(uint8_t *camera_buf, uint32_t width, uint32_t heig
     esp_err_t ret = ESP_OK;
     uint8_t *pic_buf = NULL;
 
+    /* Refresh the cached buffer pointers EVERY call, not once at init.
+     * `app_video_stream_free_buffers()` runs from `pimslo_capture_task`
+     * (line 212 of app_pimslo.c) and from `gif_bg` (line ~2287 of
+     * app_gifs.c) every photo / encode cycle, then the matching
+     * realloc gives back NEW addresses. The file-scope `scaled_camera_buf`
+     * / `jpg_buf` / `photo_buf` statics from app_video_photo_init were
+     * STALE the moment any prior cycle ran — writing to them
+     * corrupts whatever the freed PSRAM block has been recycled into,
+     * and the next heap walk panics in `tlsf::remove_free_block`.
+     *
+     * User-visible symptom of the stale-pointer bug: occasional
+     * Store-access-fault on first photo after boot when the bg encoder
+     * has run since boot (re-encoding stale captures from prior
+     * session); the bg encode does the free+realloc so the cached
+     * pointers go stale BEFORE the user's first take_and_save_photo.
+     *
+     * Refreshing here is cheap (3 pointer loads, 3 size loads) and
+     * eliminates the use-after-free entirely. */
+    app_video_stream_get_scaled_camera_buf(&scaled_camera_buf, &scaled_camera_buf_size);
+    app_video_stream_get_jpg_buf(&jpg_buf, &rx_buffer_size);
+    app_video_stream_get_shared_photo_buf(&photo_buf, &photo_buf_size);
+    if (!scaled_camera_buf || !jpg_buf || !photo_buf) {
+        ESP_LOGE(TAG, "take_and_save_photo: one of the camera buffers is NULL "
+                      "(scaled=%p jpg=%p photo=%p) — viewfinder may be mid-realloc",
+                 scaled_camera_buf, jpg_buf, photo_buf);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     bsp_display_backlight_off();
-    
+
     bsp_flashlight_set(app_video_stream_get_flash_light_state());
 
     uint32_t photo_width = photo_resolution_width[current_resolution];

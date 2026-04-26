@@ -42,6 +42,39 @@ static bool s_is_encoding = false;
 static bool s_is_playing  = false;
 static bool s_gallery_ever_opened = false;
 
+/* Orphan tracking — separate from the gallery_entry list because
+ * orphans should NEVER appear in the gallery. The mock's gallery_scan
+ * must filter them out. */
+typedef struct {
+    char stem[16];
+    bool has_truncated_gif;     /* 0-byte .gif */
+    int  pos_files;             /* 0-1 means orphan; >=2 is a real capture */
+} orphan_t;
+#define MAX_ORPHANS 16
+static orphan_t s_orphans[MAX_ORPHANS];
+static int s_n_orphans = 0;
+static int s_orphan_cleanup_count = 0;
+
+void gallery_inject_orphan_gif(const char *stem)
+{
+    if (s_n_orphans >= MAX_ORPHANS) return;
+    orphan_t *o = &s_orphans[s_n_orphans++];
+    snprintf(o->stem, sizeof(o->stem), "%s", stem);
+    o->has_truncated_gif = true;
+    o->pos_files = 0;
+}
+
+void gallery_inject_orphan_capture_dir(const char *stem, int pos_files)
+{
+    if (s_n_orphans >= MAX_ORPHANS) return;
+    orphan_t *o = &s_orphans[s_n_orphans++];
+    snprintf(o->stem, sizeof(o->stem), "%s", stem);
+    o->has_truncated_gif = false;
+    o->pos_files = pos_files;
+}
+
+int gallery_orphan_cleanup_count(void) { return s_orphan_cleanup_count; }
+
 void gallery_init(void)
 {
     memset(s_entries, 0, sizeof(s_entries));
@@ -56,6 +89,19 @@ void gallery_scan(void)
     /* In the real app, scan walks /sdcard/p4mslo_gifs and
      * /sdcard/p4mslo_previews and merges by stem. Here we just keep
      * the in-memory list — gallery_record_capture is what populates. */
+    /* Clean orphans first — mirrors the firmware's pass-1 scan logic
+     * that drops 0-byte .gifs and <2-pos capture dirs. */
+    int kept = 0;
+    for (int i = 0; i < s_n_orphans; i++) {
+        orphan_t *o = &s_orphans[i];
+        if (o->has_truncated_gif || o->pos_files < 2) {
+            s_orphan_cleanup_count++;
+            continue;     /* drop */
+        }
+        s_orphans[kept++] = *o;
+    }
+    s_n_orphans = kept;
+
     /* Sort by stem for stable ordering. */
     for (int i = 1; i < s_n_entries; i++) {
         for (int j = i; j > 0 && strcmp(s_entries[j-1].stem, s_entries[j].stem) > 0; j--) {
@@ -95,6 +141,7 @@ void gallery_delete_current(void)
         s_current_index = s_n_entries > 0 ? s_n_entries - 1 : 0;
     }
 }
+
 
 void gallery_record_capture(const char *stem, bool has_gif, bool has_jpeg, bool has_p4ms)
 {
@@ -185,6 +232,80 @@ int    album_release_count(void)         { return s_album.release_count; }
 int    album_reacquire_count(void)       { return s_album.reacquire_count; }
 int    album_reacquire_fail_count(void)  { return s_album.reacquire_fail_count; }
 void   album_force_next_reacquire_fail(int n) { s_album.force_fail_remaining = n; }
+
+/* ========================================================================
+ * Capture-error-overlay model
+ * ======================================================================== */
+#define ERROR_OVERLAY_MS 3000
+static int64_t s_error_until_ms = 0;
+/* Forward decl — defined at file scope below alongside other sim state. */
+extern int64_t s_sim_clock_ms;
+
+bool capture_error_pending(void)
+{
+    if (s_error_until_ms == 0) return false;
+    if (s_sim_clock_ms >= s_error_until_ms) {
+        s_error_until_ms = 0;
+        return false;
+    }
+    return true;
+}
+
+void simulate_advance_time_ms(int ms) { s_sim_clock_ms += ms; }
+
+/* ========================================================================
+ * Camera viewfinder buffer model — catches stale-pointer use-after-free
+ * ======================================================================== */
+static struct {
+    int    generation;          /* increments on every realloc */
+    bool   alive;               /* are buffers currently allocated? */
+    int    consumer_cached_gen; /* what gen did consumer cache? -1 = nothing cached */
+} s_vf;
+
+void viewfinder_init_buffers(void)
+{
+    s_vf.generation = 1;
+    s_vf.alive = true;
+    s_vf.consumer_cached_gen = -1;
+}
+
+void viewfinder_free_buffers(void)
+{
+    s_vf.alive = false;
+}
+
+void viewfinder_realloc_buffers(void)
+{
+    s_vf.alive = true;
+    s_vf.generation++;          /* NEW addresses */
+}
+
+int viewfinder_buf_generation(void)  { return s_vf.generation; }
+bool viewfinder_buffers_alive(void)  { return s_vf.alive; }
+
+void consumer_cache_buffers(void)
+{
+    s_vf.consumer_cached_gen = s_vf.generation;
+}
+
+bool consumer_use_buffers(void)
+{
+    /* Read via cached pointer. Returns false if stale or freed. */
+    if (s_vf.consumer_cached_gen < 0) return false;     /* never cached */
+    if (!s_vf.alive) return false;                       /* freed currently */
+    if (s_vf.consumer_cached_gen != s_vf.generation) return false; /* stale */
+    return true;
+}
+
+void consumer_refresh_buffers(void)
+{
+    /* The FIX: consumer re-reads the current pointers before use.
+     * Mirrors `take_and_save_photo` calling `app_video_stream_get_*_buf()`
+     * on every entry instead of relying on init-time cache. */
+    if (s_vf.alive) {
+        s_vf.consumer_cached_gen = s_vf.generation;
+    }
+}
 
 /* ========================================================================
  * Gallery canvas rendering model (mirrors app_gifs.c::play_current)
@@ -314,7 +435,8 @@ static int s_gif_count  = 0;
 static int s_bg_pre_render_count = 0;
 static int s_bg_re_encode_count  = 0;
 
-static int64_t s_sim_clock_ms = 0;
+/* Definition of the forward-declared s_sim_clock_ms above. */
+int64_t s_sim_clock_ms = 0;
 
 static bool encode_should_defer(void)
 {
@@ -417,9 +539,14 @@ pimslo_sim_capture_result_t pimslo_sim_photo_btn(int cams_to_simulate)
     s_sim_clock_ms += r.capture_ms;
 
     if (cams_to_simulate < 2) {
-        /* Drop — capture task discards if <2 cams. */
+        /* Drop — capture task discards if <2 cams. Set the user-
+         * visible error window so the saving overlay shows ERROR
+         * instead of vanishing silently. */
+        s_error_until_ms = s_sim_clock_ms + ERROR_OVERLAY_MS;
         return r;
     }
+    /* Successful capture clears any pending error window. */
+    s_error_until_ms = 0;
 
     snprintf(r.stem, sizeof(r.stem), "P4M%04d", s_capture_counter++);
 
@@ -481,6 +608,12 @@ void pimslo_sim_init(void)
     s_sim_clock_ms = 0;
     memset(&s_album, 0, sizeof(s_album));
     memset(&s_canvas, 0, sizeof(s_canvas));
+    memset(&s_vf, 0, sizeof(s_vf));
+    s_vf.consumer_cached_gen = -1;
+    s_error_until_ms = 0;
+    memset(s_orphans, 0, sizeof(s_orphans));
+    s_n_orphans = 0;
+    s_orphan_cleanup_count = 0;
 }
 
 void pimslo_sim_shutdown(void)

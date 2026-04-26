@@ -39,6 +39,42 @@ def main():
     with open(LOG, 'w') as fh:
         _lib.drain(s, 2, fh)
 
+        # PHASE 0 — fully drain background work + guarantee ≥1 entry.
+        # In the suite, prior tests (02, 13, 08) can leave 3+ encodes
+        # queued and one mid-encode. If we enter PHASE 1 while a bg
+        # encode is in flight, gallery_scan(reasoned by encode-complete)
+        # fires mid-modal, resets the modal's NO/YES focus state, and
+        # the next btn_trigger is interpreted as "exit gallery to main"
+        # instead of "confirm delete". `_lib.reset_state` polls the
+        # full pimslo_queue/pimslo_encoding/pimslo_capturing trio
+        # against zero before returning. 360 s ≈ 4-5 queued encodes at
+        # ~76 s each — comfortable upper bound on suite contention.
+        _lib.mark(fh, 'PHASE 0 — drain bg work + ensure gallery non-empty')
+        _lib.reset_state(s, fh, timeout=360)
+        # If the gallery is already populated from prior tests, skip
+        # the photo. Otherwise take one and wait for encode complete.
+        _lib.do(s, 'status', 2, fh)
+        with open(LOG) as lf:
+            tail = lf.read()[-2000:]
+        gifs_count = 0
+        m = re.search(r'gifs_count=(\d+)', tail)
+        if m:
+            gifs_count = int(m.group(1))
+        if gifs_count == 0:
+            _lib.do(s, 'menu_goto camera', 6, fh)
+            _lib.do(s, 'photo_btn', 12, fh)
+            _lib.do(s, 'menu_goto main', 3, fh)
+            # NB: don't `sd_ls` here — that would offset PHASE 1's
+            # sd_ls blocks against PHASE 2/3's p4ms blocks and break
+            # the zip-aligned `totals` list the verdict logic uses.
+            for _ in range(90):  # 90 × 2 s = 180 s — one encode worst
+                _lib.do(s, 'status', 2, fh)
+                with open(LOG) as lf:
+                    tail = lf.read().splitlines()[-20:]
+                if any('pimslo_encoding=0' in ln and 'gifs_encoding=0' in ln
+                       for ln in tail):
+                    break
+
         _lib.mark(fh, 'PHASE 1 — enter gallery')
         _lib.do(s, 'menu_goto gifs', 6, fh)
         _lib.do(s, 'status', 2, fh)

@@ -581,6 +581,207 @@ SCENARIO(long_sequence_internal_largest_does_not_shrink)
     ASSERT(gallery_count() == 30, "all 30 captures made it through");
 }
 
+/* SD-orphan cleanup scenarios.
+ *
+ * Prior interrupted encodes can leave 0-byte .gif files in
+ * /sdcard/p4mslo_gifs/ and capture directories with <2 pos*.jpg
+ * files in /sdcard/p4mslo/. Without active cleanup these accumulate
+ * forever — the user's 32 GB SD fills up with invisible orphans.
+ * Gallery scan should drop them on every refresh. */
+
+SCENARIO(orphan_truncated_gif_cleaned_at_scan)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    /* Inject a 0-byte .gif from a prior panicked encode. */
+    gallery_inject_orphan_gif("P4M0247");
+    ASSERT(gallery_orphan_cleanup_count() == 0, "no cleanups yet");
+
+    gallery_scan();
+
+    ASSERT(gallery_orphan_cleanup_count() == 1,
+           "scan must clean the truncated .gif so it doesn't show as a frozen entry");
+    ASSERT(gallery_count() == 0, "orphan must NOT appear in gallery");
+}
+
+SCENARIO(orphan_capture_dir_no_pos_files_cleaned)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    /* Capture dir with 0 pos files: definitely an orphan. */
+    gallery_inject_orphan_capture_dir("P4M0246", 0);
+    /* Capture dir with 1 pos file: also orphan (need ≥2 to encode). */
+    gallery_inject_orphan_capture_dir("P4M0248", 1);
+    /* Capture dir with 2 pos files: still encodable, leave alone. */
+    gallery_inject_orphan_capture_dir("P4M0249", 2);
+
+    gallery_scan();
+
+    ASSERT(gallery_orphan_cleanup_count() == 2,
+           "two <2-pos orphans cleaned, encodable one preserved");
+}
+
+SCENARIO(orphan_cleanup_idempotent_on_repeated_scans)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    gallery_inject_orphan_gif("P4M0247");
+    gallery_scan();
+    int after_first = gallery_orphan_cleanup_count();
+
+    gallery_scan();
+    ASSERT(gallery_orphan_cleanup_count() == after_first,
+           "second scan over a now-clean SD doesn't re-trigger cleanup");
+}
+
+/* Capture-error-overlay scenarios.
+ *
+ * When a photo_btn press results in 0 usable cameras (e.g. SPI cams
+ * unresponsive, network glitch), the firmware shows a red "ERROR" pill
+ * for ~3 s instead of silently hiding the saving overlay. Tests assert:
+ *   - 0-cam capture sets the error flag
+ *   - error flag clears after 3 s
+ *   - successful subsequent capture clears the error flag immediately */
+
+SCENARIO(zero_cam_capture_sets_error_overlay)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_CAMERA);
+    ASSERT(!capture_error_pending(), "no error initially");
+
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(0);  /* 0/4 cams */
+    ASSERT(r.cams_usable == 0, "0 cams returned");
+    ASSERT(capture_error_pending(),
+           "after 0-cam capture, ERROR overlay flag must be set");
+}
+
+SCENARIO(error_overlay_auto_expires_after_3s)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_CAMERA);
+    pimslo_sim_photo_btn(0);
+    ASSERT(capture_error_pending(), "error pending right after");
+
+    simulate_advance_time_ms(2900);
+    ASSERT(capture_error_pending(), "still pending at 2.9 s");
+
+    simulate_advance_time_ms(200);   /* total 3.1 s */
+    ASSERT(!capture_error_pending(), "expired after 3 s");
+}
+
+SCENARIO(successful_capture_clears_error_overlay)
+{
+    pimslo_sim_set_architecture(PIMSLO_ARCH_PROPOSED_OCTREE_TCM);
+    ui_extra_set_current_page(UI_PAGE_CAMERA);
+    pimslo_sim_photo_btn(0);             /* fail */
+    ASSERT(capture_error_pending(), "error pending");
+
+    /* User retries — successful capture should immediately clear the
+     * error window so the overlay doesn't show ERROR after a successful
+     * shot. */
+    pimslo_sim_capture_result_t r = pimslo_sim_photo_btn(4);
+    ASSERT(r.cams_usable == 4, "4 cams second time");
+    ASSERT(!capture_error_pending(),
+           "successful capture immediately clears the error flag");
+}
+
+/* Viewfinder buffer use-after-free scenarios.
+ *
+ * Mirrors the on-device bug where app_video_photo.c caches the
+ * scaled_camera_buf / jpg_buf / shared_photo_buf pointers at init
+ * but they get free()d and re-allocated to NEW addresses every
+ * PIMSLO photo cycle and every bg encode. The cached pointers
+ * become stale → use-after-free → heap corruption → tlsf panic
+ * later when free walks the corrupted block. */
+
+SCENARIO(viewfinder_init_then_take_photo_no_stale_pointer)
+{
+    /* Boot: viewfinder buffers allocated.
+     * Consumer (app_video_photo) caches pointers in init.
+     * Take photo: consumer reads via cache. STILL VALID this cycle. */
+    viewfinder_init_buffers();
+    consumer_cache_buffers();
+    ASSERT(viewfinder_buf_generation() == 1, "boot is gen 1");
+    ASSERT(consumer_use_buffers(), "first photo: cache valid");
+}
+
+SCENARIO(viewfinder_free_realloc_invalidates_cached_pointer)
+{
+    /* This is THE BUG that causes the user's first-photo crash:
+     * the bg encoder runs at boot (re-encoding stale captures from
+     * prior session), which calls free_buffers + realloc_buffers.
+     * The cached pointers in app_video_photo are now stale. The
+     * user's "first photo after boot" then writes to the stale
+     * pointer → freed PSRAM → heap corruption. */
+    viewfinder_init_buffers();
+    consumer_cache_buffers();           /* boot init caches gen 1 */
+
+    /* Simulate bg encoder running between boot and user's first photo. */
+    viewfinder_free_buffers();
+    viewfinder_realloc_buffers();
+    ASSERT(viewfinder_buf_generation() == 2, "free+realloc bumps gen");
+
+    /* User takes first photo. Cached pointer is gen 1, current is gen 2.
+     * The cached-pointer read is STALE. */
+    ASSERT(!consumer_use_buffers(),
+           "after free+realloc, consumer's cached pointer is stale (THIS IS THE BUG)");
+}
+
+SCENARIO(viewfinder_consumer_refresh_fixes_stale_pointer)
+{
+    /* The FIX: consumer refreshes pointers before each use, not just at init.
+     * Mirrors take_and_save_photo calling app_video_stream_get_*_buf()
+     * on every entry. */
+    viewfinder_init_buffers();
+    consumer_cache_buffers();
+    viewfinder_free_buffers();
+    viewfinder_realloc_buffers();
+    /* Cached pointer is stale, but consumer refreshes before use: */
+    consumer_refresh_buffers();
+    ASSERT(consumer_use_buffers(),
+           "after refresh, consumer reads current-gen pointer");
+}
+
+SCENARIO(viewfinder_concurrent_encode_keeps_consumer_safe)
+{
+    /* Multi-cycle stress: 5 PIMSLO photo cycles + bg-encode cycles
+     * interleaved. With the FIX (refresh-before-use), every consumer
+     * read is valid. Without the fix, only the first read is valid. */
+    viewfinder_init_buffers();
+    consumer_cache_buffers();
+
+    int valid_reads = 0;
+    for (int cycle = 0; cycle < 5; cycle++) {
+        /* User takes photo: consumer refreshes, then uses. */
+        consumer_refresh_buffers();
+        if (consumer_use_buffers()) valid_reads++;
+
+        /* PIMSLO cycle frees + realloc */
+        viewfinder_free_buffers();
+        viewfinder_realloc_buffers();
+    }
+    ASSERT(valid_reads == 5, "all 5 photos read valid pointers");
+    ASSERT(viewfinder_buf_generation() == 6, "5 cycles = gen 1 → 6");
+}
+
+SCENARIO(viewfinder_no_cache_no_use_after_free)
+{
+    /* Worst case: consumer NEVER caches; reads on every photo via
+     * fresh getter. No use-after-free possible because there's no
+     * cache to go stale. This is the architectural goal of the fix. */
+    viewfinder_init_buffers();
+    /* DON'T cache. */
+
+    int valid_reads = 0;
+    int stale_reads = 0;
+    for (int cycle = 0; cycle < 10; cycle++) {
+        consumer_refresh_buffers();         /* always refresh */
+        if (consumer_use_buffers()) valid_reads++;
+        else stale_reads++;
+        viewfinder_free_buffers();
+        viewfinder_realloc_buffers();
+    }
+    ASSERT(valid_reads == 10, "10 cycles, all reads valid");
+    ASSERT(stale_reads == 0, "no stale reads when refresh is always called");
+}
+
 /* Gallery rendering scenarios — model the `blue square` bug.
  *
  * `app_gifs.c::show_jpeg` memsets the canvas to byte 0x10 (which is
@@ -815,6 +1016,20 @@ int main(void)
     RUN(rapid_burst_captures_all_eventually_encode);
 
     RUN(long_sequence_internal_largest_does_not_shrink);
+    RUN(orphan_truncated_gif_cleaned_at_scan);
+    RUN(orphan_capture_dir_no_pos_files_cleaned);
+    RUN(orphan_cleanup_idempotent_on_repeated_scans);
+
+    RUN(zero_cam_capture_sets_error_overlay);
+    RUN(error_overlay_auto_expires_after_3s);
+    RUN(successful_capture_clears_error_overlay);
+
+    RUN(viewfinder_init_then_take_photo_no_stale_pointer);
+    RUN(viewfinder_free_realloc_invalidates_cached_pointer);
+    RUN(viewfinder_consumer_refresh_fixes_stale_pointer);
+    RUN(viewfinder_concurrent_encode_keeps_consumer_safe);
+    RUN(viewfinder_no_cache_no_use_after_free);
+
     RUN(jpeg_only_entry_paints_jpeg_not_blue);
     RUN(jpeg_show_failure_leaves_blue_canvas);
     RUN(gif_entry_with_preview_flashes_jpeg_first);

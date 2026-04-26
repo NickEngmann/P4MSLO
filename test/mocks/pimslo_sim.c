@@ -511,10 +511,14 @@ static int run_encode_pipeline(int n_cams, const char *stem)
     bool boost = power_idle_is_sleeping();
     if (boost) s_encoder_boost_count++;
     else       s_encoder_normal_count++;
+    /* cache_source_jpegs is unconditional in the model — once the
+     * firmware moves the jpeg_data[] free to AFTER pass 2, every
+     * encode benefits regardless of sleep state. */
     p4_pipeline_timing_t t = p4_timing_estimate((p4_pipeline_params_t){
         .n_cams = n_cams, .stack = encoder_stack_location(),
         .lut = encoder_lut_location(), .save_p4ms = true,
         .boost_dual_core = boost,
+        .cache_source_jpegs = true,
     });
 
     /* Allocate encoder buffers (PSRAM). The 7 MB scaled_buf is what

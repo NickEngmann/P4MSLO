@@ -67,21 +67,36 @@ p4_pipeline_timing_t p4_timing_estimate(p4_pipeline_params_t p)
      * touch the per-encode pixel_lut. With boost_dual_core, Core 0
      * helps decode + accumulate in parallel — apply
      * P4_BOOST_PASS1_PCT to the n-frame portion. The LUT-build at
-     * the end is single-threaded (median-cut) and unchanged. */
+     * the end is single-threaded (median-cut) and unchanged.
+     * Pass 1 currently includes an SD re-read per frame; with
+     * cache_source_jpegs the bytes come from PSRAM and the SD-read
+     * cost is removed. */
     int pass1_decodes = apply_penalty(P4_TIMING_PALETTE_PER_FRAME_MS * n, p.stack);
+    int pass1_sd_read = p.cache_source_jpegs
+                        ? 0
+                        : P4_TIMING_SD_REREAD_PER_FRAME_MS * n;
     if (p.boost_dual_core) {
         pass1_decodes = (pass1_decodes * P4_BOOST_PASS1_PCT) / 100;
     }
-    t.pass1_ms = pass1_decodes + P4_TIMING_PALETTE_LUT_BUILD_MS;
+    t.pass1_ms = pass1_decodes + pass1_sd_read + P4_TIMING_PALETTE_LUT_BUILD_MS;
 
     /* Pass 2: forward — n frames. Decode is stack-only; encode (dither
      * + LZW) is stack × LUT. With boost_dual_core, Core 0 prefetches
      * the next frame's JPEG from SD while Core 1 dithers the current
-     * — apply P4_BOOST_PASS2_FWD_PCT. */
+     * — apply P4_BOOST_PASS2_FWD_PCT.
+     * Pass 2 also currently includes an SD re-read per frame; with
+     * cache_source_jpegs that's gone. NB: when both cache_source_jpegs
+     * AND boost_dual_core are set, the boost-pass2 SD-prefetch win
+     * is also subsumed by the cache (no SD reads to prefetch). The
+     * mock applies them independently for clarity; in practice
+     * cache_source_jpegs is the strictly larger win. */
     int decode_part = apply_penalty(P4_TIMING_DECODE_PER_FRAME_MS * n, p.stack);
     int encode_part = apply_pass2_penalty(P4_TIMING_ENCODE_PER_FRAME_MS * n,
                                            p.stack, p.lut);
-    t.pass2_forward_ms = decode_part + encode_part;
+    int pass2_sd_read = p.cache_source_jpegs
+                        ? 0
+                        : P4_TIMING_SD_REREAD_PER_FRAME_MS * n;
+    t.pass2_forward_ms = decode_part + encode_part + pass2_sd_read;
     if (p.boost_dual_core) {
         t.pass2_forward_ms = (t.pass2_forward_ms * P4_BOOST_PASS2_FWD_PCT) / 100;
     }

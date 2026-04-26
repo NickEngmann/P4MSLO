@@ -101,6 +101,13 @@ typedef enum {
 /* SD save costs (per pos*.jpg = ~250 KB at 250 KB/s). */
 #define P4_TIMING_SD_SAVE_PER_FRAME_MS    1000
 
+/* SD read cost for a 600 KB source JPEG at ~250 KB/s. Currently the
+ * encoder re-reads each pos*.jpg from SD TWICE — once in Pass 1 and
+ * once in Pass 2 — even though the bytes were already loaded into
+ * `jpeg_data[]` earlier in the function. Caching across passes saves
+ * `n_cams × 2 × P4_TIMING_SD_REREAD_PER_FRAME_MS` per encode. */
+#define P4_TIMING_SD_REREAD_PER_FRAME_MS  2400
+
 /* Stack-penalty factor as a percentage of nominal.
  *   100 = no penalty (internal stack)
  *   460 = 4.6× slowdown (PSRAM stack), measured */
@@ -112,6 +119,14 @@ typedef struct {
     p4_stack_location_t stack;
     p4_lut_location_t   lut;
     bool save_p4ms;         /* whether to include the .p4ms direct-JPEG save */
+    /* Cache source JPEGs across Pass 1 and Pass 2. Currently the
+     * encoder re-reads each pos*.jpg twice; caching saves
+     * 2 × n_cams × P4_TIMING_SD_REREAD_PER_FRAME_MS. Memory cost:
+     * ~2.4 MB held during the whole encode (4 × 600 KB), allocated
+     * AFTER gif_encoder_create() so the 7 MB scaled_buf alloc isn't
+     * fragmented. Pure win, single-core, no quality change. */
+    bool cache_source_jpegs;
+
     /* Dual-core boost mode. When ui_extra_is_display_sleeping() is
      * true on hardware, Core 0 (LVGL + video_stream paused) is fully
      * idle and can be enlisted to help the encoder. Concrete wins
